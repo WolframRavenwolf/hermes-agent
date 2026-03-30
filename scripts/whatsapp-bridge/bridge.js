@@ -245,12 +245,13 @@ async function startSocket() {
         hasMedia = true;
         mediaType = msg.message.pttMessage ? 'ptt' : 'audio';
         try {
-          const audioMsg = msg.message.pttMessage || msg.message.audioMessage;
           const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+          const audioMsg = msg.message.audioMessage || msg.message.pttMessage;
           const mime = audioMsg.mimetype || 'audio/ogg';
-          const ext = mime.includes('ogg') ? '.ogg' : mime.includes('mp4') ? '.m4a' : '.ogg';
+          const extMap = { 'audio/ogg; codecs=opus': '.ogg', 'audio/ogg': '.ogg', 'audio/mpeg': '.mp3', 'audio/mp4': '.m4a', 'audio/wav': '.wav' };
+          const ext = extMap[mime] || '.ogg';
           mkdirSync(AUDIO_CACHE_DIR, { recursive: true });
-          const filePath = path.join(AUDIO_CACHE_DIR, `aud_${randomBytes(6).toString('hex')}${ext}`);
+          const filePath = path.join(AUDIO_CACHE_DIR, `audio_${randomBytes(6).toString('hex')}${ext}`);
           writeFileSync(filePath, buf);
           mediaUrls.push(filePath);
         } catch (err) {
