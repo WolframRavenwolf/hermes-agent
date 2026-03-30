@@ -58,3 +58,4 @@ mini-swe-agent/
 # Nix
 .direnv/
 result
+hermes_state.db

@@ -489,16 +489,30 @@ SESSION_SEARCH_SCHEMA = {
 # --- Registry ---
 from tools.registry import registry
 
+
+def _session_search_handler(args, **kw):
+    """Registry handler that lazily creates a SessionDB if none is provided."""
+    db = kw.get("db")
+    if db is None:
+        try:
+            from hermes_state import SessionDB
+            db = SessionDB()
+        except Exception:
+            logging.debug("session_search: could not create SessionDB, proceeding without")
+    return session_search(
+        query=args.get("query", ""),
+        role_filter=args.get("role_filter"),
+        limit=args.get("limit", 3),
+        db=db,
+        current_session_id=kw.get("current_session_id"),
+    )
+
+
 registry.register(
     name="session_search",
     toolset="session_search",
     schema=SESSION_SEARCH_SCHEMA,
-    handler=lambda args, **kw: session_search(
-        query=args.get("query") or "",
-        role_filter=args.get("role_filter"),
-        limit=args.get("limit", 3),
-        db=kw.get("db"),
-        current_session_id=kw.get("current_session_id")),
+    handler=_session_search_handler,
     check_fn=check_session_search_requirements,
     emoji="🔍",
 )
