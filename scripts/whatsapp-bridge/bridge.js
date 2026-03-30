@@ -30,6 +30,7 @@ import { execSync } from 'child_process';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
+import { getAudioMessage, getMessageContent } from './media-utils.js';
 
 // Parse CLI args
 const args = process.argv.slice(2);
@@ -65,6 +66,7 @@ let SCRIPT_HASH = '';
 try {
   SCRIPT_HASH = createHash('sha256')
     .update(readFileSync(fileURLToPath(import.meta.url)))
+    .update(readFileSync(new URL('./media-utils.js', import.meta.url)))
     .digest('hex')
     .slice(0, 16);
 } catch {}
@@ -142,18 +144,6 @@ function trackSentMessageId(sent) {
 function normalizeWhatsAppId(value) {
   if (!value) return '';
   return String(value).replace(':', '@');
-}
-
-function getMessageContent(msg) {
-  const content = msg?.message || {};
-  if (content.ephemeralMessage?.message) return content.ephemeralMessage.message;
-  if (content.viewOnceMessage?.message) return content.viewOnceMessage.message;
-  if (content.viewOnceMessageV2?.message) return content.viewOnceMessageV2.message;
-  if (content.documentWithCaptionMessage?.message) return content.documentWithCaptionMessage.message;
-  if (content.templateMessage?.hydratedTemplate) return content.templateMessage.hydratedTemplate;
-  if (content.buttonsMessage) return content.buttonsMessage;
-  if (content.listMessage) return content.listMessage;
-  return content;
 }
 
 function getContextInfo(messageContent) {
@@ -387,12 +377,14 @@ async function startSocket() {
         hasMedia = true;
         mediaType = messageContent.pttMessage ? 'ptt' : 'audio';
         try {
-          const audioMsg = messageContent.pttMessage || messageContent.audioMessage;
           const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+          const audioMsg = getAudioMessage(msg);
+          if (!audioMsg) throw new Error('Downloaded message no longer contains audio metadata');
           const mime = audioMsg.mimetype || 'audio/ogg';
-          const ext = mime.includes('ogg') ? '.ogg' : mime.includes('mp4') ? '.m4a' : '.ogg';
+          const extMap = { 'audio/ogg; codecs=opus': '.ogg', 'audio/ogg': '.ogg', 'audio/mpeg': '.mp3', 'audio/mp4': '.m4a', 'audio/wav': '.wav' };
+          const ext = extMap[mime] || '.ogg';
           mkdirSync(AUDIO_CACHE_DIR, { recursive: true });
-          const filePath = path.join(AUDIO_CACHE_DIR, `aud_${randomBytes(6).toString('hex')}${ext}`);
+          const filePath = path.join(AUDIO_CACHE_DIR, `audio_${randomBytes(6).toString('hex')}${ext}`);
           writeFileSync(filePath, buf);
           mediaUrls.push(filePath);
         } catch (err) {
