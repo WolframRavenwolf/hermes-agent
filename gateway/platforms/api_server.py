@@ -300,7 +300,14 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
-        self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        # Shared SessionDB singleton — avoids creating (and leaking) a new
+        # SQLite connection on every /v1/chat/completions request.
+        self._session_db = None
+        try:
+            from hermes_state import SessionDB
+            self._session_db = SessionDB()
+        except Exception:
+            pass
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -415,6 +422,7 @@ class APIServerAdapter(BasePlatformAdapter):
             platform="api_server",
             stream_delta_callback=stream_delta_callback,
             tool_progress_callback=tool_progress_callback,
+            session_db=self._session_db,
         )
         return agent
 
