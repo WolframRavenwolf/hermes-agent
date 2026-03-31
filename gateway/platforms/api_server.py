@@ -634,7 +634,14 @@ class APIServerAdapter(BasePlatformAdapter):
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
-        self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        # Shared SessionDB singleton — avoids creating (and leaking) a new
+        # SQLite connection on every /v1/chat/completions request.
+        self._session_db: Optional[Any] = None
+        try:
+            from hermes_state import SessionDB
+            self._session_db = SessionDB()
+        except Exception:
+            pass
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
