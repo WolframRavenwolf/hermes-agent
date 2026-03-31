@@ -9112,9 +9112,18 @@ class GatewayRunner:
                 default=True,
             )
         )
-        
+        # thinking_progress is independent — if enabled, we need the progress
+        # queue even when tool_progress is off (thinking relay uses same infra)
+        _thinking_cfg = user_config.get("display", {}).get("thinking_progress")
+        _thinking_enabled = (
+            _thinking_cfg is True
+            or (isinstance(_thinking_cfg, str) and _thinking_cfg.lower() in ("true", "yes", "1", "on"))
+        )
+        needs_progress_queue = tool_progress_enabled or _thinking_enabled
+
+
         # Queue for progress messages (thread-safe)
-        progress_queue = queue.Queue() if tool_progress_enabled else None
+        progress_queue = queue.Queue() if needs_progress_queue else None
         last_tool = [None]  # Mutable container for tracking in closure
         last_progress_msg = [None]  # Track last message for dedup
         repeat_count = [0]  # How many times the same message repeated
@@ -9130,7 +9139,12 @@ class GatewayRunner:
                 if msg:
                     progress_queue.put(msg)
                 return
-            
+
+            # If tool_progress is off, only _thinking passes through (above).
+            # Regular tool calls are suppressed.
+            if not tool_progress_enabled:
+                return
+
             # Only act on tool.started events (ignore tool.completed, reasoning.available, etc.)
             if event_type not in ("tool.started",):
                 return
@@ -9620,7 +9634,7 @@ class GatewayRunner:
 
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
-            agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
+            agent.tool_progress_callback = progress_callback if needs_progress_queue else None
             agent.tool_progress_mode = progress_mode if tool_progress_enabled else None
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
@@ -9690,6 +9704,16 @@ class GatewayRunner:
             if isinstance(_mem_notif, bool):
                 _mem_notif = "on" if _mem_notif else "off"
             agent.memory_notifications = str(_mem_notif).lower() if _mem_notif else "on"
+
+            # Show assistant thinking between tool calls — fully independent
+            # of tool_progress mode.  Config: display.thinking_progress: true
+            _thinking_progress = user_config.get("display", {}).get("thinking_progress")
+            if isinstance(_thinking_progress, bool):
+                agent.thinking_progress = _thinking_progress
+            elif isinstance(_thinking_progress, str):
+                agent.thinking_progress = _thinking_progress.lower() in ("true", "yes", "1", "on")
+            else:
+                agent.thinking_progress = False
 
             # Store agent reference for interrupt support
             agent_holder[0] = agent
