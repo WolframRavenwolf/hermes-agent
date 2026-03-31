@@ -6770,12 +6770,13 @@ class GatewayRunner:
             )
 
         # --- cycle mode (per-platform) ----------------------------------------
-        cycle = ["off", "new", "all", "verbose"]
+        cycle = ["off", "new", "all", "verbose", "full"]
         descriptions = {
             "off": "⚙️ Tool progress: **OFF** — no tool activity shown.",
-            "new": "⚙️ Tool progress: **NEW** — shown when tool changes (preview length: `display.tool_preview_length`, default 40).",
-            "all": "⚙️ Tool progress: **ALL** — every tool call shown (preview length: `display.tool_preview_length`, default 40).",
-            "verbose": "⚙️ Tool progress: **VERBOSE** — every tool call with full arguments.",
+            "new": "⚙️ Tool progress: **NEW** — shown when tool changes.",
+            "all": "⚙️ Tool progress: **ALL** — every tool call shown.",
+            "verbose": "⚙️ Tool progress: **VERBOSE** — detailed tool args.",
+            "full": "⚙️ Tool progress: **FULL** — complete args, no truncation.",
         }
 
         # Read current effective mode for this platform via the resolver
@@ -9079,9 +9080,17 @@ class GatewayRunner:
             if not progress_queue or not _run_still_current():
                 return
 
+            # "_thinking" is assistant text between tool calls — relay as-is
+            if tool_name == "_thinking":
+                msg = f"💬 {preview}" if preview else None
+                if msg:
+                    progress_queue.put(msg)
+                return
+            
             # Only act on tool.started events (ignore tool.completed, reasoning.available, etc.)
             if event_type not in ("tool.started",):
                 return
+
 
             # "new" mode: only report when tool changes
             if progress_mode == "new" and tool_name == last_tool[0]:
@@ -9092,6 +9101,14 @@ class GatewayRunner:
             from agent.display import get_tool_emoji
             emoji = get_tool_emoji(tool_name, default="⚙️")
             
+            # Full mode: show complete arguments (no truncation)
+            if progress_mode == "full" and args:
+                import json as _json
+                args_str = _json.dumps(args, ensure_ascii=False, default=str)
+                msg = f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
+                progress_queue.put(msg)
+                return
+
             # Verbose mode: show detailed arguments, respects tool_preview_length
             if progress_mode == "verbose":
                 if args:
@@ -9560,6 +9577,7 @@ class GatewayRunner:
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
             agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
+            agent.tool_progress_mode = progress_mode if tool_progress_enabled else None
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None

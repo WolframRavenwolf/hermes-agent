@@ -6454,8 +6454,8 @@ class HermesCLI:
             print("  Prompt + TUI colors updated.")
 
     def _toggle_verbose(self):
-        """Cycle tool progress mode: off → new → all → verbose → off."""
-        cycle = ["off", "new", "all", "verbose"]
+        """Cycle tool progress mode: off → new → all → verbose → full → off."""
+        cycle = ["off", "new", "all", "verbose", "full"]
         try:
             idx = cycle.index(self.tool_progress_mode)
         except ValueError:
@@ -6477,7 +6477,8 @@ class HermesCLI:
             "off": f"{_Colors.DIM}Tool progress: OFF{_Colors.RESET} — silent mode, just the final response.",
             "new": f"{_Colors.YELLOW}Tool progress: NEW{_Colors.RESET} — show each new tool (skip repeats).",
             "all": f"{_Colors.GREEN}Tool progress: ALL{_Colors.RESET} — show every tool call.",
-            "verbose": f"{_Colors.BOLD}{_Colors.GREEN}Tool progress: VERBOSE{_Colors.RESET} — full args, results, think blocks, and debug logs.",
+            "verbose": f"{_Colors.BOLD}{_Colors.GREEN}Tool progress: VERBOSE{_Colors.RESET} — detailed tool args (200 char limit).",
+            "full": f"{_Colors.BOLD}{_Colors.CYAN}Tool progress: FULL{_Colors.RESET} — complete args, no truncation.",
         }
         _cprint(labels.get(self.tool_progress_mode, ""))
 

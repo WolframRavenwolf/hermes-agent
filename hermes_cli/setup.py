@@ -1482,11 +1482,12 @@ def setup_agent_settings(config: dict):
     print_info("  off     — Silent, just the final response")
     print_info("  new     — Show tool name only when it changes (less noise)")
     print_info("  all     — Show every tool call with a short preview")
-    print_info("  verbose — Full args, results, and debug logs")
+    print_info("  verbose — Detailed tool args (200 char limit)")
+    print_info("  full    — Complete tool args, no truncation")
 
     current_mode = config.get("display", {}).get("tool_progress", "all")
     mode = prompt("Tool progress mode", current_mode)
-    if mode.lower() in ("off", "new", "all", "verbose"):
+    if mode.lower() in ("off", "new", "all", "verbose", "full"):
         if "display" not in config:
             config["display"] = {}
         config["display"]["tool_progress"] = mode.lower()
