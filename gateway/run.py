@@ -4326,12 +4326,13 @@ class GatewayRunner:
             )
 
         # --- cycle mode -------------------------------------------------------
-        cycle = ["off", "new", "all", "verbose"]
+        cycle = ["off", "new", "all", "verbose", "full"]
         descriptions = {
             "off": "⚙️ Tool progress: **OFF** — no tool activity shown.",
             "new": "⚙️ Tool progress: **NEW** — shown when tool changes.",
             "all": "⚙️ Tool progress: **ALL** — every tool call shown.",
-            "verbose": "⚙️ Tool progress: **VERBOSE** — full args and results.",
+            "verbose": "⚙️ Tool progress: **VERBOSE** — detailed tool args.",
+            "full": "⚙️ Tool progress: **FULL** — complete args, no truncation.",
         }
 
         raw_progress = user_config.get("display", {}).get("tool_progress", "all")
@@ -5353,6 +5354,13 @@ class GatewayRunner:
             """Callback invoked by agent when a tool is called."""
             if not progress_queue:
                 return
+
+            # "_thinking" is assistant text between tool calls — relay as-is
+            if tool_name == "_thinking":
+                msg = f"💬 {preview}" if preview else None
+                if msg:
+                    progress_queue.put(msg)
+                return
             
             # "new" mode: only report when tool changes
             if progress_mode == "new" and tool_name == last_tool[0]:
@@ -5363,6 +5371,14 @@ class GatewayRunner:
             from agent.display import get_tool_emoji
             emoji = get_tool_emoji(tool_name, default="⚙️")
             
+            # Full mode: show complete arguments (no truncation)
+            if progress_mode == "full" and args:
+                import json as _json
+                args_str = _json.dumps(args, ensure_ascii=False, default=str)
+                msg = f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
+                progress_queue.put(msg)
+                return
+
             # Verbose mode: show detailed arguments
             if progress_mode == "verbose" and args:
                 import json as _json
@@ -5667,6 +5683,7 @@ class GatewayRunner:
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
             agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
+            agent.tool_progress_mode = progress_mode if tool_progress_enabled else None
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
             agent.status_callback = _status_callback_sync
