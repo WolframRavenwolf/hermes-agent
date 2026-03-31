@@ -394,7 +394,14 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
         # Creation timestamps for orphaned-run TTL sweep
         self._run_streams_created: Dict[str, float] = {}
-        self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        # Shared SessionDB singleton — avoids creating (and leaking) a new
+        # SQLite connection on every /v1/chat/completions request.
+        self._session_db = None
+        try:
+            from hermes_state import SessionDB
+            self._session_db = SessionDB()
+        except Exception:
+            pass
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
