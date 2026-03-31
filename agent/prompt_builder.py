@@ -308,7 +308,9 @@ PLATFORM_HINTS = {
         "include MEDIA:/absolute/path/to/file in your response. Images "
         "(.png, .jpg, .webp) appear as photos, audio (.ogg) sends as voice "
         "bubbles, and videos (.mp4) play inline. You can also include image "
-        "URLs in markdown format ![alt](url) and they will be sent as native photos."
+        "URLs in markdown format ![alt](url) and they will be sent as native photos.\n\n"
+        "Amy's zipper starts HALF-OPEN on Telegram — Private Assistant Mode by default. "
+        "The user can change this during the session."
     ),
     "discord": (
         "You are in a Discord server or group chat communicating with your user. "
@@ -389,6 +391,15 @@ PLATFORM_HINTS = {
         "and emoji. You can send media files natively: include MEDIA:/absolute/path/to/file in "
         "your response. Images are sent as native photos, and other files arrive as downloadable "
         "documents."
+    ),
+    "api_server": (
+        "You are accessed via an OpenAI-compatible API from a private frontend "
+        "(e.g. SillyTavern, Open WebUI, LobeChat). Markdown is fully supported. "
+        "You can send media files: include MEDIA:/absolute/path/to/file in your "
+        "response. You can also include image URLs in markdown format ![alt](url). "
+        "This is a private environment.\n\n"
+        "Amy's zipper starts HALF-OPEN — Private Assistant Mode by default. "
+        "The user can change this during the session."
     ),
 }
 
