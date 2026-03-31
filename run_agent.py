@@ -533,6 +533,7 @@ class AIAgent:
         # would mangle the escape sequences.  None = use builtins.print.
         self._print_fn = None
         self.background_review_callback = None  # Optional sync callback for gateway delivery
+        self.memory_notifications = "on"  # Memory update notifications: "off", "on", "verbose"
         self.skip_context_files = skip_context_files
         self.pass_session_id = pass_session_id
         self.persist_session = persist_session
@@ -1694,9 +1695,53 @@ class AIAgent:
 
                 # Scan the review agent's messages for successful tool actions
                 # and surface a compact summary to the user.
+                #
+                # memory_notifications controls chat delivery:
+                #   "off"     — no chat notification (stdout only)
+                #   "on"      — generic "Memory updated" (default)
+                #   "verbose" — content preview with ➕/✏️/➖ indicators
+                _notif_mode = getattr(self, "memory_notifications", "on")
                 actions = []
-                for msg in getattr(review_agent, "_session_messages", []):
+                _verbose = _notif_mode == "verbose"
+                _review_msgs = getattr(review_agent, "_session_messages", [])
+
+                # Build a map of tool_call_id → details from assistant messages
+                # that contain memory or skill_manage tool_calls.  Used to
+                # filter out unrelated tool responses (session_search, etc.)
+                # and (in verbose mode) to display content previews.
+                _NOTIFY_TOOLS = {"memory", "skill_manage"}
+                _call_details: dict = {}
+                for msg in _review_msgs:
+                    if msg.get("role") != "assistant":
+                        continue
+                    for tc in msg.get("tool_calls", []):
+                        fn = tc.get("function", {})
+                        fn_name = fn.get("name", "")
+                        if fn_name not in _NOTIFY_TOOLS:
+                            continue
+                        try:
+                            args = json.loads(fn.get("arguments", "{}"))
+                        except (json.JSONDecodeError, TypeError):
+                            args = {}
+                        tc_id = tc.get("id")
+                        if tc_id:
+                            _call_details[tc_id] = {
+                                "tool": fn_name,
+                                "action": args.get("action", "?"),
+                                "target": args.get("target", "memory"),
+                                "content": args.get("content", ""),
+                                "old_text": args.get("old_text", ""),
+                                "name": args.get("name", ""),
+                            }
+
+                for msg in _review_msgs:
                     if not isinstance(msg, dict) or msg.get("role") != "tool":
+                        continue
+                    # Only process memory/skill tool responses — other tools
+                    # (session_search, etc.) also return {"success": true} but
+                    # are not worth notifying about.
+                    tc_id = msg.get("tool_call_id")
+                    if tc_id and _call_details and tc_id not in _call_details:
                         continue
                     try:
                         data = json.loads(msg.get("content", "{}"))
@@ -1706,29 +1751,67 @@ class AIAgent:
                         continue
                     message = data.get("message", "")
                     target = data.get("target", "")
-                    if "created" in message.lower():
-                        actions.append(message)
-                    elif "updated" in message.lower():
-                        actions.append(message)
-                    elif "added" in message.lower() or (target and "add" in message.lower()):
+                    detail = _call_details.get(tc_id, {})
+                    is_skill = detail.get("tool") == "skill_manage"
+
+                    # Determine display label
+                    if is_skill:
+                        label = "Skill"
+                    elif target:
                         label = "Memory" if target == "memory" else "User profile" if target == "user" else target
-                        actions.append(f"{label} updated")
-                    elif "Entry added" in message:
-                        label = "Memory" if target == "memory" else "User profile" if target == "user" else target
-                        actions.append(f"{label} updated")
-                    elif "removed" in message.lower() or "replaced" in message.lower():
-                        label = "Memory" if target == "memory" else "User profile" if target == "user" else target
-                        actions.append(f"{label} updated")
+                    else:
+                        continue  # skip tool responses we can't label
+
+                    if _verbose:
+                        action = detail.get("action", "")
+                        content = detail.get("content", "")
+                        old_text = detail.get("old_text", "")
+                        skill_name = detail.get("name", "")
+
+                        # Build a descriptive action string with content preview
+                        _MAX_PREVIEW = 120
+                        if is_skill:
+                            # Skill notifications: use the message from the tool
+                            actions.append(f"📝 {message}" if message else f"Skill {action}")
+                        elif action == "add" and content:
+                            preview = content[:_MAX_PREVIEW] + ("…" if len(content) > _MAX_PREVIEW else "")
+                            actions.append(f"{label} ➕ {preview}")
+                        elif action == "replace" and content:
+                            preview = content[:_MAX_PREVIEW] + ("…" if len(content) > _MAX_PREVIEW else "")
+                            actions.append(f"{label} ✏️ {preview}")
+                        elif action == "remove" and old_text:
+                            preview = old_text[:60] + ("…" if len(old_text) > 60 else "")
+                            actions.append(f"{label} ➖ {preview}")
+                        else:
+                            actions.append(f"{label} updated")
+                    else:
+                        # Generic labels (default behavior)
+                        if "created" in message.lower():
+                            actions.append(message)
+                        elif "updated" in message.lower():
+                            actions.append(message)
+                        elif "added" in message.lower() or "replaced" in message.lower() or "removed" in message.lower():
+                            actions.append(f"{label} updated")
+                        else:
+                            actions.append(f"{label} updated")
 
                 if actions:
                     summary = " · ".join(dict.fromkeys(actions))
+                    # Always log to stdout (HA addon log)
                     self._safe_print(f"  💾 {summary}")
-                    _bg_cb = self.background_review_callback
-                    if _bg_cb:
-                        try:
-                            _bg_cb(f"💾 {summary}")
-                        except Exception:
-                            pass
+                    # Send to chat unless notifications are off
+                    if _notif_mode != "off":
+                        _bg_cb = self.background_review_callback
+                        if _bg_cb:
+                            try:
+                                if _verbose:
+                                    # Show each action on its own line for readability
+                                    chat_summary = "\n".join(f"💾 {a}" for a in dict.fromkeys(actions))
+                                else:
+                                    chat_summary = f"💾 {summary}"
+                                _bg_cb(chat_summary)
+                            except Exception:
+                                pass
 
             except Exception as e:
                 logger.debug("Background memory/skill review failed: %s", e)
