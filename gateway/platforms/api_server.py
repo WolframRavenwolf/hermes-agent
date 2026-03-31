@@ -402,6 +402,15 @@ class APIServerAdapter(BasePlatformAdapter):
 
         max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
 
+        # Ensure API server sessions are registered in state.db
+        # so /resume and session_search can find them cross-platform.
+        session_db = None
+        try:
+            from hermes_state import SessionDB
+            session_db = SessionDB()
+        except Exception:
+            pass
+
         agent = AIAgent(
             model=model,
             **runtime_kwargs,
@@ -414,6 +423,7 @@ class APIServerAdapter(BasePlatformAdapter):
             platform="api_server",
             stream_delta_callback=stream_delta_callback,
             tool_progress_callback=tool_progress_callback,
+            session_db=session_db,
         )
         return agent
 

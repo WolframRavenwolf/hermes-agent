@@ -1006,7 +1006,25 @@ class SessionStore:
                                 session_id, line[:120],
                             )
 
-        # Prefer whichever source has more messages.
+        # Fallback: load from session_<id>.json (AIAgent session log format).
+        # The AIAgent (run_agent.py) saves transcripts as session_<id>.json
+        # with a {"messages": [...]} structure.  This is the ONLY transcript
+        # format for API server sessions (which bypass the gateway session
+        # store entirely), and also exists for gateway sessions as a secondary
+        # log.  Without this fallback, /resume cannot restore API sessions.
+        json_messages = []
+        session_log_path = self.sessions_dir / f"session_{session_id}.json"
+        if session_log_path.exists():
+            try:
+                with open(session_log_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                json_messages = data.get("messages", [])
+            except (json.JSONDecodeError, Exception) as e:
+                logger.debug(
+                    "Could not load session log %s: %s", session_log_path, e
+                )
+
+        # Prefer whichever source has the most messages.
         #
         # Background: when a session pre-dates SQLite storage (or when the DB
         # layer was added while a long-lived session was already active), the
@@ -1016,16 +1034,26 @@ class SessionStore:
         # turn load_transcript returns those few SQLite rows and ignores the
         # full JSONL history — the model sees a context of 1-4 messages instead
         # of hundreds.  Using the longer source prevents this silent truncation.
-        if len(jsonl_messages) > len(db_messages):
-            if db_messages:
-                logger.debug(
-                    "Session %s: JSONL has %d messages vs SQLite %d — "
-                    "using JSONL (legacy session not yet fully migrated)",
-                    session_id, len(jsonl_messages), len(db_messages),
-                )
-            return jsonl_messages
+        candidates = [
+            ("sqlite", db_messages),
+            ("jsonl", jsonl_messages),
+            ("json_log", json_messages),
+        ]
+        best_source, best_messages = max(candidates, key=lambda x: len(x[1]))
 
-        return db_messages
+        if len(best_messages) > 0 and best_source != "sqlite":
+            runner_up = max(
+                ((s, m) for s, m in candidates if s != best_source),
+                key=lambda x: len(x[1]),
+            )
+            if runner_up[1]:
+                logger.debug(
+                    "Session %s: using %s (%d messages) over %s (%d messages)",
+                    session_id, best_source, len(best_messages),
+                    runner_up[0], len(runner_up[1]),
+                )
+
+        return best_messages
 
 
 def build_session_context(
