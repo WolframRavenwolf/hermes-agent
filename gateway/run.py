@@ -5846,6 +5846,14 @@ class GatewayRunner:
                     logger.debug("background_review_callback error: %s", _e)
 
             agent.background_review_callback = _bg_review_send
+            # Memory update notifications in chat.  Config: display.memory_notifications
+            #   off     — no chat notification (still logged to stdout)
+            #   on      — generic "💾 Memory updated" (default)
+            #   verbose — content preview: "💾 Memory ➕ Hermes Repo..."
+            _mem_notif = user_config.get("display", {}).get("memory_notifications")
+            if isinstance(_mem_notif, bool):
+                _mem_notif = "on" if _mem_notif else "off"
+            agent.memory_notifications = str(_mem_notif).lower() if _mem_notif else "on"
 
             # Show assistant thinking between tool calls — fully independent
             # of tool_progress mode.  Config: display.thinking_progress: true
