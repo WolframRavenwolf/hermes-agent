@@ -4851,7 +4851,8 @@ class GatewayRunner:
 
         # Check if there's an active agent
         session_key = session_entry.session_key
-        is_running = session_key in self._running_agents
+        agent = self._running_agents.get(session_key)
+        is_running = agent is not None and agent is not _AGENT_PENDING_SENTINEL
 
         title = None
         if self._session_db:
@@ -4859,7 +4860,54 @@ class GatewayRunner:
                 title = self._session_db.get_session_title(session_entry.session_id)
             except Exception:
                 title = None
-
+        
+        # Resolve model info — prefer live agent, fall back to config
+        model_name = ""
+        provider_name = ""
+        context_used = 0
+        context_total = 0
+        if is_running and hasattr(agent, "model"):
+            model_name = getattr(agent, "model", "") or ""
+            provider_name = getattr(agent, "provider", "") or ""
+            ctx = getattr(agent, "context_compressor", None)
+            if ctx:
+                context_used = getattr(ctx, "last_prompt_tokens", 0) or 0
+                context_total = getattr(ctx, "context_length", 0) or 0
+        else:
+            # Fall back to config for model and session entry for context
+            user_config = _load_gateway_config()
+            model_name = _resolve_gateway_model(user_config)
+            model_cfg = user_config.get("model", {})
+            if isinstance(model_cfg, dict):
+                provider_name = model_cfg.get("provider", "") or ""
+            context_used = session_entry.last_prompt_tokens or 0
+            if model_name:
+                try:
+                    from agent.model_metadata import DEFAULT_CONTEXT_LENGTHS
+                    model_lower = model_name.lower()
+                    for key, length in sorted(DEFAULT_CONTEXT_LENGTHS.items(), key=lambda x: len(x[0]), reverse=True):
+                        if key.lower() in model_lower:
+                            context_total = length
+                            break
+                except Exception:
+                    pass
+        
+        # Build model line
+        model_line = ""
+        if model_name:
+            if provider_name:
+                model_line = f"**Model:** {model_name} ({provider_name})"
+            else:
+                model_line = f"**Model:** {model_name}"
+        
+        # Build context line
+        context_line = ""
+        if context_total:
+            pct = min(100, round(context_used / context_total * 100))
+            context_line = f"**Context:** ~{context_used:,} / {context_total:,} ({pct}%)"
+        elif context_used:
+            context_line = f"**Context:** ~{context_used:,}"
+        
         lines = [
             "📊 **Hermes Gateway Status**",
             "",
@@ -4870,12 +4918,18 @@ class GatewayRunner:
         lines.extend([
             f"**Created:** {session_entry.created_at.strftime('%Y-%m-%d %H:%M')}",
             f"**Last Activity:** {session_entry.updated_at.strftime('%Y-%m-%d %H:%M')}",
-            f"**Tokens:** {session_entry.total_tokens:,}",
+        ])
+        if model_line:
+            lines.append(model_line)
+        if context_line:
+            lines.append(context_line)
+        lines.extend([
+            f"**Tokens:** {session_entry.total_tokens:,} (cumulative)",
             f"**Agent Running:** {'Yes ⚡' if is_running else 'No'}",
             "",
             f"**Connected Platforms:** {', '.join(connected_platforms)}",
         ])
-
+        
         return "\n".join(lines)
 
     async def _handle_agents_command(self, event: MessageEvent) -> str:
