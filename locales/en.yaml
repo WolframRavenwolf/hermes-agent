@@ -335,7 +335,8 @@ gateway:
     mode_off:              "⚙️ Tool progress: **OFF** — no tool activity shown."
     mode_new:              "⚙️ Tool progress: **NEW** — shown when tool changes (preview length: `display.tool_preview_length`, default 40)."
     mode_all:              "⚙️ Tool progress: **ALL** — every tool call shown (preview length: `display.tool_preview_length`, default 40)."
-    mode_verbose:          "⚙️ Tool progress: **VERBOSE** — every tool call with full arguments."
+    mode_verbose:          "⚙️ Tool progress: **VERBOSE** — detailed tool args (200 char limit)."
+    mode_full:             "⚙️ Tool progress: **FULL** — complete args, no truncation."
     saved_suffix:          "_(saved for **{platform}** — takes effect on next message)_"
     save_failed:           "_(could not save to config: {error})_"
 

@@ -320,7 +320,8 @@ gateway:
     mode_off:              "⚙️ Tool-Fortschritt: **OFF** — keine Tool-Aktivität angezeigt."
     mode_new:              "⚙️ Tool-Fortschritt: **NEW** — angezeigt bei Tool-Wechsel (Vorschaulänge: `display.tool_preview_length`, Standard 40)."
     mode_all:              "⚙️ Tool-Fortschritt: **ALL** — jeder Tool-Aufruf wird angezeigt (Vorschaulänge: `display.tool_preview_length`, Standard 40)."
-    mode_verbose:          "⚙️ Tool-Fortschritt: **VERBOSE** — jeder Tool-Aufruf mit vollständigen Argumenten."
+    mode_verbose:          "⚙️ Tool-Fortschritt: **VERBOSE** — detaillierte Tool-Argumente (200-Zeichen-Limit)."
+    mode_full:             "⚙️ Tool-Fortschritt: **FULL** — vollständige Argumente, keine Kürzung."
     saved_suffix:          "_(für **{platform}** gespeichert — wird ab nächster Nachricht wirksam)_"
     save_failed:           "_(konnte nicht in der Konfiguration gespeichert werden: {error})_"
 
