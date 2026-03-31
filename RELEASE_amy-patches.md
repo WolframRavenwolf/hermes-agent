@@ -53,6 +53,20 @@ Platform-aware zipper mode defaults for Amy's persona:
 
 ## 🐛 Bug Fixes
 
+### Gateway /status: Provider-Aware Idle Context Window (2026-05-19)
+
+`/status` shows model, context usage, and cumulative token labels. Its idle
+fallback resolves the model context window provider-aware instead of using raw
+`DEFAULT_CONTEXT_LENGTHS`, so `gpt-5.5` via `openai-codex` displays the real
+272,000-token Codex OAuth window instead of the direct-OpenAI 1,050,000-token
+window. The same path respects provider/base URL/custom-provider/context
+overrides used by `/model` and compression.
+
+**Files:** `gateway/run.py`, `tests/gateway/test_status_command.py`
+
+**Verification:** `tests/gateway/test_status_command.py`,
+`tests/hermes_cli/test_model_switch_context_display.py`.
+
 ### Session Search: Lazy DB Creation (`154785c3`)
 
 The `session_search` tool passed `db=None` to the search function when no pre-initialized `SessionDB` existed — silently returning zero results in cron jobs and background agents (memory flush). Direct SQL queries against `state.db` worked fine, confirming the issue was in tool initialization. Fixed by adding a `_session_search_handler` that lazily creates a `SessionDB` instance when none is provided.

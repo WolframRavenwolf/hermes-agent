@@ -175,6 +175,47 @@ async def test_status_command_tokens_zero_when_session_db_row_missing():
 
 
 @pytest.mark.asyncio
+async def test_status_command_idle_context_uses_provider_aware_limit(monkeypatch):
+    """Idle /status must not fall back to provider-blind static context windows.
+
+    gpt-5.5 is 1.05M on the direct OpenAI API, but openai-codex exposes a
+    272K context window. The status command should display the provider-aware
+    value even when no agent is currently running.
+    """
+    import gateway.run as gateway_run
+
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    session_entry.last_prompt_tokens = 182_566
+    runner = _make_runner(session_entry)
+    runner._session_db.get_session.return_value = None
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"model": {"default": "gpt-5.5", "provider": "openai-codex"}},
+    )
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda model, **kwargs: 272_000
+        if model == "gpt-5.5" and kwargs.get("provider") == "openai-codex"
+        else 1_050_000,
+    )
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert "**Model:** gpt-5.5 (openai-codex)" in result
+    assert "**Context:** ~182,566 / 272,000 (67%)" in result
+    assert "1,050,000" not in result
+
+
+@pytest.mark.asyncio
 async def test_agents_command_reports_active_agents_and_processes(monkeypatch):
     session_key = build_session_key(_make_source())
     session_entry = SessionEntry(

@@ -8611,7 +8611,8 @@ class GatewayRunner:
 
         # Check if there's an active agent
         session_key = session_entry.session_key
-        is_running = session_key in self._running_agents
+        agent = self._running_agents.get(session_key)
+        is_running = agent is not None and agent is not _AGENT_PENDING_SENTINEL
 
         # Count pending /queue follow-ups (slot + overflow).
         adapter = self.adapters.get(source.platform) if source else None
@@ -8643,6 +8644,95 @@ class GatewayRunner:
             except Exception:
                 db_total_tokens = 0
 
+        # Resolve model info — prefer live agent, fall back to config
+        model_name = ""
+        provider_name = ""
+        context_used = 0
+        context_total = 0
+        if is_running and hasattr(agent, "model"):
+            _agent_model = getattr(agent, "model", "") or ""
+            _agent_provider = getattr(agent, "provider", "") or ""
+            model_name = _agent_model if isinstance(_agent_model, str) else ""
+            provider_name = _agent_provider if isinstance(_agent_provider, str) else ""
+            ctx = getattr(agent, "context_compressor", None)
+            if ctx:
+                _ctx_used = getattr(ctx, "last_prompt_tokens", 0) or 0
+                _ctx_total = getattr(ctx, "context_length", 0) or 0
+                if isinstance(_ctx_used, (int, float)):
+                    context_used = int(_ctx_used)
+                if isinstance(_ctx_total, (int, float)):
+                    context_total = int(_ctx_total)
+        else:
+            # Fall back to config for model and session entry for context
+            user_config = _load_gateway_config()
+            model_name = _resolve_gateway_model(user_config)
+            model_cfg = user_config.get("model", {})
+            if isinstance(model_cfg, dict):
+                provider_name = model_cfg.get("provider", "") or ""
+            context_used = session_entry.last_prompt_tokens or 0
+            if model_name:
+                try:
+                    # Use the same provider-aware context resolver as /model.
+                    # Raw DEFAULT_CONTEXT_LENGTHS is provider-blind (for example
+                    # gpt-5.5 is 1.05M on direct OpenAI but 272K via Codex OAuth).
+                    from hermes_cli.model_switch import resolve_display_context_length
+
+                    config_context_length = None
+                    base_url = ""
+                    api_key = ""
+                    if isinstance(model_cfg, dict):
+                        base_url = model_cfg.get("base_url", "") or ""
+                        api_key = model_cfg.get("api_key", "") or ""
+                        raw_ctx = model_cfg.get("context_length")
+                        if raw_ctx is not None:
+                            try:
+                                config_context_length = int(raw_ctx)
+                            except (TypeError, ValueError):
+                                config_context_length = None
+
+                    custom_providers = []
+                    try:
+                        from hermes_cli.config import get_compatible_custom_providers
+                        custom_providers = get_compatible_custom_providers(user_config)
+                    except Exception:
+                        raw_custom = user_config.get("custom_providers", [])
+                        if isinstance(raw_custom, list):
+                            custom_providers = raw_custom
+
+                    resolved_ctx = resolve_display_context_length(
+                        model_name,
+                        provider_name,
+                        base_url=base_url,
+                        api_key=api_key,
+                        custom_providers=custom_providers,
+                        config_context_length=config_context_length,
+                    )
+                    if resolved_ctx:
+                        context_total = int(resolved_ctx)
+                except Exception:
+                    pass
+
+        # Build model line
+        model_line = ""
+        if model_name:
+            if provider_name:
+                model_line = t("gateway.status.model_provider", model=model_name, provider=provider_name)
+            else:
+                model_line = t("gateway.status.model", model=model_name)
+
+        # Build context line
+        context_line = ""
+        if context_total:
+            pct = min(100, round(context_used / context_total * 100))
+            context_line = t(
+                "gateway.status.context_with_total",
+                used=f"{context_used:,}",
+                total=f"{context_total:,}",
+                pct=str(pct),
+            )
+        elif context_used:
+            context_line = t("gateway.status.context_used", used=f"{context_used:,}")
+
         lines = [
             t("gateway.status.header"),
             "",
@@ -8653,11 +8743,15 @@ class GatewayRunner:
         lines.extend([
             t("gateway.status.created", timestamp=session_entry.created_at.strftime('%Y-%m-%d %H:%M')),
             t("gateway.status.last_activity", timestamp=session_entry.updated_at.strftime('%Y-%m-%d %H:%M')),
-            t("gateway.status.tokens", tokens=f"{db_total_tokens:,}"),
+            t("gateway.status.tokens_cumulative", tokens=f"{db_total_tokens:,}"),
             t("gateway.status.agent_running", state=t("gateway.status.state_yes") if is_running else t("gateway.status.state_no")),
         ])
         if queue_depth:
             lines.append(t("gateway.status.queued", count=queue_depth))
+        if model_line:
+            lines.append(model_line)
+        if context_line:
+            lines.append(context_line)
         lines.extend([
             "",
             t("gateway.status.platforms", platforms=', '.join(connected_platforms)),
