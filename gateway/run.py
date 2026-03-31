@@ -4409,12 +4409,13 @@ class GatewayRunner:
             )
 
         # --- cycle mode -------------------------------------------------------
-        cycle = ["off", "new", "all", "verbose"]
+        cycle = ["off", "new", "all", "verbose", "full"]
         descriptions = {
             "off": "⚙️ Tool progress: **OFF** — no tool activity shown.",
             "new": "⚙️ Tool progress: **NEW** — shown when tool changes.",
             "all": "⚙️ Tool progress: **ALL** — every tool call shown.",
-            "verbose": "⚙️ Tool progress: **VERBOSE** — full args and results.",
+            "verbose": "⚙️ Tool progress: **VERBOSE** — detailed tool args.",
+            "full": "⚙️ Tool progress: **FULL** — complete args, no truncation.",
         }
 
         raw_progress = user_config.get("display", {}).get("tool_progress", "all")
@@ -5533,6 +5534,14 @@ class GatewayRunner:
             from agent.display import get_tool_emoji
             emoji = get_tool_emoji(tool_name, default="⚙️")
             
+            # Full mode: show complete arguments (no truncation)
+            if progress_mode == "full" and args:
+                import json as _json
+                args_str = _json.dumps(args, ensure_ascii=False, default=str)
+                msg = f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
+                progress_queue.put(msg)
+                return
+
             # Verbose mode: show detailed arguments
             if progress_mode == "verbose" and args:
                 import json as _json
