@@ -347,6 +347,7 @@ Future messages in this room will use that transcript until `/reset` or another 
     mode_new:              "⚙️ Прогрес інструментів: **NEW** — показується при зміні інструмента (довжина попереднього перегляду: `display.tool_preview_length`, за замовчуванням 40)."
     mode_all:              "⚙️ Прогрес інструментів: **ALL** — показується кожен виклик інструмента (довжина попереднього перегляду: `display.tool_preview_length`, за замовчуванням 40)."
     mode_verbose:          "⚙️ Прогрес інструментів: **VERBOSE** — кожен виклик інструмента з повними аргументами."
+    mode_full:             "⚙️ Tool progress: **FULL** - complete args, no truncation."
     saved_suffix:          "_(збережено для **{platform}** — набуде чинності з наступного повідомлення)_"
     save_failed:           "_(не вдалося зберегти у конфігурацію: {error})_"
 

@@ -8195,7 +8195,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
 
     def _toggle_verbose(self):
-        """Cycle tool progress mode: off → new → all → verbose → off.
+        """Cycle tool progress mode: off → new → all → verbose → full → off.
 
         Tool-progress display (full args / results / think blocks at the
         ``verbose`` step) is INDEPENDENT of global DEBUG logging.  Cycling
@@ -8204,7 +8204,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         explicit ``-v``/``--verbose`` flag and the ``/verbose-logging``
         toggle.  See PR #6a1aa420e for the history that decoupled them.
         """
-        cycle = ["off", "new", "all", "verbose"]
+        cycle = ["off", "new", "all", "verbose", "full"]
         try:
             idx = cycle.index(self.tool_progress_mode)
         except ValueError:
@@ -8228,6 +8228,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             "new": f"{_Colors.YELLOW}Tool progress: NEW{_Colors.RESET} — show each new tool (skip repeats).",
             "all": f"{_Colors.GREEN}Tool progress: ALL{_Colors.RESET} — show every tool call.",
             "verbose": f"{_Colors.BOLD}{_Colors.GREEN}Tool progress: VERBOSE{_Colors.RESET} — full args, results, and think blocks.",
+            "full": f"{_Colors.BOLD}{_Colors.CYAN}Tool progress: FULL{_Colors.RESET} — complete args, no truncation.",
         }
         _cprint(labels.get(self.tool_progress_mode, ""))
 

@@ -14531,6 +14531,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _cmd_short = _cmd_short + " ..."
                 _code_block_short = f"{_block_header}```\n{_cmd_short}\n```"
 
+            # Full mode: show complete arguments (no truncation).
+            # This is Amy's opt-in debugging mode: unlike verbose, it
+            # deliberately emits the full raw argument JSON so metadata
+            # such as workdir, timeout, background, and media paths is not
+            # lost behind a terminal-only code-block preview.
+            if progress_mode == "full" and args:
+                args_str = json.dumps(args, ensure_ascii=False, default=str)
+                msg = f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
+                last_was_terminal_block[0] = False
+                progress_queue.put(msg)
+                return
+
             # Verbose mode: show detailed arguments, respects tool_preview_length
             if progress_mode == "verbose":
                 if _code_block_full is not None:
@@ -15319,6 +15331,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent.tool_start_callback = (
                 voice_ack_callback if _voice_ack_guild[0] is not None else None
             )
+            agent.tool_progress_mode = progress_mode if tool_progress_enabled else None
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None

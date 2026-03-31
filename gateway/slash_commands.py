@@ -2349,8 +2349,8 @@ class GatewaySlashCommandsMixin:
 
         Gated by ``display.tool_progress_command`` in config.yaml (default off).
         When enabled, cycles the tool progress mode through off → new → all →
-        verbose → off for the *current platform*.  The setting is saved to
-        ``display.platforms.<platform>.tool_progress`` so each channel can
+        verbose → full → off for the *current platform*.  The setting is saved
+        to ``display.platforms.<platform>.tool_progress`` so each channel can
         have its own verbosity level independently.
         """
         from gateway.run import _hermes_home, _load_gateway_config, _platform_config_key
@@ -2372,12 +2372,13 @@ class GatewaySlashCommandsMixin:
             return t("gateway.verbose.not_enabled")
 
         # --- cycle mode (per-platform) ----------------------------------------
-        cycle = ["off", "new", "all", "verbose"]
+        cycle = ["off", "new", "all", "verbose", "full"]
         descriptions = {
             "off": t("gateway.verbose.mode_off"),
             "new": t("gateway.verbose.mode_new"),
             "all": t("gateway.verbose.mode_all"),
             "verbose": t("gateway.verbose.mode_verbose"),
+            "full": t("gateway.verbose.mode_full"),
         }
 
         # Read current effective mode for this platform via the resolver
