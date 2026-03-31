@@ -533,6 +533,8 @@ class AIAgent:
         # would mangle the escape sequences.  None = use builtins.print.
         self._print_fn = None
         self.background_review_callback = None  # Optional sync callback for gateway delivery
+        self.memory_notifications = "on"  # Memory update notifications: "off", "on", "verbose"
+        self.thinking_progress = False  # Relay assistant thinking text between tool calls to gateway
         self.skip_context_files = skip_context_files
         self.pass_session_id = pass_session_id
         self.persist_session = persist_session
@@ -7921,21 +7923,39 @@ class AIAgent:
                     else:
                         self._vprint(f"{self.log_prefix}🤖 Assistant: {assistant_message.content[:100]}{'...' if len(assistant_message.content) > 100 else ''}")
 
-                # Notify progress callback of model's thinking (used by subagent
-                # delegation to relay the child's reasoning to the parent display).
-                # Guard: only fire for subagents (_delegate_depth >= 1) to avoid
-                # spamming gateway platforms with the main agent's every thought.
+                # Notify progress callback of model's thinking.
+                # Only relay when the model will continue with tool calls — not
+                # for the final response (which is delivered via the normal
+                # response path and would otherwise appear twice).
+                # Thinking relay is controlled by thinking_progress (independent
+                # of tool_progress).  Subagents always relay for parent display.
+                # Main agent: only relay when tool_calls present (avoids duplicate
+                # final response).  Subagents: always relay (their final response
+                # isn't delivered to chat directly — it goes back to the parent
+                # as a tool result, so suppressing it would lose visibility).
+                _is_subagent = getattr(self, '_delegate_depth', 0) > 0
+                _should_relay_thinking = (
+                    _is_subagent
+                    or getattr(self, 'thinking_progress', False)
+                )
+                _has_tool_calls = bool(assistant_message.tool_calls)
                 if (assistant_message.content and self.tool_progress_callback
-                        and getattr(self, '_delegate_depth', 0) > 0):
+                        and _should_relay_thinking
+                        and (_has_tool_calls or _is_subagent)):
                     _think_text = assistant_message.content.strip()
                     # Strip reasoning XML tags that shouldn't leak to parent display
                     _think_text = re.sub(
                         r'</?(?:REASONING_SCRATCHPAD|think|reasoning)>', '', _think_text
                     ).strip()
-                    first_line = _think_text.split('\n')[0][:80] if _think_text else ""
-                    if first_line:
+                    if getattr(self, 'thinking_progress', False):
+                        # Explicit thinking_progress: relay complete text, no limit
+                        _relay_text = _think_text or ""
+                    else:
+                        # Subagent relay: first line, truncated
+                        _relay_text = _think_text.split('\n')[0][:80] if _think_text else ""
+                    if _relay_text:
                         try:
-                            self.tool_progress_callback("_thinking", first_line)
+                            self.tool_progress_callback("_thinking", _relay_text)
                         except Exception:
                             pass
                 

@@ -5395,9 +5395,16 @@ class GatewayRunner:
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform
         tool_progress_enabled = progress_mode != "off" and source.platform != Platform.WEBHOOK
-        
+        # thinking_progress is independent — if enabled, we need the progress
+        # queue even when tool_progress is off (thinking relay uses same infra)
+        _thinking_cfg = user_config.get("display", {}).get("thinking_progress")
+        _thinking_enabled = (
+            _thinking_cfg is True
+            or (isinstance(_thinking_cfg, str) and _thinking_cfg.lower() in ("true", "yes", "1", "on"))
+        )
+        needs_progress_queue = tool_progress_enabled or _thinking_enabled
         # Queue for progress messages (thread-safe)
-        progress_queue = queue.Queue() if tool_progress_enabled else None
+        progress_queue = queue.Queue() if needs_progress_queue else None
         last_tool = [None]  # Mutable container for tracking in closure
         last_progress_msg = [None]  # Track last message for dedup
         repeat_count = [0]  # How many times the same message repeated
@@ -5406,7 +5413,19 @@ class GatewayRunner:
             """Callback invoked by agent when a tool is called."""
             if not progress_queue:
                 return
-            
+
+            # "_thinking" is assistant text between tool calls — relay as-is
+            if tool_name == "_thinking":
+                msg = f"💬 {preview}" if preview else None
+                if msg:
+                    progress_queue.put(msg)
+                return
+
+            # If tool_progress is off, only _thinking passes through (above).
+            # Regular tool calls are suppressed.
+            if not tool_progress_enabled:
+                return
+
             # "new" mode: only report when tool changes
             if progress_mode == "new" and tool_name == last_tool[0]:
                 return
@@ -5749,7 +5768,8 @@ class GatewayRunner:
 
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
-            agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
+            agent.tool_progress_callback = progress_callback if needs_progress_queue else None
+            agent.tool_progress_mode = progress_mode if tool_progress_enabled else None
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
             agent.status_callback = _status_callback_sync
@@ -5772,6 +5792,16 @@ class GatewayRunner:
                     logger.debug("background_review_callback error: %s", _e)
 
             agent.background_review_callback = _bg_review_send
+
+            # Show assistant thinking between tool calls — fully independent
+            # of tool_progress mode.  Config: display.thinking_progress: true
+            _thinking_progress = user_config.get("display", {}).get("thinking_progress")
+            if isinstance(_thinking_progress, bool):
+                agent.thinking_progress = _thinking_progress
+            elif isinstance(_thinking_progress, str):
+                agent.thinking_progress = _thinking_progress.lower() in ("true", "yes", "1", "on")
+            else:
+                agent.thinking_progress = False
 
             # Store agent reference for interrupt support
             agent_holder[0] = agent
@@ -6035,7 +6065,7 @@ class GatewayRunner:
         
         # Start progress message sender if enabled
         progress_task = None
-        if tool_progress_enabled:
+        if needs_progress_queue:
             progress_task = asyncio.create_task(send_progress_messages())
 
         # Start stream consumer task — polls for consumer creation since it
