@@ -273,6 +273,16 @@ TOOL_CATEGORIES = {
                 "browser_provider": "browser-use",
                 "post_setup": "browserbase",
             },
+            {
+                "name": "Camofox",
+                "tag": "Local anti-detection browser (Firefox/Camoufox)",
+                "env_vars": [
+                    {"key": "CAMOFOX_URL", "prompt": "Camofox server URL", "default": "http://localhost:9377",
+                     "url": "https://github.com/jo-inc/camofox-browser"},
+                ],
+                "browser_provider": "camofox",
+                "post_setup": "camofox",
+            },
         ],
     },
     "homeassistant": {
@@ -336,6 +346,28 @@ def _run_post_setup(post_setup_key: str):
                 _print_warning(f"    npm install failed - run manually: cd {display_hermes_home()}/hermes-agent && npm install")
         elif not node_modules.exists():
             _print_warning("    Node.js not found - browser tools require: npm install (in hermes-agent directory)")
+
+    elif post_setup_key == "camofox":
+        camofox_dir = PROJECT_ROOT / "node_modules" / "@askjo" / "camoufox-browser"
+        if not camofox_dir.exists() and shutil.which("npm"):
+            _print_info("    Installing Camofox browser server...")
+            import subprocess
+            result = subprocess.run(
+                ["npm", "install", "--silent"],
+                capture_output=True, text=True, cwd=str(PROJECT_ROOT)
+            )
+            if result.returncode == 0:
+                _print_success("    Camofox installed")
+            else:
+                _print_warning("    npm install failed - run manually: npm install")
+        if camofox_dir.exists():
+            _print_info("    Start the Camofox server:")
+            _print_info("      npx @askjo/camoufox-browser")
+            _print_info("    First run downloads the Camoufox engine (~300MB)")
+            _print_info("    Or use Docker: docker run -p 9377:9377 jo-inc/camofox-browser")
+        elif not shutil.which("npm"):
+            _print_warning("    Node.js not found. Install Camofox via Docker:")
+            _print_info("      docker run -p 9377:9377 jo-inc/camofox-browser")
 
     elif post_setup_key == "rl_training":
         try:
@@ -565,7 +597,9 @@ def _toolset_has_keys(ts_key: str) -> bool:
     if cat:
         for provider in cat.get("providers", []):
             env_vars = provider.get("env_vars", [])
-            if env_vars and all(get_env_value(e["key"]) for e in env_vars):
+            if not env_vars:
+                return True  # No-key provider (e.g. Local Browser, Edge TTS)
+            if all(get_env_value(e["key"]) for e in env_vars):
                 return True
         return False
 
@@ -949,8 +983,13 @@ def _configure_simple_requirements(ts_key: str):
             key_label = "    OPENAI_API_KEY" if "api.openai.com" in base_url.lower() else "    API key"
             api_key = _prompt(key_label, password=True)
             if api_key and api_key.strip():
-                save_env_value("OPENAI_BASE_URL", base_url)
                 save_env_value("OPENAI_API_KEY", api_key.strip())
+                # Save vision base URL to config (not .env — only secrets go there)
+                from hermes_cli.config import load_config, save_config
+                _cfg = load_config()
+                _aux = _cfg.setdefault("auxiliary", {}).setdefault("vision", {})
+                _aux["base_url"] = base_url
+                save_config(_cfg)
                 if "api.openai.com" in base_url.lower():
                     save_env_value("AUXILIARY_VISION_MODEL", "gpt-4o-mini")
                 _print_success("    Saved")
