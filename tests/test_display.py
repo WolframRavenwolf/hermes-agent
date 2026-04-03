@@ -88,6 +88,40 @@ class TestBuildToolPreview:
         assert result is not None
         assert "find something" in result
 
+    def test_delegate_task_single_goal(self):
+        """Single-task delegate should show the goal."""
+        result = build_tool_preview("delegate_task", {"goal": "Research Python typing"})
+        assert result is not None
+        assert "Research Python typing" in result
+
+    def test_delegate_task_batch(self):
+        """Batch delegate should show task count and individual goals."""
+        result = build_tool_preview("delegate_task", {"tasks": [
+            {"goal": "Research topic A"},
+            {"goal": "Analyze data B"},
+            {"goal": "Write report C"},
+        ]})
+        assert result is not None
+        assert "3 tasks" in result
+        assert "Research topic A" in result
+        assert "Analyze data B" in result
+        assert "Write report C" in result
+
+    def test_delegate_task_batch_empty_goals(self):
+        """Batch delegate with missing goals should not crash."""
+        result = build_tool_preview("delegate_task", {"tasks": [
+            {"goal": "Only this one"},
+            {},  # missing goal
+        ]})
+        assert result is not None
+        assert "2 tasks" in result
+        assert "Only this one" in result
+
+    def test_delegate_task_no_goal(self):
+        """delegate_task with neither goal nor tasks returns None."""
+        result = build_tool_preview("delegate_task", {"context": "some context"})
+        assert result is None
+
     def test_false_like_args_zero(self):
         """Non-dict falsy values should return None, not crash."""
         assert build_tool_preview("terminal", 0) is None
