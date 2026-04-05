@@ -875,6 +875,11 @@ class SessionDB:
         Also increments the session's message_count (and tool_call_count
         if role is 'tool' or tool_calls is present).
         """
+        # Serialize multimodal content arrays (e.g. text + image blocks)
+        # to JSON before storage.  Plain string content passes through as-is.
+        if isinstance(content, (list, dict)):
+            content = json.dumps(content)
+
         # Serialize structured fields to JSON before entering the write txn
         reasoning_details_json = (
             json.dumps(reasoning_details)
@@ -964,7 +969,23 @@ class SessionDB:
             rows = cursor.fetchall()
         messages = []
         for row in rows:
-            msg = {"role": row["role"], "content": row["content"]}
+            content = row["content"]
+            # Restore multimodal content arrays/dicts that were JSON-serialized
+            # during append_message.  Attempt parse for strings that look like
+            # JSON arrays ('[') or objects ('{') and contain multimodal markers.
+            if isinstance(content, str) and content and content[0] in ("[", "{"):
+                try:
+                    parsed = json.loads(content)
+                    # Only promote if it looks like multimodal content blocks
+                    # (a list of dicts with 'type' keys), not arbitrary JSON
+                    # that happens to appear in tool results.
+                    if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict) and "type" in parsed[0]:
+                        content = parsed
+                    elif isinstance(parsed, dict) and "type" in parsed:
+                        content = parsed
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            msg = {"role": row["role"], "content": content}
             if row["tool_call_id"]:
                 msg["tool_call_id"] = row["tool_call_id"]
             if row["tool_name"]:
