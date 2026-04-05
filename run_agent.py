@@ -1850,7 +1850,18 @@ class AIAgent:
         if 0 <= idx < len(messages):
             msg = messages[idx]
             if isinstance(msg, dict) and msg.get("role") == "user":
-                msg["content"] = override
+                existing = msg.get("content")
+                if isinstance(existing, list):
+                    # Multimodal content: replace only the text block(s),
+                    # preserve image blocks so session replay keeps images.
+                    msg["content"] = [
+                        {"type": "text", "text": override}
+                        if (b.get("type") == "text")
+                        else b
+                        for b in existing
+                    ]
+                else:
+                    msg["content"] = override
 
     def _persist_session(self, messages: List[Dict], conversation_history: List[Dict] = None):
         """Save session state to both JSON log and SQLite on any exit path.
@@ -6455,6 +6466,7 @@ class AIAgent:
     def run_conversation(
         self,
         user_message: str,
+        image_paths: Optional[List[str]] = None,
         system_message: str = None,
         conversation_history: List[Dict[str, Any]] = None,
         task_id: str = None,
@@ -6573,8 +6585,38 @@ class AIAgent:
                 _should_review_memory = True
                 self._turns_since_memory = 0
 
-        # Add user message
-        user_msg = {"role": "user", "content": user_message}
+        # Add user message — with native image blocks when image_paths are provided
+        if image_paths:
+            import base64 as _b64
+            from pathlib import Path as _Path
+            _mime_map = {
+                '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+                '.png': 'image/png', '.gif': 'image/gif',
+                '.webp': 'image/webp',
+            }
+            _MAX_IMAGE_BYTES = 15 * 1024 * 1024  # 15 MB limit per image
+            content_blocks = [{"type": "text", "text": user_message}]
+            for _img_path in image_paths:
+                try:
+                    _img_file = _Path(_img_path)
+                    if _img_file.stat().st_size > _MAX_IMAGE_BYTES:
+                        logger.warning("Image %s too large (%d bytes), skipping native embed", _img_path, _img_file.stat().st_size)
+                        continue
+                    _img_data = _img_file.read_bytes()
+                    _b64_data = _b64.standard_b64encode(_img_data).decode()
+                    _ext = _Path(_img_path).suffix.lower()
+                    _media_type = _mime_map.get(_ext, 'image/jpeg')
+                    content_blocks.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{_media_type};base64,{_b64_data}"
+                        }
+                    })
+                except Exception as _img_err:
+                    logger.warning("Failed to read image %s for native multimodal: %s", _img_path, _img_err)
+            user_msg = {"role": "user", "content": content_blocks}
+        else:
+            user_msg = {"role": "user", "content": user_message}
         messages.append(user_msg)
         current_turn_user_idx = len(messages) - 1
         self._persist_user_message_idx = current_turn_user_idx

@@ -2530,6 +2530,7 @@ class GatewayRunner:
         # tool even when they appear in the same message.
         # -----------------------------------------------------------------
         message_text = event.text or ""
+        native_image_paths: List[str] = []  # populated when native multimodal is on
         if event.media_urls:
             image_paths = []
             for i, path in enumerate(event.media_urls):
@@ -2542,9 +2543,25 @@ class GatewayRunner:
                 if is_image:
                     image_paths.append(path)
             if image_paths:
-                message_text = await self._enrich_message_with_vision(
-                    message_text, image_paths
-                )
+                _user_config = _load_gateway_config()
+                _native_mm = bool(_user_config.get("native_multimodal", False))
+                if _native_mm:
+                    # Native multimodal: pass images as-is to the LLM
+                    native_image_paths = image_paths
+                    if not message_text:
+                        message_text = "[User sent image(s)]"
+                    # Still mention paths so the model can re-examine
+                    # with vision_analyze if needed
+                    for _p in image_paths:
+                        message_text += (
+                            f"\n[Image attached natively. For re-examination, "
+                            f"use vision_analyze with image_url: {_p}]"
+                        )
+                else:
+                    # Legacy: pre-analyze with vision model
+                    message_text = await self._enrich_message_with_vision(
+                        message_text, image_paths
+                    )
         
         # -----------------------------------------------------------------
         # Auto-transcribe voice/audio messages sent by the user
@@ -2681,6 +2698,7 @@ class GatewayRunner:
             # Run the agent
             agent_result = await self._run_agent(
                 message=message_text,
+                image_paths=native_image_paths or None,
                 context_prompt=context_prompt,
                 history=history,
                 source=source,
@@ -5448,6 +5466,7 @@ class GatewayRunner:
         session_key: str = None,
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
+        image_paths: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -6051,7 +6070,7 @@ class GatewayRunner:
             _approval_session_key = session_key or ""
             register_gateway_notify(_approval_session_key, _approval_notify_sync)
             try:
-                result = agent.run_conversation(message, conversation_history=agent_history, task_id=session_id)
+                result = agent.run_conversation(message, image_paths=image_paths, conversation_history=agent_history, task_id=session_id)
             finally:
                 unregister_gateway_notify(_approval_session_key)
             result_holder[0] = result

@@ -904,8 +904,24 @@ def estimate_tokens_rough(text: str) -> int:
 
 def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
     """Rough token estimate for a message list (pre-flight only)."""
-    total_chars = sum(len(str(msg)) for msg in messages)
-    return total_chars // 4
+    total = 0
+    for msg in messages:
+        content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
+        if isinstance(content, list):
+            # Multimodal content array — count text blocks normally,
+            # use fixed estimate for image blocks (base64 is huge but
+            # actual token cost is ~1600 per image for most providers).
+            for block in content:
+                btype = block.get("type", "") if isinstance(block, dict) else ""
+                if btype == "text":
+                    total += len(block.get("text", "")) // 4
+                elif btype in ("image_url", "image"):
+                    total += 1600  # approximate per-image token cost
+                else:
+                    total += len(str(block)) // 4
+        else:
+            total += len(str(msg)) // 4
+    return total
 
 
 def estimate_request_tokens_rough(
