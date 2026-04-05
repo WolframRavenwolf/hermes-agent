@@ -196,6 +196,27 @@ class ContextCompressor:
         budget = int(content_tokens * _SUMMARY_RATIO)
         return max(_MIN_SUMMARY_TOKENS, min(budget, self.max_summary_tokens))
 
+    @staticmethod
+    def _flatten_multimodal_content(content) -> str:
+        """Convert multimodal content arrays to plain text for summarization.
+
+        Replaces image blocks with text placeholders so huge base64 data
+        never reaches the summarizer LLM.
+        """
+        if isinstance(content, list):
+            text_parts = []
+            for block in content:
+                if not isinstance(block, dict):
+                    text_parts.append(str(block))
+                elif block.get("type") == "text":
+                    text_parts.append(block.get("text", ""))
+                elif block.get("type") in ("image_url", "image"):
+                    text_parts.append("[Attached image]")
+                else:
+                    text_parts.append(str(block))
+            return "\n".join(text_parts)
+        return content if isinstance(content, str) else str(content or "")
+
     def _serialize_for_summary(self, turns: List[Dict[str, Any]]) -> str:
         """Serialize conversation turns into labeled text for the summarizer.
 
@@ -206,7 +227,7 @@ class ContextCompressor:
         parts = []
         for msg in turns:
             role = msg.get("role", "unknown")
-            content = msg.get("content") or ""
+            content = self._flatten_multimodal_content(msg.get("content") or "")
 
             # Tool results: keep more content than before (3000 chars)
             if role == "tool":
@@ -510,7 +531,7 @@ Write only the summary body. Do not include any preamble or prefix."""
 
         for i in range(n - 1, head_end - 1, -1):
             msg = messages[i]
-            content = msg.get("content") or ""
+            content = self._flatten_multimodal_content(msg.get("content") or "")
             msg_tokens = len(content) // _CHARS_PER_TOKEN + 10  # +10 for role/metadata
             # Include tool call arguments in estimate
             for tc in msg.get("tool_calls") or []:
@@ -653,7 +674,7 @@ Write only the summary body. Do not include any preamble or prefix."""
         for i in range(compress_end, n_messages):
             msg = messages[i].copy()
             if _merge_summary_into_tail and i == compress_end:
-                original = msg.get("content") or ""
+                original = self._flatten_multimodal_content(msg.get("content") or "")
                 msg["content"] = summary + "\n\n" + original
                 _merge_summary_into_tail = False
             compressed.append(msg)

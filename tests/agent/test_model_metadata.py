@@ -92,13 +92,20 @@ class TestEstimateMessagesTokensRough:
         assert result == len(str(msg)) // 4
 
     def test_message_with_list_content(self):
-        """Vision messages with multimodal content arrays."""
+        """Vision messages with multimodal content arrays.
+
+        Image blocks use a fixed ~1600 token estimate (actual API cost)
+        rather than counting the base64 string chars (which would
+        massively overcount).
+        """
         msg = {"role": "user", "content": [
             {"type": "text", "text": "describe"},
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
         ]}
         result = estimate_messages_tokens_rough([msg])
-        assert result == len(str(msg)) // 4
+        # ~1600 for image + ~2 for "describe" text
+        assert result >= 1600
+        assert result < 2000
 
 
 # =========================================================================
