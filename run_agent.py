@@ -2605,6 +2605,9 @@ class AIAgent:
                                 "content": args.get("content", ""),
                                 "old_text": args.get("old_text", ""),
                                 "name": args.get("name", ""),
+                                # For skill_manage patch: capture old/new strings
+                                "old_string": args.get("old_string", ""),
+                                "new_string": args.get("new_string", ""),
                             }
 
                 for msg in _review_msgs:
@@ -2644,8 +2647,21 @@ class AIAgent:
                         # Build a descriptive action string with content preview
                         _MAX_PREVIEW = 120
                         if is_skill:
-                            # Skill notifications: use the message from the tool
-                            actions.append(f"📝 {message}" if message else f"Skill {action}")
+                            # Skill notifications: show change details when available
+                            _change = data.get("_change", {})
+                            _old_s = _change.get("old", "") or detail.get("old_string", "")
+                            _new_s = _change.get("new", "") or detail.get("new_string", "")
+                            _sk_desc = _change.get("description", "")
+                            if action == "patch" and (_old_s or _new_s):
+                                _old_p = _old_s[:80].replace("\n", " ") + ("…" if len(_old_s) > 80 else "")
+                                _new_p = _new_s[:80].replace("\n", " ") + ("…" if len(_new_s) > 80 else "")
+                                actions.append(f"📝 Skill '{skill_name}' patched: \"{_old_p}\" → \"{_new_p}\"")
+                            elif action == "create" and _sk_desc:
+                                actions.append(f"📝 Skill '{skill_name}' created: {_sk_desc}")
+                            elif action == "edit" and _sk_desc:
+                                actions.append(f"📝 Skill '{skill_name}' rewritten: {_sk_desc}")
+                            else:
+                                actions.append(f"📝 {message}" if message else f"Skill {action}")
                         elif action == "add" and content:
                             preview = content[:_MAX_PREVIEW] + ("…" if len(content) > _MAX_PREVIEW else "")
                             actions.append(f"{label} ➕ {preview}")
