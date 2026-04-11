@@ -433,9 +433,19 @@ def build_environment_hints() -> str:
     return "\n\n".join(hints)
 
 
-CONTEXT_FILE_MAX_CHARS = 20_000
+CONTEXT_FILE_MAX_CHARS = 25_000
 CONTEXT_TRUNCATE_HEAD_RATIO = 0.7
 CONTEXT_TRUNCATE_TAIL_RATIO = 0.2
+
+# Collect truncation warnings so the caller (run_agent) can surface them.
+_truncation_warnings: list = []
+
+
+def drain_truncation_warnings() -> list:
+    """Return and clear any truncation warnings accumulated since last drain."""
+    warnings = _truncation_warnings.copy()
+    _truncation_warnings.clear()
+    return warnings
 
 
 # =========================================================================
@@ -900,6 +910,13 @@ def _truncate_content(content: str, filename: str, max_chars: int = CONTEXT_FILE
     """Head/tail truncation with a marker in the middle."""
     if len(content) <= max_chars:
         return content
+    msg = (
+        f"⚠️  Context file {filename} TRUNCATED: "
+        f"{len(content)} chars exceeds limit of {max_chars} — "
+        f"increase CONTEXT_FILE_MAX_CHARS or trim the file!"
+    )
+    logger.warning(msg)
+    _truncation_warnings.append(msg)
     head_chars = int(max_chars * CONTEXT_TRUNCATE_HEAD_RATIO)
     tail_chars = int(max_chars * CONTEXT_TRUNCATE_TAIL_RATIO)
     head = content[:head_chars]
