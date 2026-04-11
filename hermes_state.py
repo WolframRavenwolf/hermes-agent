@@ -891,14 +891,32 @@ class SessionDB:
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT role, content, tool_call_id, tool_calls, tool_name, "
-                "reasoning, reasoning_details, codex_reasoning_items "
+                "reasoning, reasoning_details, codex_reasoning_items, timestamp "
                 "FROM messages WHERE session_id = ? ORDER BY timestamp, id",
                 (session_id,),
             )
             rows = cursor.fetchall()
         messages = []
         for row in rows:
-            msg = {"role": row["role"], "content": row["content"]}
+            content = row["content"]
+            # Restore multimodal content arrays/dicts that were JSON-serialized
+            # during append_message.  Attempt parse for strings that look like
+            # JSON arrays ('[') or objects ('{') and contain multimodal markers.
+            if isinstance(content, str) and content and content[0] in ("[", "{"):
+                try:
+                    parsed = json.loads(content)
+                    # Only promote if it looks like multimodal content blocks
+                    # (a list of dicts with 'type' keys), not arbitrary JSON
+                    # that happens to appear in tool results.
+                    if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict) and "type" in parsed[0]:
+                        content = parsed
+                    elif isinstance(parsed, dict) and "type" in parsed:
+                        content = parsed
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            msg = {"role": row["role"], "content": content}
+            if row["timestamp"]:
+                msg["timestamp"] = row["timestamp"]
             if row["tool_call_id"]:
                 msg["tool_call_id"] = row["tool_call_id"]
             if row["tool_name"]:

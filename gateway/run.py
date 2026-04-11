@@ -4275,6 +4275,58 @@ class GatewayRunner:
             }
             await self.hooks.emit("agent:start", hook_ctx)
 
+            # Expand @ context references (@file:, @folder:, @diff, etc.)
+            if "@" in message_text:
+                try:
+                    from agent.context_references import preprocess_context_references_async
+                    from agent.model_metadata import get_model_context_length
+                    _msg_cwd = os.environ.get("MESSAGING_CWD", os.path.expanduser("~"))
+                    _msg_ctx_len = get_model_context_length(
+                        self._model, base_url=self._base_url or "")
+                    _ctx_result = await preprocess_context_references_async(
+                        message_text, cwd=_msg_cwd,
+                        context_length=_msg_ctx_len, allowed_root=_msg_cwd)
+                    if _ctx_result.blocked:
+                        _adapter = self.adapters.get(source.platform)
+                        if _adapter:
+                            await _adapter.send(
+                                source.chat_id,
+                                "\n".join(_ctx_result.warnings) or "Context injection refused.",
+                            )
+                        return
+                    if _ctx_result.expanded:
+                        message_text = _ctx_result.message
+                except Exception as exc:
+                    logger.debug("@ context reference expansion failed: %s", exc)
+
+            # Inject message timestamp so the LLM sees when this message was sent.
+            # Uses ISO format for unambiguous date+time across sessions and days.
+            # The event.timestamp is set by the platform adapter (e.g., Telegram
+            # message.date) and falls back to datetime.now() in MessageEvent.
+            try:
+                from hermes_time import get_timezone as _get_evt_tz
+                _evt_tz = _get_evt_tz()
+                _evt_ts = getattr(event, "timestamp", None)
+                if _evt_ts and message_text and isinstance(message_text, str):
+                    if hasattr(_evt_ts, "astimezone"):
+                        # datetime object from platform adapter
+                        if _evt_tz:
+                            _evt_local = _evt_ts.astimezone(_evt_tz)
+                        else:
+                            _evt_local = _evt_ts.astimezone()
+                    else:
+                        # Unix epoch float (shouldn't happen for events, but be safe)
+                        from datetime import datetime as _dt
+                        if _evt_tz:
+                            _evt_local = _dt.fromtimestamp(float(_evt_ts), tz=_evt_tz)
+                        else:
+                            _evt_local = _dt.fromtimestamp(float(_evt_ts)).astimezone()
+                    _iso_ts = _evt_local.strftime("%Y-%m-%dT%H:%M:%S%z")
+                    message_text = f"[{_iso_ts}] {message_text}"
+            except Exception as _ts_err:
+                logger.debug("Message timestamp injection failed (non-fatal): %s", _ts_err)
+
+
             # Run the agent
             agent_result = await self._run_agent(
                 message=message_text,
@@ -9777,11 +9829,28 @@ class GatewayRunner:
             # Convert history to agent format.
             # Two cases:
             #   1. Normal path (from transcript): simple {role, content, timestamp} dicts
-            #      - Strip timestamps, keep role+content
+            #      - Inject timestamps into user messages, strip timestamp field
             #   2. Interrupt path (from agent result["messages"]): full agent messages
             #      that may include tool_calls, tool_call_id, reasoning, etc.
             #      - These must be passed through intact so the API sees valid
             #        assistant→tool sequences (dropping tool_calls causes 500 errors)
+            #
+            # Timestamp injection: prepend an ISO timestamp to user messages so
+            # the LLM sees when each message was sent.  Uses the DB-stored
+            # timestamp which is immutable — so the injected prefix is identical
+            # on every reload, keeping the prompt-cache prefix stable across turns.
+            from hermes_time import get_timezone as _get_msg_tz
+            _msg_tz = _get_msg_tz()
+
+            def _format_msg_timestamp(epoch: float) -> str:
+                """Format a Unix epoch as ISO timestamp in the user's timezone."""
+                from datetime import datetime as _dt
+                if _msg_tz:
+                    dt = _dt.fromtimestamp(epoch, tz=_msg_tz)
+                else:
+                    dt = _dt.fromtimestamp(epoch).astimezone()
+                return "[" + dt.strftime("%Y-%m-%dT%H:%M:%S%z") + "]"
+
             agent_history = []
             for msg in history:
                 role = msg.get("role")
@@ -9814,6 +9883,10 @@ class GatewayRunner:
                         if msg.get("mirror"):
                             mirror_src = msg.get("mirror_source", "another session")
                             content = f"[Delivered from {mirror_src}] {content}"
+                        # Inject timestamp into user messages
+                        _ts = msg.get("timestamp")
+                        if role == "user" and _ts and isinstance(content, str):
+                            content = f"{_format_msg_timestamp(_ts)} {content}"
                         entry = {"role": role, "content": content}
                         # Preserve reasoning fields on assistant messages so
                         # multi-turn reasoning context survives session reload.
