@@ -4541,7 +4541,7 @@ class GatewayRunner:
                     "Your next message will start a fresh session."
                 )
 
-            ts = datetime.now().isoformat()
+            ts = time.time()  # Unix epoch float — consistent with DB storage
             
             # If this is a fresh session (no history), write the full tool
             # definitions as the first entry so the transcript is self-describing
@@ -9842,13 +9842,33 @@ class GatewayRunner:
             from hermes_time import get_timezone as _get_msg_tz
             _msg_tz = _get_msg_tz()
 
-            def _format_msg_timestamp(epoch: float) -> str:
-                """Format a Unix epoch as ISO timestamp in the user's timezone."""
+            def _format_msg_timestamp(ts_value) -> str:
+                """Format a timestamp as ISO string in the user's timezone.
+
+                Accepts Unix epoch (float/int) or ISO format string.
+                JSONL transcripts may store ISO strings (via datetime.isoformat())
+                while the SQLite DB stores Unix epoch floats.
+                """
                 from datetime import datetime as _dt
-                if _msg_tz:
-                    dt = _dt.fromtimestamp(epoch, tz=_msg_tz)
-                else:
-                    dt = _dt.fromtimestamp(epoch).astimezone()
+                if isinstance(ts_value, str):
+                    # Already an ISO string — parse it, localize, and reformat
+                    try:
+                        dt = _dt.fromisoformat(ts_value)
+                        if dt.tzinfo is None and _msg_tz:
+                            dt = dt.replace(tzinfo=_msg_tz)
+                        elif dt.tzinfo is None:
+                            dt = dt.astimezone()
+                    except (ValueError, TypeError):
+                        # Unparseable string — try float conversion as last resort
+                        try:
+                            ts_value = float(ts_value)
+                        except (ValueError, TypeError):
+                            return ""
+                if isinstance(ts_value, (int, float)):
+                    if _msg_tz:
+                        dt = _dt.fromtimestamp(ts_value, tz=_msg_tz)
+                    else:
+                        dt = _dt.fromtimestamp(ts_value).astimezone()
                 return "[" + dt.strftime("%Y-%m-%dT%H:%M:%S%z") + "]"
 
             agent_history = []
