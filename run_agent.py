@@ -8331,9 +8331,12 @@ class AIAgent:
                 env=get_active_env(effective_task_id),
             )
 
-            subdir_hints = self._subdirectory_hints.check_tool_call(name, args)
-            if subdir_hints:
-                function_result += subdir_hints
+            # Don't append subdir hints to inject_image results — they contain
+            # JSON with base64 image data that must remain valid for the adapter.
+            if '"_inject_image"' not in function_result:
+                subdir_hints = self._subdirectory_hints.check_tool_call(name, args)
+                if subdir_hints:
+                    function_result += subdir_hints
 
             tool_msg = {
                 "role": "tool",
@@ -8354,6 +8357,26 @@ class AIAgent:
         # so the steer marker is never truncated. See steer() for details.
         if num_tools > 0:
             self._apply_pending_steer_to_tool_results(messages, num_tools)
+        # ── Budget pressure injection ────────────────────────────────────
+        budget_warning = self._get_budget_warning(api_call_count)
+        if budget_warning and messages and messages[-1].get("role") == "tool":
+            last_content = messages[-1]["content"]
+            # Don't inject budget warnings into inject_image results — they
+            # contain large base64 data that must stay untouched.
+            if '"_inject_image"' not in last_content:
+                try:
+                    parsed = json.loads(last_content)
+                    if isinstance(parsed, dict):
+                        parsed["_budget_warning"] = budget_warning
+                        messages[-1]["content"] = json.dumps(parsed, ensure_ascii=False)
+                    else:
+                        messages[-1]["content"] = last_content + f"\n\n{budget_warning}"
+                except (json.JSONDecodeError, TypeError):
+                    messages[-1]["content"] = last_content + f"\n\n{budget_warning}"
+            if not self.quiet_mode:
+                remaining = self.max_iterations - api_call_count
+                tier = "⚠️  WARNING" if remaining <= self.max_iterations * 0.1 else "💡 CAUTION"
+                print(f"{self.log_prefix}{tier}: {remaining} iterations remaining")
 
     def _execute_tool_calls_sequential(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools."""
@@ -8694,9 +8717,12 @@ class AIAgent:
             )
 
             # Discover subdirectory context files from tool arguments
-            subdir_hints = self._subdirectory_hints.check_tool_call(function_name, function_args)
-            if subdir_hints:
-                function_result += subdir_hints
+            # Don't append subdir hints to inject_image results — they contain
+            # JSON with base64 image data that must remain valid for the adapter.
+            if '"_inject_image"' not in function_result:
+                subdir_hints = self._subdirectory_hints.check_tool_call(function_name, function_args)
+                if subdir_hints:
+                    function_result += subdir_hints
 
             tool_msg = {
                 "role": "tool",
@@ -8739,6 +8765,29 @@ class AIAgent:
         # applied to sequential execution as well.
         if num_tools_seq > 0:
             self._apply_pending_steer_to_tool_results(messages, num_tools_seq)
+        # ── Budget pressure injection ─────────────────────────────────
+        # After all tool calls in this turn are processed, check if we're
+        # approaching max_iterations. If so, inject a warning into the LAST
+        # tool result's JSON so the LLM sees it naturally when reading results.
+        budget_warning = self._get_budget_warning(api_call_count)
+        if budget_warning and messages and messages[-1].get("role") == "tool":
+            last_content = messages[-1]["content"]
+            # Don't inject budget warnings into inject_image results — they
+            # contain large base64 data that must stay untouched.
+            if '"_inject_image"' not in last_content:
+                try:
+                    parsed = json.loads(last_content)
+                    if isinstance(parsed, dict):
+                        parsed["_budget_warning"] = budget_warning
+                        messages[-1]["content"] = json.dumps(parsed, ensure_ascii=False)
+                    else:
+                        messages[-1]["content"] = last_content + f"\n\n{budget_warning}"
+                except (json.JSONDecodeError, TypeError):
+                    messages[-1]["content"] = last_content + f"\n\n{budget_warning}"
+            if not self.quiet_mode:
+                remaining = self.max_iterations - api_call_count
+                tier = "⚠️  WARNING" if remaining <= self.max_iterations * 0.1 else "💡 CAUTION"
+                print(f"{self.log_prefix}{tier}: {remaining} iterations remaining")
 
 
 

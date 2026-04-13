@@ -1074,10 +1074,33 @@ def convert_messages_to_anthropic(
             result_content = content if isinstance(content, str) else json.dumps(content)
             if not result_content:
                 result_content = "(no output)"
+
+            # Check for _inject_image marker — convert tool result to
+            # multimodal content blocks so the model sees the image natively.
+            tool_result_content: Any = result_content
+            try:
+                parsed_result = json.loads(result_content) if isinstance(result_content, str) else result_content
+                if isinstance(parsed_result, dict) and "_inject_image" in parsed_result:
+                    img = parsed_result["_inject_image"]
+                    text_msg = parsed_result.get("message", "Image loaded.")
+                    tool_result_content = [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": img.get("media_type", "image/jpeg"),
+                                "data": img["data"],
+                            },
+                        },
+                        {"type": "text", "text": text_msg},
+                    ]
+            except (json.JSONDecodeError, TypeError, KeyError):
+                pass  # not an inject_image result — keep as string
+
             tool_result = {
                 "type": "tool_result",
                 "tool_use_id": _sanitize_tool_id(m.get("tool_call_id", "")),
-                "content": result_content,
+                "content": tool_result_content,
             }
             if isinstance(m.get("cache_control"), dict):
                 tool_result["cache_control"] = dict(m["cache_control"])

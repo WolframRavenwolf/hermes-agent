@@ -787,3 +787,83 @@ registry.register(
     is_async=True,
     emoji="👁️",
 )
+
+
+# ---------------------------------------------------------------------------
+# inject_image — load a local image into the model's native vision context
+# ---------------------------------------------------------------------------
+
+_MAX_INJECT_SIZE_MB = 20  # refuse files larger than this
+
+
+def _handle_inject_image(args: Dict[str, Any], **kw: Any) -> str:
+    """Load a local image file and return it as a base64-encoded content block.
+
+    The result contains a special ``_inject_image`` key that the Anthropic
+    adapter (and future adapters) recognise and convert into a native image
+    content block inside the tool-result message.  This lets the model *see*
+    the image directly — no auxiliary vision model involved.
+    """
+    image_path_str = args.get("image_path", "").strip()
+    if not image_path_str:
+        return json.dumps({"error": "image_path is required"})
+
+    image_path = Path(os.path.expanduser(image_path_str)).resolve()
+    if not image_path.exists():
+        return json.dumps({"error": f"File not found: {image_path}"})
+    if not image_path.is_file():
+        return json.dumps({"error": f"Not a file: {image_path}"})
+
+    size_mb = image_path.stat().st_size / (1024 * 1024)
+    if size_mb > _MAX_INJECT_SIZE_MB:
+        return json.dumps({"error": f"File too large ({size_mb:.1f} MB > {_MAX_INJECT_SIZE_MB} MB limit)"})
+
+    mime = _detect_image_mime_type(image_path)
+    if not mime or not mime.startswith("image/"):
+        return json.dumps({"error": f"Not a recognised image format: {image_path.name}"})
+
+    raw = image_path.read_bytes()
+    b64 = base64.b64encode(raw).decode("ascii")
+
+    return json.dumps({
+        "success": True,
+        "_inject_image": {
+            "media_type": mime,
+            "data": b64,
+        },
+        "message": f"Image loaded: {image_path.name} ({mime}, {size_mb:.1f} MB). I can now see this image natively.",
+    })
+
+
+INJECT_IMAGE_SCHEMA = {
+    "name": "inject_image",
+    "description": (
+        "Load a local image file into your own visual context so you can see it natively — "
+        "no external vision model involved.  Use this to review images you generated, inspect "
+        "screenshots, or examine any local image file before sending it to the user.  "
+        "Returns the image as a native content block that you perceive directly."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "image_path": {
+                "type": "string",
+                "description": "Absolute or relative path to a local image file (PNG, JPEG, WebP, GIF, BMP).",
+            },
+        },
+        "required": ["image_path"],
+    },
+}
+
+
+registry.register(
+    name="inject_image",
+    toolset="vision",
+    schema=INJECT_IMAGE_SCHEMA,
+    handler=_handle_inject_image,
+    is_async=False,
+    emoji="🖼️",
+    # Must bypass the result persistence/truncation system — the base64 image
+    # data is intentionally large and must reach the Anthropic adapter intact.
+    max_result_size_chars=float("inf"),
+)
