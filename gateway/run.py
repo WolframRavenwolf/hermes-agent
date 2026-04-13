@@ -4321,7 +4321,7 @@ class GatewayRunner:
                             _evt_local = _dt.fromtimestamp(float(_evt_ts), tz=_evt_tz)
                         else:
                             _evt_local = _dt.fromtimestamp(float(_evt_ts)).astimezone()
-                    _iso_ts = _evt_local.strftime("%Y-%m-%dT%H:%M:%S%z")
+                    _iso_ts = _evt_local.strftime("%a %Y-%m-%d %H:%M:%S %Z")
                     message_text = f"[{_iso_ts}] {message_text}"
             except Exception as _ts_err:
                 logger.debug("Message timestamp injection failed (non-fatal): %s", _ts_err)
@@ -9869,7 +9869,7 @@ class GatewayRunner:
                         dt = _dt.fromtimestamp(ts_value, tz=_msg_tz)
                     else:
                         dt = _dt.fromtimestamp(ts_value).astimezone()
-                return "[" + dt.strftime("%Y-%m-%dT%H:%M:%S%z") + "]"
+                return "[" + dt.strftime("%a %Y-%m-%d %H:%M:%S %Z") + "]"
 
             agent_history = []
             for msg in history:
