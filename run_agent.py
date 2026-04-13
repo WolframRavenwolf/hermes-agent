@@ -656,6 +656,7 @@ class AIAgent:
         interim_assistant_callback: callable = None,
         tool_gen_callback: callable = None,
         status_callback: callable = None,
+        event_callback: callable = None,
         max_tokens: int = None,
         reasoning_config: Dict[str, Any] = None,
         service_tier: str = None,
@@ -835,6 +836,7 @@ class AIAgent:
         self.stream_delta_callback = stream_delta_callback
         self.interim_assistant_callback = interim_assistant_callback
         self.status_callback = status_callback
+        self.event_callback = event_callback
         self.tool_gen_callback = tool_gen_callback
 
         
@@ -7894,6 +7896,19 @@ class AIAgent:
                 f"accuracy may degrade. Consider /new to start fresh.",
                 force=True,
             )
+
+        # Emit session:compress event so hooks (e.g. MemPalace sync) can
+        # ingest the completed old session before its details are lost.
+        if self.event_callback:
+            try:
+                self.event_callback("session:compress", {
+                    "platform": self.platform or "",
+                    "session_id": self.session_id,
+                    "old_session_id": old_session_id if self._session_db else "",
+                    "compression_count": self.context_compressor.compression_count,
+                })
+            except Exception as e:
+                logger.debug("event_callback error on session:compress: %s", e)
 
         # Update token estimate after compaction so pressure calculations
         # use the post-compression count, not the stale pre-compression one.
