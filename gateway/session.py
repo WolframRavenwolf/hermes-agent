@@ -740,13 +740,25 @@ class SessionStore:
                 entry = self._entries[session_key]
 
                 # Auto-reset sessions marked as suspended (e.g. after /stop
-                # broke a stuck loop — #7536).  ``suspended`` is the hard
-                # forced-wipe signal and always wins over ``resume_pending``,
-                # so repeated interrupted restarts that escalate via the
-                # existing ``.restart_failure_counts`` stuck-loop counter
-                # still converge to a clean slate.
+                # broke a stuck loop — #7536).  However, respect the
+                # user's reset policy: if mode is "none", the user has
+                # explicitly opted out of all automatic resets, so just
+                # clear the suspension flag and keep the session alive.
+                # ``suspended`` is the hard forced-wipe signal and always
+                # wins over ``resume_pending``, so repeated interrupted
+                # restarts that escalate via the existing
+                # ``.restart_failure_counts`` stuck-loop counter still
+                # converge to a clean slate.
                 if entry.suspended:
-                    reset_reason = "suspended"
+                    policy = self.config.get_reset_policy(
+                        platform=source.platform,
+                        session_type=source.chat_type,
+                    )
+                    if policy.mode == "none":
+                        entry.suspended = False
+                        reset_reason = None
+                    else:
+                        reset_reason = "suspended"
                 elif entry.resume_pending:
                     # Restart-interrupted session: preserve the session_id
                     # and return the existing entry so the transcript
@@ -953,6 +965,8 @@ class SessionStore:
         in-flight when the gateway last exited from being blindly resumed
         (#7536).  Only suspends sessions updated within *max_age_seconds*
         to avoid resetting long-idle sessions that are harmless to resume.
+        Sessions whose reset policy is ``"none"`` are never suspended —
+        the user has explicitly opted out of all automatic resets.
         Returns the number of sessions that were suspended.
 
         Entries flagged ``resume_pending=True`` are skipped — those were
@@ -971,6 +985,12 @@ class SessionStore:
                 if entry.resume_pending:
                     continue
                 if not entry.suspended and entry.updated_at >= cutoff:
+                    policy = self.config.get_reset_policy(
+                        platform=entry.platform,
+                        session_type=entry.chat_type,
+                    )
+                    if policy.mode == "none":
+                        continue
                     entry.suspended = True
                     count += 1
             if count:
