@@ -7926,6 +7926,34 @@ class AIAgent:
         )
         return compressed, new_system_prompt
 
+    def _get_budget_warning(self, api_call_count: int) -> Optional[str]:
+        """Return a budget pressure warning if iterations are running low.
+
+        Thresholds:
+        - <10% remaining → CRITICAL warning
+        - <25% remaining → CAUTION warning
+        - Otherwise → None
+
+        The warning is injected into the last tool result so the LLM
+        naturally sees it and can wrap up or prioritize remaining work.
+        """
+        remaining = self.max_iterations - api_call_count
+        total = self.max_iterations
+        if total <= 0:
+            return None
+        ratio = remaining / total
+        if ratio <= 0.10:
+            return (
+                f"⚠️ BUDGET CRITICAL: Only {remaining}/{total} iterations remaining! "
+                "Wrap up immediately — deliver your best answer with what you have."
+            )
+        elif ratio <= 0.25:
+            return (
+                f"💡 BUDGET CAUTION: {remaining}/{total} iterations remaining. "
+                "Start wrapping up — avoid unnecessary tool calls."
+            )
+        return None
+
     def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute tool calls from the assistant message and append results to messages.
 
