@@ -6032,24 +6032,15 @@ class AIAgent:
                         _fire_first_delta()
                         self._fire_stream_delta(delta.content)
                         deltas_were_sent["yes"] = True
-                    else:
-                        # Tool calls suppress regular content streaming (avoids
-                        # displaying chatty "I'll use the tool..." text alongside
-                        # tool calls).  But reasoning tags embedded in suppressed
-                        # content should still reach the display — otherwise the
-                        # reasoning box only appears as a post-response fallback,
-                        # rendering it confusingly after the already-streamed
-                        # response.  Route suppressed content through the stream
-                        # delta callback so its tag extraction can fire the
-                        # reasoning display.  Non-reasoning text is harmlessly
-                        # suppressed by the CLI's _stream_delta when the stream
-                        # box is already closed (tool boundary flush).
-                        if self.stream_delta_callback:
-                            try:
-                                self.stream_delta_callback(delta.content)
-                                self._record_streamed_assistant_text(delta.content)
-                            except Exception:
-                                pass
+                    # Note: When tool_calls_acc is non-empty, text content is
+                    # NOT forwarded to the stream consumer.  Sending suppressed
+                    # text to stream_delta_callback caused the gateway consumer
+                    # to accumulate partial fragments that were then truncated
+                    # at tool boundaries under flood control.  Reasoning tags
+                    # embedded in the text are handled by the CLI's tag
+                    # extraction at the non-streaming response level; the
+                    # reasoning_callback already fires from reasoning_content
+                    # deltas separately.
 
                 # Accumulate tool call deltas — notify display on first name
                 if delta and delta.tool_calls:
