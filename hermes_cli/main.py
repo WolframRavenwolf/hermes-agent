@@ -258,6 +258,8 @@ import json
 import shutil
 import stat
 import subprocess
+import sys
+import warnings
 from pathlib import Path
 from typing import Optional
 
@@ -300,6 +302,14 @@ from hermes_cli.subcommands.pairing import build_pairing_parser
 from hermes_cli.subcommands.plugins import build_plugins_parser
 from hermes_cli.subcommands.mcp import build_mcp_parser
 from hermes_cli.subcommands.claw import build_claw_parser
+
+# Suppress noisy deprecation warnings from third-party packages that we
+# can't fix ourselves.  These clutter gateway logs on every startup.
+warnings.filterwarnings(
+    "ignore",
+    message="pkg_resources is deprecated as an API",
+    category=UserWarning,
+)
 
 
 def _require_tty(command_name: str) -> None:
