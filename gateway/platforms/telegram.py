@@ -2622,6 +2622,20 @@ class TelegramAdapter(BasePlatformAdapter):
                     ext = mime_to_ext.get(doc.mime_type, "")
 
                 # Check if supported
+                # Images sent as "files" (uncompressed) arrive as documents
+                # instead of photos.  Route them through the image cache so
+                # the vision pipeline picks them up normally.
+                _IMAGE_DOC_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+                if ext in _IMAGE_DOC_EXTS:
+                    file_obj = await doc.get_file()
+                    image_bytes = await file_obj.download_as_bytearray()
+                    cached_path = cache_image_from_bytes(bytes(image_bytes), ext=ext)
+                    event.media_urls = [cached_path]
+                    event.media_types = [f"image/{ext.lstrip('.')}"]
+                    logger.info("[Telegram] Document is an image, cached at %s", cached_path)
+                    await self.handle_message(event)
+                    return
+
                 if ext not in SUPPORTED_DOCUMENT_TYPES:
                     supported_list = ", ".join(sorted(SUPPORTED_DOCUMENT_TYPES.keys()))
                     event.text = (
