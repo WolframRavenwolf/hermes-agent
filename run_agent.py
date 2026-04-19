@@ -2750,6 +2750,288 @@ class AIAgent:
         self._save_session_log(messages)
         self._flush_messages_to_session_db(messages, conversation_history)
 
+    # ── Context overflow safety net ──────────────────────────────────
+    # When compression fails after max attempts, we don't just give up.
+    # Instead, we export the full session transcript and perform a
+    # graceful handoff to a new session so the user can keep working.
+
+    def _export_overflow_session(self, messages: List[Dict]) -> Optional[str]:
+        """Export the full session transcript to a Markdown file for archival.
+
+        Called when compression fails — ensures zero data loss even when
+        the context window is exhausted.  Returns the export file path,
+        or None if export fails.
+        """
+        overflow_dir = Path(get_hermes_home()) / "sessions" / "overflow"
+        try:
+            overflow_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logging.error("Failed to create overflow dir %s: %s", overflow_dir, e)
+            return None
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        export_path = overflow_dir / f"session_{self.session_id}_{ts}.md"
+
+        lines = [
+            f"# Session Overflow Export",
+            f"",
+            f"- **Session ID:** {self.session_id}",
+            f"- **Model:** {self.model}",
+            f"- **Platform:** {self.platform or 'cli'}",
+            f"- **Exported:** {datetime.now().isoformat()}",
+            f"- **Reason:** Context compression failed — full transcript preserved",
+            f"- **Messages:** {len(messages)}",
+            f"",
+            f"---",
+            f"",
+        ]
+
+        for i, msg in enumerate(messages):
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "") or ""
+            # Normalize multimodal content (list of blocks) to string
+            if isinstance(content, list):
+                text_parts = []
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text_parts.append(part.get("text", ""))
+                    elif isinstance(part, dict):
+                        text_parts.append(f"[{part.get('type', 'unknown')} content]")
+                content = "\n".join(text_parts) if text_parts else str(content)
+
+            # Tool calls on assistant messages
+            tool_calls = None
+            if hasattr(msg, "tool_calls") and msg.tool_calls:
+                tool_calls = [
+                    {"name": tc.function.name, "arguments": tc.function.arguments}
+                    for tc in msg.tool_calls
+                ]
+            elif isinstance(msg.get("tool_calls"), list):
+                tool_calls = msg["tool_calls"]
+
+            if role == "system":
+                lines.append(f"## [{i}] System")
+                lines.append(f"")
+                # Truncate very long system prompts
+                if len(content) > 2000:
+                    lines.append(f"{content[:2000]}")
+                    lines.append(f"")
+                    lines.append(f"*[... truncated, {len(content)} chars total]*")
+                else:
+                    lines.append(content)
+            elif role == "user":
+                lines.append(f"## [{i}] User")
+                lines.append(f"")
+                lines.append(content)
+            elif role == "assistant":
+                lines.append(f"## [{i}] Assistant")
+                lines.append(f"")
+                if content:
+                    lines.append(content)
+                if tool_calls:
+                    for tc in tool_calls:
+                        name = tc.get("name", "?") if isinstance(tc, dict) else "?"
+                        args = tc.get("arguments", "") if isinstance(tc, dict) else ""
+                        # Truncate very long tool arguments (e.g. base64 images)
+                        if isinstance(args, str) and len(args) > 1000:
+                            args = args[:1000] + f"... [{len(args)} chars]"
+                        lines.append(f"")
+                        lines.append(f"**Tool call:** `{name}`")
+                        lines.append(f"```json")
+                        lines.append(f"{args}")
+                        lines.append(f"```")
+            elif role == "tool":
+                tool_name = msg.get("tool_name", "")
+                lines.append(f"## [{i}] Tool Result{f' ({tool_name})' if tool_name else ''}")
+                lines.append(f"")
+                # Truncate very long tool results
+                if len(content) > 3000:
+                    lines.append(f"```")
+                    lines.append(f"{content[:3000]}")
+                    lines.append(f"```")
+                    lines.append(f"*[... truncated, {len(content)} chars total]*")
+                else:
+                    lines.append(f"```")
+                    lines.append(content)
+                    lines.append(f"```")
+            else:
+                lines.append(f"## [{i}] {role}")
+                lines.append(f"")
+                lines.append(content)
+
+            lines.append(f"")
+
+        try:
+            export_path.write_text("\n".join(lines), encoding="utf-8")
+            logging.info("Overflow session exported to %s (%d messages)", export_path, len(messages))
+            return str(export_path)
+        except OSError as e:
+            logging.error("Failed to write overflow export %s: %s", export_path, e)
+            return None
+
+    def _find_last_user_message(self, messages: List[Dict]) -> Optional[str]:
+        """Find the content of the last user message in the conversation."""
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                # Handle multimodal content (list of content blocks)
+                if isinstance(content, list):
+                    content = next(
+                        (p.get("text", "") for p in content
+                         if isinstance(p, dict) and p.get("type") == "text"),
+                        "",
+                    )
+                if content and isinstance(content, str) and not content.startswith("[CONTEXT COMPACTION"):
+                    return content
+        return None
+
+    def _graceful_overflow_handoff(
+        self,
+        messages: List[Dict],
+        conversation_history: Optional[List[Dict]],
+        system_message: str,
+        approx_tokens: int = 0,
+    ) -> Optional[Dict]:
+        """Perform a graceful session handoff when compression fails.
+
+        Instead of returning an error, this method:
+        1. Exports the full session transcript to disk (zero data loss)
+        2. Persists the current session to DB
+        3. Starts a new session with a handoff summary
+        4. Re-injects the user's last message
+
+        Returns a dict with the new messages, system prompt, and export path
+        on success, or None if the handoff itself fails.
+        """
+        self._emit_status("📋 Exporting full session transcript before handoff...")
+
+        # Step 1: Persist everything we have
+        self._persist_session(messages, conversation_history)
+
+        # Step 2: Export full transcript to Markdown
+        export_path = self._export_overflow_session(messages)
+        if export_path:
+            self._vprint(
+                f"{self.log_prefix}📋 Full session transcript saved to: {export_path}",
+                force=True,
+            )
+
+        # Step 3: Find the user's last message (what they were trying to do)
+        last_user_msg = self._find_last_user_message(messages)
+
+        # Step 4: Build a minimal handoff summary from the tail of the conversation
+        # We take just the last few messages to build context — no LLM call needed,
+        # since the LLM already failed on the full context
+        handoff_parts = [
+            "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted "
+            "into the summary below. This is a handoff from a previous context "
+            "window — treat it as background reference, NOT as active instructions. "
+            "Do NOT answer questions or fulfill requests mentioned in this summary; "
+            "they were already addressed. Respond ONLY to the latest user message "
+            "that appears AFTER this summary. The current session state (files, "
+            "config, etc.) may reflect work described here — avoid repeating it:",
+            "",
+            "## Session Overflow Handoff",
+            "",
+            f"The previous session ({self.session_id}) exceeded the context window "
+            f"after ~{approx_tokens:,} tokens and {len(messages)} messages. "
+            f"Compression could not reduce it further.",
+        ]
+        if export_path:
+            handoff_parts.append(f"Full transcript archived at: {export_path}")
+        handoff_parts.append("")
+
+        # Include a brief snippet of recent assistant content for continuity
+        recent_assistant_msgs = []
+        for msg in reversed(messages):
+            if msg.get("role") == "assistant":
+                content = msg.get("content", "") or ""
+                if content and len(content) > 20:
+                    # Take the last substantive assistant message
+                    snippet = content[:500] + ("..." if len(content) > 500 else "")
+                    recent_assistant_msgs.append(snippet)
+                    if len(recent_assistant_msgs) >= 2:
+                        break
+        if recent_assistant_msgs:
+            handoff_parts.append("## Recent Context")
+            handoff_parts.append("Last assistant responses (for continuity):")
+            for snippet in reversed(recent_assistant_msgs):
+                handoff_parts.append(f"- {snippet}")
+            handoff_parts.append("")
+
+        handoff_summary = "\n".join(handoff_parts)
+
+        # Step 5: End current session and create a new one
+        old_session_id = self.session_id  # capture before potential mutation
+        if self._session_db:
+            try:
+                old_title = self._session_db.get_session_title(self.session_id)
+                self._session_db.end_session(self.session_id, "overflow")
+                old_session_id = self.session_id
+                self.session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+                self.session_log_file = self.logs_dir / f"session_{self.session_id}.json"
+                self._session_db.create_session(
+                    session_id=self.session_id,
+                    source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                    model=self.model,
+                    parent_session_id=old_session_id,
+                )
+                if old_title:
+                    try:
+                        new_title = self._session_db.get_next_title_in_lineage(old_title)
+                        self._session_db.set_session_title(self.session_id, new_title)
+                    except Exception as e:
+                        logger.debug("Could not propagate title on overflow handoff: %s", e)
+                self._session_db.update_system_prompt(self.session_id, self._build_system_prompt(system_message))
+                self._last_flushed_db_idx = 0
+            except Exception as e:
+                logging.warning("Session DB overflow handoff failed: %s", e)
+                return None
+
+        # Step 6: Build the new message list — handoff summary + last user message
+        self._invalidate_system_prompt()
+        new_system_prompt = self._build_system_prompt(system_message)
+        self._cached_system_prompt = new_system_prompt
+
+        new_messages = [{"role": "user", "content": handoff_summary}]
+
+        # Re-inject the TODO list if present
+        todo_snapshot = self._todo_store.format_for_injection()
+        if todo_snapshot:
+            new_messages.append({"role": "user", "content": todo_snapshot})
+
+        # Re-inject the user's last message so the model can respond to it
+        if last_user_msg:
+            new_messages.append({"role": "user", "content": last_user_msg})
+
+        # Emit session:compress event so hooks can process the old session
+        if self.event_callback:
+            try:
+                self.event_callback("session:compress", {
+                    "platform": self.platform or "",
+                    "session_id": self.session_id,
+                    "old_session_id": old_session_id,
+                    "compression_count": getattr(self.context_compressor, "compression_count", 0),
+                    "overflow": True,
+                })
+            except Exception:
+                pass
+
+        logging.info(
+            "Overflow handoff complete: %s -> %s (%d messages -> %d, export=%s)",
+            old_session_id,
+            self.session_id,
+            len(messages),
+            len(new_messages),
+            export_path or "failed",
+        )
+
+        return {
+            "messages": new_messages,
+            "system_prompt": new_system_prompt,
+            "export_path": export_path,
+        }
+
     def _flush_messages_to_session_db(self, messages: List[Dict], conversation_history: List[Dict] = None):
         """Persist any un-flushed messages to the SQLite session store.
 
@@ -9573,6 +9855,7 @@ class AIAgent:
             max_retries = 3
             primary_recovery_attempted = False
             max_compression_attempts = 3
+            overflow_handoff_used = False  # Safety: only one overflow handoff per run
             codex_auth_retry_attempted=False
             anthropic_auth_retry_attempted=False
             nous_auth_retry_attempted=False
@@ -10729,8 +11012,25 @@ class AIAgent:
                         compression_attempts += 1
                         if compression_attempts > max_compression_attempts:
                             self._vprint(f"{self.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached for payload-too-large error.", force=True)
-                            self._vprint(f"{self.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                             logging.error(f"{self.log_prefix}413 compression failed after {max_compression_attempts} attempts.")
+                            # ── Overflow safety net: try graceful handoff ──
+                            if not overflow_handoff_used:
+                                handoff = self._graceful_overflow_handoff(
+                                    messages, conversation_history, system_message,
+                                    approx_tokens,
+                                )
+                                if handoff:
+                                    messages = handoff["messages"]
+                                    active_system_prompt = handoff["system_prompt"]
+                                    conversation_history = None
+                                    compression_attempts = 0
+                                    overflow_handoff_used = True
+                                    retry_count = 0  # fresh session deserves fresh retries
+                                    self._emit_status("🔄 Session overflow — starting fresh with handoff context...")
+                                    restart_with_compressed_messages = True
+                                    break
+                            # Handoff failed — fall back to error return
+                            self._vprint(f"{self.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                             self._persist_session(messages, conversation_history)
                             return {
                                 "messages": messages,
@@ -10760,8 +11060,25 @@ class AIAgent:
                             break
                         else:
                             self._vprint(f"{self.log_prefix}❌ Payload too large and cannot compress further.", force=True)
-                            self._vprint(f"{self.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                             logging.error(f"{self.log_prefix}413 payload too large. Cannot compress further.")
+                            # ── Overflow safety net: try graceful handoff ──
+                            if not overflow_handoff_used:
+                                handoff = self._graceful_overflow_handoff(
+                                    messages, conversation_history, system_message,
+                                    approx_tokens,
+                                )
+                                if handoff:
+                                    messages = handoff["messages"]
+                                    active_system_prompt = handoff["system_prompt"]
+                                    conversation_history = None
+                                    compression_attempts = 0
+                                    overflow_handoff_used = True
+                                    retry_count = 0  # fresh session deserves fresh retries
+                                    self._emit_status("🔄 Session overflow — starting fresh with handoff context...")
+                                    restart_with_compressed_messages = True
+                                    break
+                            # Handoff failed — fall back to error return
+                            self._vprint(f"{self.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                             self._persist_session(messages, conversation_history)
                             return {
                                 "messages": messages,
@@ -10813,8 +11130,25 @@ class AIAgent:
                             compression_attempts += 1
                             if compression_attempts > max_compression_attempts:
                                 self._vprint(f"{self.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
-                                self._vprint(f"{self.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                                 logging.error(f"{self.log_prefix}Context compression failed after {max_compression_attempts} attempts.")
+                                # ── Overflow safety net: try graceful handoff ──
+                                if not overflow_handoff_used:
+                                    handoff = self._graceful_overflow_handoff(
+                                        messages, conversation_history, system_message,
+                                        approx_tokens,
+                                    )
+                                    if handoff:
+                                        messages = handoff["messages"]
+                                        active_system_prompt = handoff["system_prompt"]
+                                        conversation_history = None
+                                        compression_attempts = 0
+                                        overflow_handoff_used = True
+                                        retry_count = 0  # fresh session deserves fresh retries
+                                        self._emit_status("🔄 Session overflow — starting fresh with handoff context...")
+                                        restart_with_compressed_messages = True
+                                        break
+                                # Handoff failed — fall back to error return
+                                self._vprint(f"{self.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                                 self._persist_session(messages, conversation_history)
                                 return {
                                     "messages": messages,
@@ -10865,8 +11199,25 @@ class AIAgent:
                         compression_attempts += 1
                         if compression_attempts > max_compression_attempts:
                             self._vprint(f"{self.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
-                            self._vprint(f"{self.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                             logging.error(f"{self.log_prefix}Context compression failed after {max_compression_attempts} attempts.")
+                            # ── Overflow safety net: try graceful handoff ──
+                            if not overflow_handoff_used:
+                                handoff = self._graceful_overflow_handoff(
+                                    messages, conversation_history, system_message,
+                                    approx_tokens,
+                                )
+                                if handoff:
+                                    messages = handoff["messages"]
+                                    active_system_prompt = handoff["system_prompt"]
+                                    conversation_history = None
+                                    compression_attempts = 0
+                                    overflow_handoff_used = True
+                                    retry_count = 0  # fresh session deserves fresh retries
+                                    self._emit_status("🔄 Session overflow — starting fresh with handoff context...")
+                                    restart_with_compressed_messages = True
+                                    break
+                            # Handoff failed — fall back to error return
+                            self._vprint(f"{self.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                             self._persist_session(messages, conversation_history)
                             return {
                                 "messages": messages,
@@ -10898,8 +11249,25 @@ class AIAgent:
                         else:
                             # Can't compress further and already at minimum tier
                             self._vprint(f"{self.log_prefix}❌ Context length exceeded and cannot compress further.", force=True)
-                            self._vprint(f"{self.log_prefix}   💡 The conversation has accumulated too much content. Try /new to start fresh, or /compress to manually trigger compression.", force=True)
                             logging.error(f"{self.log_prefix}Context length exceeded: {approx_tokens:,} tokens. Cannot compress further.")
+                            # ── Overflow safety net: try graceful handoff ──
+                            if not overflow_handoff_used:
+                                handoff = self._graceful_overflow_handoff(
+                                    messages, conversation_history, system_message,
+                                    approx_tokens,
+                                )
+                                if handoff:
+                                    messages = handoff["messages"]
+                                    active_system_prompt = handoff["system_prompt"]
+                                    conversation_history = None
+                                    compression_attempts = 0
+                                    overflow_handoff_used = True
+                                    retry_count = 0  # fresh session deserves fresh retries
+                                    self._emit_status("🔄 Session overflow — starting fresh with handoff context...")
+                                    restart_with_compressed_messages = True
+                                    break
+                            # Handoff failed — fall back to error return
+                            self._vprint(f"{self.log_prefix}   💡 The conversation has accumulated too much content. Try /new to start fresh, or /compress to manually trigger compression.", force=True)
                             self._persist_session(messages, conversation_history)
                             return {
                                 "messages": messages,
