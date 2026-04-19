@@ -48,8 +48,17 @@ import os
 import shutil
 import subprocess
 import sys
+import warnings
 from pathlib import Path
 from typing import Optional
+
+# Suppress noisy deprecation warnings from third-party packages that we
+# can't fix ourselves.  These clutter gateway logs on every startup.
+warnings.filterwarnings(
+    "ignore",
+    message="pkg_resources is deprecated as an API",
+    category=UserWarning,
+)
 
 
 def _require_tty(command_name: str) -> None:
