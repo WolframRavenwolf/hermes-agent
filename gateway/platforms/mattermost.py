@@ -263,17 +263,32 @@ class MattermostAdapter(BasePlatformAdapter):
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, MAX_POST_LENGTH)
 
+        metadata_thread_id = (metadata or {}).get("thread_id") if isinstance(metadata, dict) else None
+        thread_root_id = reply_to or metadata_thread_id
+
         last_id = None
         for chunk in chunks:
             payload: Dict[str, Any] = {
                 "channel_id": chat_id,
                 "message": chunk,
             }
-            # Thread support: reply_to is the root post ID.
-            if reply_to and self._reply_mode == "thread":
-                payload["root_id"] = reply_to
+            # Thread support: normal replies pass reply_to; progress/tool
+            # messages pass the current thread via metadata.thread_id.
+            if thread_root_id and self._reply_mode == "thread":
+                payload["root_id"] = thread_root_id
 
             data = await self._api_post("posts", payload)
+            if (not data or "id" not in data) and "root_id" in payload:
+                # If Mattermost rejects a thread root (e.g. because the caller
+                # passed a nested reply ID or a cross-platform message ID),
+                # degrade to a flat channel post instead of dropping the reply.
+                logger.warning(
+                    "Mattermost: threaded post failed for root_id=%s; retrying flat",
+                    payload.get("root_id"),
+                )
+                retry_payload = dict(payload)
+                retry_payload.pop("root_id", None)
+                data = await self._api_post("posts", retry_payload)
             if not data or "id" not in data:
                 return SendResult(success=False, error="Failed to create post")
             last_id = data["id"]
@@ -765,8 +780,25 @@ class MattermostAdapter(BasePlatformAdapter):
         sender_id = post.get("user_id", "")
         sender_name = data.get("sender_name", "").lstrip("@") or sender_id
 
-        # Thread support: if the post is in a thread, use root_id.
-        thread_id = post.get("root_id") or None
+        # Thread support: if the incoming post is already inside a thread,
+        # Mattermost still expects replies to use the thread root post ID.
+        # Using the reply post's own ID as root_id attempts an invalid nested
+        # thread on some servers (400 api.post.create_post.root_id.app_error).
+        #
+        # When Hermes is configured to reply in threads, a top-level channel
+        # post also becomes the root of the user-visible conversation. Seed the
+        # SessionSource with that post ID so the first answer and later replies
+        # in the Mattermost thread share the same Hermes transcript. Keep DMs
+        # stable unless Mattermost explicitly sends a root_id; otherwise every
+        # normal DM message would incorrectly become a fresh session.
+        root_id = post.get("root_id") or None
+        if root_id:
+            thread_id = root_id
+        elif channel_type_raw != "D" and self._reply_mode == "thread":
+            thread_id = post_id or None
+        else:
+            thread_id = None
+        reply_target_id = thread_id or post_id
 
         # Determine message type.
         file_ids = post.get("file_ids") or []
@@ -841,7 +873,7 @@ class MattermostAdapter(BasePlatformAdapter):
             message_type=msg_type,
             source=source,
             raw_message=post,
-            message_id=post_id,
+            message_id=reply_target_id,
             media_urls=media_urls if media_urls else None,
             media_types=media_types if media_types else None,
             channel_prompt=_channel_prompt,

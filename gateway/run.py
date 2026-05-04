@@ -300,6 +300,22 @@ def _last_transcript_timestamp(history: Optional[List[Dict[str, Any]]]) -> Any:
     return None
 
 
+
+def _resolve_progress_thread_id(platform: Any, source_thread_id: Optional[str], event_message_id: Optional[str]) -> Optional[str]:
+    """Resolve the thread target used for gateway tool/progress messages.
+
+    Some platforms (Slack, Mattermost) can start a reply thread from a normal
+    message ID, so top-level progress should use the incoming event's message
+    ID as the thread root. Telegram cannot: normal message IDs are not forum
+    topic IDs, so it must only use an explicit source.thread_id.
+    """
+    if source_thread_id:
+        return source_thread_id
+    platform_value = getattr(platform, "value", platform)
+    if platform_value in ("slack", "mattermost"):
+        return event_message_id
+    return None
+
 # ---------------------------------------------------------------------------
 # SSL certificate auto-detection for NixOS and other non-standard systems.
 # Must run BEFORE any HTTP library (discord, aiohttp, etc.) is imported.
@@ -15017,10 +15033,11 @@ class GatewayRunner:
         # - Feishu only honors reply_in_thread when sending a reply, so topic
         #   progress uses the triggering event message as the reply target
         # - Other platforms should use explicit source.thread_id only
-        if source.platform == Platform.SLACK:
-            _progress_thread_id = source.thread_id or event_message_id
-        else:
-            _progress_thread_id = source.thread_id
+        _progress_thread_id = _resolve_progress_thread_id(
+            source.platform,
+            source.thread_id,
+            event_message_id,
+        )
         _progress_metadata = (
             self._thread_metadata_for_source(source, event_message_id)
             if _progress_thread_id == source.thread_id

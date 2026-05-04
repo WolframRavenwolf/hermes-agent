@@ -6,11 +6,38 @@ import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
 
 from gateway.config import Platform, PlatformConfig
+from gateway.run import _resolve_progress_thread_id
 
 
 # ---------------------------------------------------------------------------
 # Platform & Config
 # ---------------------------------------------------------------------------
+
+class TestMattermostProgressThreadRouting:
+    def test_top_level_mattermost_progress_uses_event_message_id(self):
+        """Tool progress for a top-level Mattermost post should start under that post's thread."""
+        assert _resolve_progress_thread_id(
+            Platform.MATTERMOST,
+            source_thread_id=None,
+            event_message_id="top_post_123",
+        ) == "top_post_123"
+
+    def test_threaded_mattermost_progress_prefers_existing_thread_root(self):
+        """Tool progress inside an existing Mattermost thread should keep using the root post."""
+        assert _resolve_progress_thread_id(
+            Platform.MATTERMOST,
+            source_thread_id="root_post_123",
+            event_message_id="reply_post_456",
+        ) == "root_post_123"
+
+    def test_telegram_progress_does_not_use_normal_message_id_as_thread_id(self):
+        """Telegram normal message IDs are not forum thread IDs and must not be used as fallback."""
+        assert _resolve_progress_thread_id(
+            Platform.TELEGRAM,
+            source_thread_id=None,
+            event_message_id="12345",
+        ) is None
+
 
 class TestMattermostConfigLoading:
     def test_apply_env_overrides_mattermost(self, monkeypatch):
@@ -226,6 +253,60 @@ class TestMattermostSend:
         assert "root_id" not in payload
 
     @pytest.mark.asyncio
+    async def test_send_uses_metadata_thread_id_for_progress_messages(self):
+        """Progress/tool messages pass thread context via metadata, not reply_to."""
+        self.adapter._reply_mode = "thread"
+
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(return_value={"id": "progress_post"})
+        mock_resp.text = AsyncMock(return_value="")
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+        self.adapter._session.post = MagicMock(return_value=mock_resp)
+
+        result = await self.adapter.send(
+            "channel_1",
+            "⚡ terminal...",
+            metadata={"thread_id": "root_post_123"},
+        )
+
+        assert result.success is True
+        payload = self.adapter._session.post.call_args[1]["json"]
+        assert payload["root_id"] == "root_post_123"
+
+    @pytest.mark.asyncio
+    async def test_send_with_invalid_thread_root_falls_back_flat(self):
+        """If Mattermost rejects root_id, send() should retry once without threading."""
+        self.adapter._reply_mode = "thread"
+
+        bad_resp = AsyncMock()
+        bad_resp.status = 400
+        bad_resp.json = AsyncMock(return_value={})
+        bad_resp.text = AsyncMock(return_value='{"id":"api.post.create_post.root_id.app_error"}')
+        bad_resp.__aenter__ = AsyncMock(return_value=bad_resp)
+        bad_resp.__aexit__ = AsyncMock(return_value=False)
+
+        ok_resp = AsyncMock()
+        ok_resp.status = 200
+        ok_resp.json = AsyncMock(return_value={"id": "post_flat"})
+        ok_resp.text = AsyncMock(return_value="")
+        ok_resp.__aenter__ = AsyncMock(return_value=ok_resp)
+        ok_resp.__aexit__ = AsyncMock(return_value=False)
+
+        self.adapter._session.post = MagicMock(side_effect=[bad_resp, ok_resp])
+
+        result = await self.adapter.send("channel_1", "Reply!", reply_to="bad_root")
+
+        assert result.success is True
+        assert result.message_id == "post_flat"
+        first_payload = self.adapter._session.post.call_args_list[0][1]["json"]
+        second_payload = self.adapter._session.post.call_args_list[1][1]["json"]
+        assert first_payload["root_id"] == "bad_root"
+        assert "root_id" not in second_payload
+
+    @pytest.mark.asyncio
     async def test_send_api_failure(self):
         """When API returns error, send should return failure."""
         mock_resp = AsyncMock()
@@ -278,6 +359,62 @@ class TestMattermostWebSocketParsing:
         # @mention is stripped from the message text
         assert msg_event.text == "Hello from Matrix!"
         assert msg_event.message_id == "post_abc"
+
+    @pytest.mark.asyncio
+    async def test_top_level_threaded_channel_uses_own_post_as_thread_id(self):
+        """Top-level channel posts in thread reply mode must seed the session with their post ID.
+
+        Mattermost opens Hermes' answer under the top-level post's thread. If the
+        first turn is stored under the flat channel session but later thread
+        replies are stored under root_id, follow-ups lose the parent context.
+        """
+        self.adapter._reply_mode = "thread"
+        post_data = {
+            "id": "top_post_123",
+            "user_id": "user_123",
+            "channel_id": "chan_456",
+            "message": "@bot_user_id Give me channel suggestions",
+        }
+        event = {
+            "event": "posted",
+            "data": {
+                "post": json.dumps(post_data),
+                "channel_type": "O",
+                "sender_name": "@alice",
+            },
+        }
+
+        await self.adapter._handle_ws_event(event)
+        assert self.adapter.handle_message.called
+        msg_event = self.adapter.handle_message.call_args[0][0]
+        assert msg_event.source.thread_id == "top_post_123"
+        assert msg_event.message_id == "top_post_123"
+
+    @pytest.mark.asyncio
+    async def test_top_level_dm_does_not_seed_new_thread_session(self):
+        """Normal DMs should keep their stable DM session unless Mattermost sends root_id."""
+        self.adapter._reply_mode = "thread"
+        post_data = {
+            "id": "dm_post_123",
+            "user_id": "user_123",
+            "channel_id": "dm_chan",
+            "message": "DM follow-up",
+        }
+        event = {
+            "event": "posted",
+            "data": {
+                "post": json.dumps(post_data),
+                "channel_type": "D",
+                "sender_name": "@bob",
+            },
+        }
+
+        await self.adapter._handle_ws_event(event)
+        assert self.adapter.handle_message.called
+        msg_event = self.adapter.handle_message.call_args[0][0]
+        assert msg_event.source.chat_type == "dm"
+        assert msg_event.source.thread_id is None
+        assert msg_event.message_id == "dm_post_123"
 
     @pytest.mark.asyncio
     async def test_ignore_own_messages(self):
@@ -377,6 +514,30 @@ class TestMattermostWebSocketParsing:
         assert self.adapter.handle_message.called
         msg_event = self.adapter.handle_message.call_args[0][0]
         assert msg_event.source.thread_id == "root_post_123"
+
+    @pytest.mark.asyncio
+    async def test_thread_reply_uses_root_id_as_reply_target(self):
+        """Replies inside a Mattermost thread must reply to the root post, not nest under the reply."""
+        post_data = {
+            "id": "post_reply",
+            "user_id": "user_123",
+            "channel_id": "chan_456",
+            "message": "@bot_user_id Follow-up inside thread",
+            "root_id": "root_post_123",
+        }
+        event = {
+            "event": "posted",
+            "data": {
+                "post": json.dumps(post_data),
+                "channel_type": "O",
+                "sender_name": "@alice",
+            },
+        }
+
+        await self.adapter._handle_ws_event(event)
+        assert self.adapter.handle_message.called
+        msg_event = self.adapter.handle_message.call_args[0][0]
+        assert msg_event.message_id == "root_post_123"
 
     @pytest.mark.asyncio
     async def test_invalid_post_json_ignored(self):
