@@ -9913,6 +9913,12 @@ def main():
         dest="run_as_user",
         help="User account the Linux system service should run as",
     )
+    gateway_install.add_argument(
+        "--macos-app-wrapper",
+        dest="macos_app_wrapper",
+        action="store_true",
+        help="macOS only: run launchd through a Hermes Agent.app wrapper so privacy prompts show Hermes instead of python",
+    )
 
     # gateway uninstall
     gateway_uninstall = gateway_subparsers.add_parser(
