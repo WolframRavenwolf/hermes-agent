@@ -6,6 +6,7 @@ import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import SendResult
 from gateway.run import _resolve_progress_thread_id
 
 
@@ -275,6 +276,43 @@ class TestMattermostSend:
         assert result.success is True
         payload = self.adapter._session.post.call_args[1]["json"]
         assert payload["root_id"] == "root_post_123"
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_uses_metadata_thread_id(self, tmp_path):
+        """Local file uploads should keep Mattermost thread context from metadata."""
+        self.adapter._reply_mode = "thread"
+        image_path = tmp_path / "example.png"
+        image_path.write_bytes(b"png")
+        self.adapter._upload_file = AsyncMock(return_value="file_123")
+        self.adapter._api_post = AsyncMock(return_value={"id": "post_with_file"})
+
+        result = await self.adapter.send_image_file(
+            "channel_1",
+            str(image_path),
+            metadata={"thread_id": "root_post_123"},
+        )
+
+        assert result.success is True
+        payload = self.adapter._api_post.call_args[0][1]
+        assert payload["root_id"] == "root_post_123"
+        assert payload["file_ids"] == ["file_123"]
+
+    @pytest.mark.asyncio
+    async def test_send_document_missing_file_returns_failure_without_posting(self, tmp_path):
+        """Missing local files are internal delivery errors, not visible chat posts."""
+        self.adapter.send = AsyncMock(
+            return_value=SendResult(success=True, message_id="fallback_post")
+        )
+
+        result = await self.adapter.send_document(
+            "channel_1",
+            str(tmp_path / "missing.pdf"),
+            metadata={"thread_id": "root_post_123"},
+        )
+
+        assert result.success is False
+        assert "File not found" in result.error
+        self.adapter.send.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_send_with_invalid_thread_root_falls_back_flat(self):

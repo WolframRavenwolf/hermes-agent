@@ -677,6 +677,81 @@ from gateway.whatsapp_identity import (
 )
 
 
+def _extract_tool_result_media_tags(
+    messages: List[Dict[str, Any]],
+    history_media_paths: Optional[set] = None,
+) -> tuple[List[str], bool]:
+    """Extract deliverable MEDIA tags from tool/function result messages.
+
+    Tool results can contain documentation snippets or skill text with examples
+    like ``MEDIA:/path/to/file.jpg``.  Those must stay as plain text and must
+    not be appended to the final user-visible response.  Reuse the platform
+    parser so current-turn tool-result delivery has the same placeholder/code
+    span validation as normal response delivery.
+    """
+    media_tags: List[str] = []
+    has_voice_directive = False
+    seen_history = set(history_media_paths or set())
+
+    for msg in messages:
+        if msg.get("role") not in ("tool", "function"):
+            continue
+        content = msg.get("content", "") or ""
+        if "MEDIA:" not in content and "[[audio_as_voice]]" not in content:
+            continue
+
+        parsed_media, _ = BasePlatformAdapter.extract_media(content)
+        for path, is_voice in parsed_media:
+            if not path or path in seen_history:
+                continue
+            media_tags.append(f"MEDIA:{path}")
+            if is_voice:
+                has_voice_directive = True
+
+    return media_tags, has_voice_directive
+
+
+def _append_missing_tool_result_media_tags(
+    final_response: str,
+    messages: List[Dict[str, Any]],
+    history_media_paths: Optional[set] = None,
+) -> str:
+    """Append deliverable tool-result MEDIA tags missing from final_response.
+
+    A raw ``"MEDIA:" in final_response`` guard is too broad: the final answer
+    may mention MEDIA syntax as documentation, or include one valid attachment
+    while a different tool-generated attachment only appears in tool JSON.
+    Parse final_response with the same validated parser and dedupe by actual
+    deliverable paths instead.
+    """
+    if final_response is None:
+        final_response = ""
+
+    final_media, _ = BasePlatformAdapter.extract_media(final_response)
+    final_has_deliverable_media = bool(final_media)
+    seen_paths = set(history_media_paths or set())
+    seen_paths.update(path for path, _is_voice in final_media)
+
+    media_tags, has_voice_directive = _extract_tool_result_media_tags(
+        messages,
+        history_media_paths=seen_paths,
+    )
+    if not media_tags:
+        return final_response
+
+    seen_tags = set()
+    unique_tags = []
+    for tag in media_tags:
+        if tag not in seen_tags:
+            seen_tags.add(tag)
+            unique_tags.append(tag)
+
+    if has_voice_directive and not final_has_deliverable_media:
+        unique_tags.insert(0, "[[audio_as_voice]]")
+    media_suffix = "\n".join(unique_tags)
+    return final_response + (("\n" if final_response else "") + media_suffix)
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -15802,15 +15877,10 @@ class GatewayRunner:
             # Collect MEDIA paths already in history so we can exclude them
             # from the current turn's extraction. This is compression-safe:
             # even if the message list shrinks, we know which paths are old.
-            _history_media_paths: set = set()
-            for _hm in agent_history:
-                if _hm.get("role") in {"tool", "function"}:
-                    _hc = _hm.get("content", "")
-                    if "MEDIA:" in _hc:
-                        for _match in re.finditer(r'MEDIA:(\S+)', _hc):
-                            _p = _match.group(1).strip().rstrip('",}')
-                            if _p:
-                                _history_media_paths.add(_p)
+            _history_media_paths: set = {
+                tag.removeprefix("MEDIA:")
+                for tag in _extract_tool_result_media_tags(agent_history, history_media_paths=set())[0]
+            }
             
             # Register per-session gateway approval callback so dangerous
             # command approval blocks the agent thread (mirrors CLI input()).
@@ -16063,6 +16133,23 @@ class GatewayRunner:
                 _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
             _resolved_model = getattr(_agent, "model", None) if _agent else None
 
+            # Scan tool results for MEDIA:<path> tags that need to be delivered
+            # as native audio/file attachments.  The TTS tool embeds MEDIA: tags
+            # in its JSON response, but the model's final text reply may omit
+            # them entirely.  Append any deliverable tags that aren't already
+            # present in history or the final response so the adapter can find
+            # and deliver the files exactly once.
+            #
+            # Uses path-based deduplication against _history_media_paths (collected
+            # before run_conversation) instead of index slicing. This is safe even
+            # when context compression shrinks the message list. (Fixes #160)
+            if not result.get("failed"):
+                final_response = _append_missing_tool_result_media_tags(
+                    final_response or "",
+                    result.get("messages", []),
+                    history_media_paths=_history_media_paths,
+                )
+
             if not final_response:
                 error_msg = f"⚠️ {result['error']}" if result.get("error") else ""
                 return {
@@ -16084,41 +16171,6 @@ class GatewayRunner:
                     "model": _resolved_model,
                     "context_length": _context_length,
                 }
-            
-            # Scan tool results for MEDIA:<path> tags that need to be delivered
-            # as native audio/file attachments.  The TTS tool embeds MEDIA: tags
-            # in its JSON response, but the model's final text reply usually
-            # doesn't include them.  We collect unique tags from tool results and
-            # append any that aren't already present in the final response, so the
-            # adapter's extract_media() can find and deliver the files exactly once.
-            #
-            # Uses path-based deduplication against _history_media_paths (collected
-            # before run_conversation) instead of index slicing. This is safe even
-            # when context compression shrinks the message list. (Fixes #160)
-            if "MEDIA:" not in final_response:
-                media_tags = []
-                has_voice_directive = False
-                for msg in result.get("messages", []):
-                    if msg.get("role") in {"tool", "function"}:
-                        content = msg.get("content", "")
-                        if "MEDIA:" in content:
-                            for match in re.finditer(r'MEDIA:(\S+)', content):
-                                path = match.group(1).strip().rstrip('",}')
-                                if path and path not in _history_media_paths:
-                                    media_tags.append(f"MEDIA:{path}")
-                            if "[[audio_as_voice]]" in content:
-                                has_voice_directive = True
-                
-                if media_tags:
-                    seen = set()
-                    unique_tags = []
-                    for tag in media_tags:
-                        if tag not in seen:
-                            seen.add(tag)
-                            unique_tags.append(tag)
-                    if has_voice_directive:
-                        unique_tags.insert(0, "[[audio_as_voice]]")
-                    final_response = final_response + "\n" + "\n".join(unique_tags)
             
             # Sync session_id: the agent may have created a new session during
             # mid-run context compression (_compress_context splits sessions).

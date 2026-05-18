@@ -609,9 +609,10 @@ class GatewayStreamConsumer:
         except Exception as e:
             logger.error("Stream consumer error: %s", e)
 
-    # Pattern to strip MEDIA:<path> tags (including optional surrounding quotes).
-    # Matches the simple cleanup regex used by the non-streaming path in
-    # gateway/platforms/base.py for post-processing.
+    # Fallback pattern used only if the shared platform media parser cannot be
+    # imported.  Normal streaming cleanup delegates to BasePlatformAdapter so
+    # placeholder/documentation text is treated the same in streaming and
+    # non-streaming delivery paths.
     _MEDIA_RE = re.compile(r'''[`"']?MEDIA:\s*\S+[`"']?''')
 
     @staticmethod
@@ -627,8 +628,15 @@ class GatewayStreamConsumer:
         """
         if "MEDIA:" not in text and "[[audio_as_voice]]" not in text:
             return text
-        cleaned = text.replace("[[audio_as_voice]]", "")
-        cleaned = GatewayStreamConsumer._MEDIA_RE.sub("", cleaned)
+        try:
+            from gateway.platforms.base import BasePlatformAdapter
+
+            _media, cleaned = BasePlatformAdapter.extract_media(text)
+        except Exception:
+            # Fail safe for display: if the shared parser cannot load, keep the
+            # old best-effort behavior rather than exposing real attachment tags.
+            cleaned = text.replace("[[audio_as_voice]]", "")
+            cleaned = GatewayStreamConsumer._MEDIA_RE.sub("", cleaned)
         # Collapse excessive blank lines left behind by removed tags
         cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
         # Strip trailing whitespace/newlines but preserve leading content

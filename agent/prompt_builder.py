@@ -413,7 +413,7 @@ PLATFORM_HINTS = {
         "You are on a text messaging communication platform, WhatsApp. "
         "Please do not use markdown as it does not render. "
         "You can send media files natively: to deliver a file to the user, "
-        "include MEDIA:/absolute/path/to/file in your response. The file "
+        "include the literal `MEDIA:` tag followed by the real absolute path of an existing local file in your response. The file "
         "will be sent as a native WhatsApp attachment — images (.jpg, .png, "
         ".webp) appear as photos, videos (.mp4, .mov) play inline, and other "
         "files arrive as downloadable documents. You can also include image "
@@ -429,7 +429,7 @@ PLATFORM_HINTS = {
         "auto-rewritten into row-group bullets, which you can produce "
         "directly for cleaner output). "
         "You can send media files natively: to deliver a file to the user, "
-        "include MEDIA:/absolute/path/to/file in your response. Images "
+        "include the literal `MEDIA:` tag followed by the real absolute path of an existing local file in your response. Images "
         "(.png, .jpg, .webp) appear as photos, audio (.ogg) sends as voice "
         "bubbles, and videos (.mp4) play inline. You can also include image "
         "URLs in markdown format ![alt](url) and they will be sent as native photos.\n\n"
@@ -438,14 +438,14 @@ PLATFORM_HINTS = {
     ),
     "discord": (
         "You are in a Discord server or group chat communicating with your user. "
-        "You can send media files natively: include MEDIA:/absolute/path/to/file "
+        "You can send media files natively: include the literal `MEDIA:` tag followed by the real absolute path of an existing local file "
         "in your response. Images (.png, .jpg, .webp) are sent as photo "
         "attachments, audio as file attachments. You can also include image URLs "
         "in markdown format ![alt](url) and they will be sent as attachments."
     ),
     "slack": (
         "You are in a Slack workspace communicating with your user. "
-        "You can send media files natively: include MEDIA:/absolute/path/to/file "
+        "You can send media files natively: include the literal `MEDIA:` tag followed by the real absolute path of an existing local file "
         "in your response. Images (.png, .jpg, .webp) are uploaded as photo "
         "attachments, audio as file attachments. You can also include image URLs "
         "in markdown format ![alt](url) and they will be uploaded as attachments."
@@ -454,7 +454,7 @@ PLATFORM_HINTS = {
         "You are on a text messaging communication platform, Signal. "
         "Please do not use markdown as it does not render. "
         "You can send media files natively: to deliver a file to the user, "
-        "include MEDIA:/absolute/path/to/file in your response. Images "
+        "include the literal `MEDIA:` tag followed by the real absolute path of an existing local file in your response. Images "
         "(.png, .jpg, .webp) appear as photos, audio as attachments, and other "
         "files arrive as downloadable documents. You can also include image "
         "URLs in markdown format ![alt](url) and they will be sent as photos."
@@ -463,7 +463,7 @@ PLATFORM_HINTS = {
         "You are communicating via email. Write clear, well-structured responses "
         "suitable for email. Use plain text formatting (no markdown). "
         "Keep responses concise but complete. You can send file attachments — "
-        "include MEDIA:/absolute/path/to/file in your response. The subject line "
+        "include the literal `MEDIA:` tag followed by the real absolute path of an existing local file in your response. The subject line "
         "is preserved for threading. Do not include greetings or sign-offs unless "
         "contextually appropriate."
     ),
@@ -493,14 +493,14 @@ PLATFORM_HINTS = {
         "You are chatting via iMessage (BlueBubbles). iMessage does not render "
         "markdown formatting — use plain text. Keep responses concise as they "
         "appear as text messages. You can send media files natively: include "
-        "MEDIA:/absolute/path/to/file in your response. Images (.jpg, .png, "
+        "the literal `MEDIA:` tag followed by the real absolute path of an existing local file in your response. Images (.jpg, .png, "
         ".heic) appear as photos and other files arrive as attachments."
     ),
     "mattermost": (
         "You are in a Mattermost workspace communicating with your user. "
         "Mattermost renders standard Markdown — headings, bold, italic, code "
         "blocks, and tables all work. "
-        "You can send media files natively: include MEDIA:/absolute/path/to/file "
+        "You can send media files natively: include the literal `MEDIA:` tag followed by the real absolute path of an existing local file "
         "in your response. Images (.jpg, .png, .webp) are uploaded as photo "
         "attachments, audio and video as file attachments. "
         "Image URLs in markdown format ![alt](url) are rendered as inline previews automatically.\n\n"
@@ -511,7 +511,7 @@ PLATFORM_HINTS = {
         "You are in a Matrix room communicating with your user. "
         "Matrix renders Markdown — bold, italic, code blocks, and links work; "
         "the adapter converts your Markdown to HTML for rich display. "
-        "You can send media files natively: include MEDIA:/absolute/path/to/file "
+        "You can send media files natively: include the literal `MEDIA:` tag followed by the real absolute path of an existing local file "
         "in your response. Images (.jpg, .png, .webp) are sent as inline photos, "
         "audio (.ogg, .mp3) as voice/audio messages, video (.mp4) inline, "
         "and other files as downloadable attachments."
@@ -520,14 +520,14 @@ PLATFORM_HINTS = {
         "You are in a Feishu (Lark) workspace communicating with your user. "
         "Feishu renders Markdown in messages — bold, italic, code blocks, and "
         "links are supported. "
-        "You can send media files natively: include MEDIA:/absolute/path/to/file "
+        "You can send media files natively: include the literal `MEDIA:` tag followed by the real absolute path of an existing local file "
         "in your response. Images (.jpg, .png, .webp) are uploaded and displayed "
         "inline, audio files as voice messages, and other files as attachments."
     ),
     "weixin": (
         "You are on Weixin/WeChat. Markdown formatting is supported, so you may use it when "
         "it improves readability, but keep the message compact and chat-friendly. You can send media files natively: "
-        "include MEDIA:/absolute/path/to/file in your response. Images are sent as native "
+        "include the literal `MEDIA:` tag followed by the real absolute path of an existing local file in your response. Images are sent as native "
         "photos, videos play inline when supported, and other files arrive as downloadable "
         "documents. You can also include image URLs in markdown format ![alt](url) and they "
         "will be downloaded and sent as native media when possible."
@@ -535,7 +535,7 @@ PLATFORM_HINTS = {
     "wecom": (
         "You are on WeCom (企业微信 / Enterprise WeChat). Markdown formatting is supported. "
         "You CAN send media files natively — to deliver a file to the user, include "
-        "MEDIA:/absolute/path/to/file in your response. The file will be sent as a native "
+        "the literal `MEDIA:` tag followed by the real absolute path of an existing local file in your response. The file will be sent as a native "
         "WeCom attachment: images (.jpg, .png, .webp) are sent as photos (up to 10 MB), "
         "other files (.pdf, .docx, .xlsx, .md, .txt, etc.) arrive as downloadable documents "
         "(up to 20 MB), and videos (.mp4) play inline. Voice messages are supported but "
@@ -546,7 +546,7 @@ PLATFORM_HINTS = {
     ),
     "qqbot": (
         "You are on QQ, a popular Chinese messaging platform. QQ supports markdown formatting "
-        "and emoji. You can send media files natively: include MEDIA:/absolute/path/to/file in "
+        "and emoji. You can send media files natively: include the literal `MEDIA:` tag followed by the real absolute path of an existing local file in "
         "your response. Images are sent as native photos, and other files arrive as downloadable "
         "documents."
     ),
@@ -576,7 +576,7 @@ PLATFORM_HINTS = {
     "api_server": (
         "You are accessed via an OpenAI-compatible API from a private frontend "
         "(e.g. SillyTavern, Open WebUI, LobeChat). Markdown is fully supported. "
-        "You can send media files: include MEDIA:/absolute/path/to/file in your "
+        "You can send media files: include the literal `MEDIA:` tag followed by the real absolute path of an existing local file in your "
         "response. You can also include image URLs in markdown format ![alt](url). "
         "This is a private environment.\n\n"
         "Amy's zipper starts HALF-OPEN — Private Assistant Mode by default. "

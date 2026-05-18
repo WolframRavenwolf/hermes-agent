@@ -10,6 +10,8 @@ times per reply. (Regression test for #160)
 import pytest
 import re
 
+from gateway.platforms.base import BasePlatformAdapter
+
 
 def extract_media_tags_fixed(result_messages, history_len):
     """
@@ -178,6 +180,201 @@ class TestMediaExtraction:
         seen = set()
         unique = [t for t in tags if t not in seen and not seen.add(t)]
         assert len(unique) == 2  # After dedup: same.ogg and different.ogg
+
+
+class TestBasePlatformExtractMedia:
+    """Regression tests for gateway MEDIA: tag parsing."""
+
+    def test_extract_media_accepts_real_absolute_media_path(self):
+        """A real-looking absolute media path should still be delivered."""
+        media, cleaned = BasePlatformAdapter.extract_media(
+            "Here is the image.\nMEDIA:/share/hermes/gallery/example.png"
+        )
+
+        assert media == [("/share/hermes/gallery/example.png", False)]
+        assert "MEDIA:" not in cleaned
+
+    def test_extract_media_accepts_document_and_platform_media_extensions(self):
+        """Documented attachment types such as Markdown and HEIC must still work."""
+        media, cleaned = BasePlatformAdapter.extract_media(
+            "Docs:\nMEDIA:/tmp/report.md\nPhoto:\nMEDIA:/tmp/photo.heic"
+        )
+
+        assert media == [("/tmp/report.md", False), ("/tmp/photo.heic", False)]
+        assert "MEDIA:" not in cleaned
+
+    def test_extract_media_ignores_prompt_placeholder_path(self):
+        """Documentation examples must not be treated as real attachments."""
+        content = "Use MEDIA:/absolute/path/to/file in your response."
+
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+
+        assert media == []
+        assert cleaned == content
+
+    def test_extract_media_ignores_angle_bracket_placeholder(self):
+        """Tool hints such as MEDIA:<screenshot_path> are placeholders, not files."""
+        content = "Share it with MEDIA:<screenshot_path>."
+
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+
+        assert media == []
+        assert cleaned == content
+
+    def test_extract_media_ignores_code_spans(self):
+        """MEDIA: examples inside inline or fenced code are documentation, not output."""
+        content = (
+            "Inline `MEDIA:/share/hermes/gallery/example.png`\n"
+            "```text\nMEDIA:/share/hermes/gallery/example2.png\n```"
+        )
+
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+
+        assert media == []
+        assert cleaned == content
+
+
+class TestGatewayToolResultMediaExtraction:
+    """Regression tests for gateway tool-result MEDIA tag scanning."""
+
+    def test_tool_result_media_scanner_ignores_documentation_placeholders(self):
+        """Inline-code MEDIA examples inside skill/tool JSON must not be appended."""
+        from gateway.run import _extract_tool_result_media_tags
+
+        messages = [
+            {
+                "role": "tool",
+                "content": (
+                    '{"content": "- **MEDIA: paths** — Raw `MEDIA:/path/to/file.jpg` '
+                    'in docs is useless. Convert to descriptive references."}'
+                ),
+            }
+        ]
+
+        tags, has_voice = _extract_tool_result_media_tags(messages, history_media_paths=set())
+
+        assert tags == []
+        assert has_voice is False
+
+    def test_tool_result_media_scanner_keeps_real_tts_media(self):
+        """Real TTS MEDIA tags in tool results must still be appended for delivery."""
+        from gateway.run import _extract_tool_result_media_tags
+
+        messages = [
+            {
+                "role": "tool",
+                "content": (
+                    '{"success": true, "media_tag": '
+                    '"[[audio_as_voice]]\\nMEDIA:/share/hermes/audio/voice.ogg"}'
+                ),
+            }
+        ]
+
+        tags, has_voice = _extract_tool_result_media_tags(messages, history_media_paths=set())
+
+        assert tags == ["MEDIA:/share/hermes/audio/voice.ogg"]
+        assert has_voice is True
+
+    def test_tool_result_media_scanner_skips_history_paths(self):
+        """Current tool results must not re-append paths already seen in history."""
+        from gateway.run import _extract_tool_result_media_tags
+
+        messages = [
+            {"role": "tool", "content": "MEDIA:/share/hermes/audio/old.ogg"},
+            {"role": "tool", "content": "MEDIA:/share/hermes/audio/new.ogg"},
+        ]
+
+        tags, has_voice = _extract_tool_result_media_tags(
+            messages,
+            history_media_paths={"/share/hermes/audio/old.ogg"},
+        )
+
+        assert tags == ["MEDIA:/share/hermes/audio/new.ogg"]
+        assert has_voice is False
+
+    def test_append_tool_media_when_final_response_has_placeholder_media_text(self):
+        """A placeholder MEDIA mention in final text must not suppress real tool media."""
+        from gateway.run import _append_missing_tool_result_media_tags
+
+        final_response = "Docs mention `MEDIA:/path/to/file.jpg`, but that is just an example."
+        messages = [
+            {
+                "role": "tool",
+                "content": (
+                    '{"success": true, "media_tag": '
+                    '"[[audio_as_voice]]\\nMEDIA:/share/hermes/audio/voice.ogg"}'
+                ),
+            }
+        ]
+
+        updated = _append_missing_tool_result_media_tags(
+            final_response,
+            messages,
+            history_media_paths=set(),
+        )
+
+        assert updated == (
+            final_response
+            + "\n[[audio_as_voice]]\nMEDIA:/share/hermes/audio/voice.ogg"
+        )
+
+    def test_append_tool_media_dedupes_against_deliverable_final_response_tags(self):
+        """Existing valid final-response MEDIA tags should not block distinct tool media."""
+        from gateway.run import _append_missing_tool_result_media_tags
+
+        final_response = "Primary image:\nMEDIA:/share/hermes/gallery/primary.png"
+        messages = [
+            {"role": "tool", "content": "MEDIA:/share/hermes/gallery/primary.png"},
+            {"role": "tool", "content": "MEDIA:/share/hermes/gallery/secondary.png"},
+        ]
+
+        updated = _append_missing_tool_result_media_tags(
+            final_response,
+            messages,
+            history_media_paths=set(),
+        )
+
+        assert updated == final_response + "\nMEDIA:/share/hermes/gallery/secondary.png"
+
+    def test_append_voice_tool_media_does_not_reclassify_existing_final_media(self):
+        """Voice directives must not globally reclassify existing final-response media."""
+        from gateway.run import _append_missing_tool_result_media_tags
+
+        final_response = "Primary image:\nMEDIA:/share/hermes/gallery/primary.png"
+        messages = [
+            {
+                "role": "tool",
+                "content": "[[audio_as_voice]]\nMEDIA:/share/hermes/audio/voice.ogg",
+            },
+        ]
+
+        updated = _append_missing_tool_result_media_tags(
+            final_response,
+            messages,
+            history_media_paths=set(),
+        )
+
+        assert updated == final_response + "\nMEDIA:/share/hermes/audio/voice.ogg"
+        assert "[[audio_as_voice]]" not in updated
+
+    def test_append_tool_media_when_final_response_is_empty(self):
+        """Tool-result media should still be deliverable without visible text."""
+        from gateway.run import _append_missing_tool_result_media_tags
+
+        messages = [
+            {
+                "role": "tool",
+                "content": "[[audio_as_voice]]\nMEDIA:/share/hermes/audio/voice.ogg",
+            },
+        ]
+
+        updated = _append_missing_tool_result_media_tags(
+            "",
+            messages,
+            history_media_paths=set(),
+        )
+
+        assert updated == "[[audio_as_voice]]\nMEDIA:/share/hermes/audio/voice.ogg"
 
 
 if __name__ == "__main__":

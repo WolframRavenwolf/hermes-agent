@@ -2107,6 +2107,10 @@ class BasePlatformAdapter(ABC):
         same response is delivered as a document, mirroring the all-or-nothing
         scope of ``[[audio_as_voice]]``.
 
+        Only real-looking local paths are extracted.  Documentation snippets and
+        placeholder paths must stay visible as text rather than becoming failed
+        attachment attempts.
+
         Args:
             content: The response text to scan.
 
@@ -2118,30 +2122,82 @@ class BasePlatformAdapter(ABC):
 
         # Check for [[audio_as_voice]] directive
         has_voice_tag = "[[audio_as_voice]]" in content
-        cleaned = cleaned.replace("[[audio_as_voice]]", "")
-        # Strip [[as_document]] directive — callers inspect the original
-        # ``content`` for it (so they can still react to it); here we just
-        # keep it out of the user-visible cleaned text.
-        cleaned = cleaned.replace("[[as_document]]", "")
-        
+        has_document_tag = "[[as_document]]" in content
+
+        allowed_exts = {
+            '.png', '.jpg', '.jpeg', '.gif', '.webp', '.heic', '.heif', '.bmp', '.svg',
+            '.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp',
+            '.ogg', '.opus', '.mp3', '.wav', '.m4a', '.flac', '.amr',
+            '.epub', '.pdf', '.zip', '.rar', '.7z', '.tar', '.gz', '.tgz', '.bz2', '.xz',
+            '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+            '.txt', '.csv', '.md', '.json', '.yaml', '.yml', '.xml', '.html', '.htm', '.log',
+            '.apk', '.ipa',
+        }
+        placeholder_prefixes = (
+            '/absolute/path/',
+            '/path/',
+            '/pfad/',
+        )
+
+        # Build spans covered by fenced code blocks and inline code.  MEDIA:
+        # examples in code are instructions/documentation, not files to send.
+        code_spans: list = []
+        for m in re.finditer(r'```[^\n]*\n.*?```', content, re.DOTALL):
+            code_spans.append((m.start(), m.end()))
+        for m in re.finditer(r'`[^`\n]+`', content):
+            code_spans.append((m.start(), m.end()))
+
+        def _in_code(pos: int) -> bool:
+            return any(start <= pos < end for start, end in code_spans)
+
+        def _deliverable_media_path(path: str) -> bool:
+            stripped = path.strip()
+            if not stripped:
+                return False
+            # Angle-bracket / brace forms are placeholders from tool hints or docs.
+            if any(ch in stripped for ch in '<>{}'):
+                return False
+            # MEDIA tags are for local files only; URLs are handled via markdown images.
+            if not (stripped.startswith('/') or stripped.startswith('~/')):
+                return False
+            lowered = stripped.lower()
+            if lowered.startswith(placeholder_prefixes):
+                return False
+            ext = os.path.splitext(stripped.rstrip('/'))[1].lower()
+            return ext in allowed_exts
+
         # Extract MEDIA:<path> tags, allowing optional whitespace after the colon
         # and quoted/backticked paths for LLM-formatted outputs.
         media_pattern = re.compile(
-            r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:png|jpe?g|gif|webp|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|txt|csv|apk|ipa)(?=[\s`"',;:)\]}]|$)|\S+)[`"']?'''
+            r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:png|jpe?g|gif|webp|heic|heif|bmp|svg|mp4|mov|avi|mkv|webm|3gp|ogg|opus|mp3|wav|m4a|flac|amr|epub|pdf|zip|rar|7z|tar|gz|tgz|bz2|xz|docx?|xlsx?|pptx?|txt|csv|md|json|ya?ml|xml|html?|log|apk|ipa)(?=[\s`"',;:)\]}]|$)|\S+)[`"']?'''
         )
+        valid_matches = []
         for match in media_pattern.finditer(content):
+            if _in_code(match.start()):
+                continue
             path = match.group("path").strip()
             if len(path) >= 2 and path[0] == path[-1] and path[0] in "`\"'":
                 path = path[1:-1].strip()
             path = path.lstrip("`\"'").rstrip("`\"',.;:)}]")
-            if path:
+            if _deliverable_media_path(path):
+                valid_matches.append(match)
                 media.append((os.path.expanduser(path), has_voice_tag))
 
-        # Remove MEDIA tags from content (including surrounding quote/backtick wrappers)
-        if media:
-            cleaned = media_pattern.sub('', cleaned)
+        # Remove only valid MEDIA tags from content. Invalid placeholders remain
+        # visible so explanatory text is not silently mutilated.
+        if valid_matches:
+            cleaned_parts = []
+            last = 0
+            for match in valid_matches:
+                cleaned_parts.append(cleaned[last:match.start()])
+                last = match.end()
+            cleaned_parts.append(cleaned[last:])
+            cleaned = ''.join(cleaned_parts)
+        if valid_matches or has_voice_tag or has_document_tag:
+            cleaned = cleaned.replace("[[audio_as_voice]]", "")
+            cleaned = cleaned.replace("[[as_document]]", "")
             cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
-        
+
         return media, cleaned
 
     @staticmethod
@@ -3115,10 +3171,12 @@ class BasePlatformAdapter(ABC):
 
                 # Extract image URLs and send them as native platform attachments
                 images, text_content = self.extract_images(response)
-                # Strip any remaining internal directives from message body (fixes #1561)
+                # Strip any remaining internal audio directive from message body (fixes #1561).
+                # Do not broadly strip MEDIA: text here: extract_media() already removed
+                # validated deliverable tags and intentionally preserves documentation
+                # placeholders such as MEDIA:/absolute/path/to/file.
                 text_content = text_content.replace("[[audio_as_voice]]", "").strip()
                 text_content = text_content.replace("[[as_document]]", "").strip()
-                text_content = re.sub(r"MEDIA:\s*\S+", "", text_content).strip()
                 if images:
                     logger.info("[%s] extract_images found %d image(s) in response (%d chars)", self.name, len(images), len(response))
 

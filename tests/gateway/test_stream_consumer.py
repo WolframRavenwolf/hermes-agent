@@ -35,11 +35,16 @@ class TestCleanForDisplay:
         assert "Audio generated" in result
 
     def test_media_tag_with_quotes(self):
-        """MEDIA: tags wrapped in quotes or backticks are removed."""
-        for wrapper in ['`MEDIA:/path/file.png`', '"MEDIA:/path/file.png"', "'MEDIA:/path/file.png'"]:
+        """MEDIA: tags wrapped in normal quotes are removed."""
+        for wrapper in ['"MEDIA:/tmp/file.png"', "'MEDIA:/tmp/file.png'"]:
             text = f"Result: {wrapper}"
             result = GatewayStreamConsumer._clean_for_display(text)
             assert "MEDIA:" not in result, f"Failed for wrapper: {wrapper}"
+
+    def test_backticked_media_example_preserved(self):
+        """Inline-code MEDIA examples are documentation, not streaming directives."""
+        text = "Result: `MEDIA:/tmp/file.png`"
+        assert GatewayStreamConsumer._clean_for_display(text) == text
 
     def test_audio_as_voice_stripped(self):
         """[[audio_as_voice]] directive is removed."""
@@ -75,6 +80,18 @@ class TestCleanForDisplay:
         assert "MEDIA:" not in result
         assert "generated" in result
         assert "for you." in result
+
+    def test_invalid_media_placeholder_preserved(self):
+        """Documentation placeholders are explanatory text, not stream directives."""
+        text = "Use MEDIA:/absolute/path/to/file in your response."
+        result = GatewayStreamConsumer._clean_for_display(text)
+        assert result == text
+
+    def test_literal_media_tag_wording_preserved(self):
+        """Prompt text mentioning the literal `MEDIA:` tag must not be garbled."""
+        text = "Include the literal `MEDIA:` tag followed by a real path."
+        result = GatewayStreamConsumer._clean_for_display(text)
+        assert result == text
 
     def test_preserves_non_media_colons(self):
         """Normal colons and text with 'MEDIA' as a word aren't stripped."""
