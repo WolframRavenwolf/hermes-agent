@@ -7194,6 +7194,8 @@ class GatewayRunner:
         
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
+        persist_user_message = None
+        persist_user_timestamp = None
         try:
             _pcfg = _load_gateway_config()
             _redact_pii = bool((_pcfg.get("privacy") or {}).get("redact_pii", False))
@@ -7702,6 +7704,59 @@ class GatewayRunner:
             }
             await self.hooks.emit("agent:start", hook_ctx)
 
+            # Expand @ context references (@file:, @folder:, @diff, etc.)
+            if "@" in message_text:
+                try:
+                    from agent.context_references import preprocess_context_references_async
+                    from agent.model_metadata import get_model_context_length
+                    _msg_cwd = os.environ.get("MESSAGING_CWD", os.path.expanduser("~"))
+                    _msg_ctx_len = get_model_context_length(
+                        self._model, base_url=self._base_url or "")
+                    _ctx_result = await preprocess_context_references_async(
+                        message_text, cwd=_msg_cwd,
+                        context_length=_msg_ctx_len, allowed_root=_msg_cwd)
+                    if _ctx_result.blocked:
+                        _adapter = self.adapters.get(source.platform)
+                        if _adapter:
+                            await _adapter.send(
+                                source.chat_id,
+                                "\n".join(_ctx_result.warnings) or "Context injection refused.",
+                            )
+                        return
+                    if _ctx_result.expanded:
+                        message_text = _ctx_result.message
+                except Exception as exc:
+                    logger.debug("@ context reference expansion failed: %s", exc)
+
+            # Inject message timestamp so the LLM sees when this message was sent.
+            # Keep the persisted transcript clean: timestamps are stored as
+            # metadata and rendered into context exactly once on replay.
+            try:
+                from hermes_time import get_timezone as _get_evt_tz
+                from gateway.message_timestamps import (
+                    coerce_message_timestamp as _coerce_msg_ts,
+                    render_user_content_with_timestamp as _render_msg_ts,
+                    strip_leading_message_timestamps as _strip_msg_ts,
+                )
+                _evt_tz = _get_evt_tz()
+                _evt_ts = getattr(event, "timestamp", None)
+                if message_text and isinstance(message_text, str):
+                    _clean_message_text, _embedded_ts = _strip_msg_ts(
+                        message_text, tz=_evt_tz)
+                    persist_user_message = _clean_message_text
+                    _event_epoch = _coerce_msg_ts(_evt_ts, tz=_evt_tz)
+                    persist_user_timestamp = (
+                        _event_epoch if _event_epoch is not None else _embedded_ts
+                    )
+                    message_text = _render_msg_ts(
+                        _clean_message_text,
+                        persist_user_timestamp,
+                        tz=_evt_tz,
+                    )
+            except Exception as _ts_err:
+                logger.debug("Message timestamp injection failed (non-fatal): %s", _ts_err)
+
+
             # Run the agent
             agent_result = await self._run_agent(
                 message=message_text,
@@ -7713,6 +7768,8 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
                 channel_prompt=event.channel_prompt,
+                persist_user_message=persist_user_message,
+                persist_user_timestamp=persist_user_timestamp,
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -7946,7 +8003,7 @@ class GatewayRunner:
                     "Your next message will start a fresh session."
                 )
 
-            ts = datetime.now().isoformat()
+            ts = time.time()  # Unix epoch float — consistent with DB storage
             
             # If this is a fresh session (no history), write the full tool
             # definitions as the first entry so the transcript is self-describing
@@ -7989,7 +8046,19 @@ class GatewayRunner:
                 if not new_messages:
                     self.session_store.append_to_transcript(
                         session_entry.session_id,
-                        {"role": "user", "content": message_text, "timestamp": ts}
+                        {
+                            "role": "user",
+                            "content": (
+                                persist_user_message
+                                if persist_user_message is not None
+                                else message_text
+                            ),
+                            "timestamp": (
+                                persist_user_timestamp
+                                if persist_user_timestamp is not None
+                                else ts
+                            ),
+                        }
                     )
                     if response:
                         self.session_store.append_to_transcript(
@@ -14671,6 +14740,8 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        persist_user_message: Optional[str] = None,
+        persist_user_timestamp: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -15650,11 +15721,23 @@ class GatewayRunner:
             # Convert history to agent format.
             # Two cases:
             #   1. Normal path (from transcript): simple {role, content, timestamp} dicts
-            #      - Strip timestamps, keep role+content
+            #      - Inject timestamps into user messages, strip timestamp field
             #   2. Interrupt path (from agent result["messages"]): full agent messages
             #      that may include tool_calls, tool_call_id, reasoning, etc.
             #      - These must be passed through intact so the API sees valid
             #        assistant→tool sequences (dropping tool_calls causes 500 errors)
+            #
+            # Timestamp rendering: prepend exactly one timestamp to user
+            # messages so the LLM sees when each message was sent.  Legacy
+            # transcripts may already contain a leading timestamp in content;
+            # render_user_content_with_timestamp strips it first and preserves
+            # its embedded platform-send time when present.
+            from hermes_time import get_timezone as _get_msg_tz
+            from gateway.message_timestamps import (
+                render_user_content_with_timestamp as _render_msg_ts,
+            )
+            _msg_tz = _get_msg_tz()
+
             agent_history = []
             for msg in history:
                 role = msg.get("role")
@@ -15687,6 +15770,10 @@ class GatewayRunner:
                         if msg.get("mirror"):
                             mirror_src = msg.get("mirror_source", "another session")
                             content = f"[Delivered from {mirror_src}] {content}"
+                        # Render one context timestamp for user messages.
+                        _ts = msg.get("timestamp")
+                        if role == "user" and isinstance(content, str):
+                            content = _render_msg_ts(content, _ts, tz=_msg_tz)
                         # Preserve assistant reasoning + Codex replay fields so
                         # multi-turn reasoning context, prefix-cache hits, and
                         # provider-specific echo requirements survive session
@@ -15919,7 +16006,13 @@ class GatewayRunner:
                 else:
                     _run_message = message
 
-                result = agent.run_conversation(_run_message, conversation_history=agent_history, task_id=session_id)
+                result = agent.run_conversation(
+                    _run_message,
+                    conversation_history=agent_history,
+                    task_id=session_id,
+                    persist_user_message=persist_user_message,
+                    persist_user_timestamp=persist_user_timestamp,
+                )
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent

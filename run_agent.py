@@ -1563,6 +1563,7 @@ class AIAgent:
         # (e.g. CLI voice mode adds a temporary prefix for the live call only).
         self._persist_user_message_idx = None
         self._persist_user_message_override = None
+        self._persist_user_message_timestamp = None
 
         # Cache anthropic image-to-text fallbacks per image payload/URL so a
         # single tool loop does not repeatedly re-run auxiliary vision on the
@@ -4627,16 +4628,21 @@ class AIAgent:
         that synthetic text leak into persisted transcripts or resumed session
         history. When an override is configured for the active turn, mutate the
         in-memory messages list in place so both persistence and returned
-        history stay clean.
+        history stay clean.  A paired timestamp override preserves the platform
+        event time as message metadata, rather than embedding it in content.
         """
         idx = getattr(self, "_persist_user_message_idx", None)
         override = getattr(self, "_persist_user_message_override", None)
-        if override is None or idx is None:
+        timestamp = getattr(self, "_persist_user_message_timestamp", None)
+        if idx is None:
             return
         if 0 <= idx < len(messages):
             msg = messages[idx]
             if isinstance(msg, dict) and msg.get("role") == "user":
-                msg["content"] = override
+                if override is not None:
+                    msg["content"] = override
+                if timestamp is not None:
+                    msg["timestamp"] = timestamp
 
     def _persist_session(self, messages: List[Dict], conversation_history: List[Dict] = None):
         """Save session state to both JSON log and SQLite on any exit path.
@@ -5138,6 +5144,7 @@ class AIAgent:
                     reasoning_details=msg.get("reasoning_details") if role == "assistant" else None,
                     codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
                     codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
+                    timestamp=msg.get("timestamp"),
                 )
             self._last_flushed_db_idx = len(messages)
         except Exception as e:
@@ -11025,6 +11032,202 @@ class AIAgent:
         """
         return self.api_mode != "codex_responses"
 
+    def flush_memories(self, messages: list = None, min_turns: int = None):
+        """Give the model one turn to persist memories before context is lost.
+
+        Called before compression, session reset, or CLI exit. Injects a flush
+        message, makes one API call, executes any memory tool calls, then
+        strips all flush artifacts from the message list.
+
+        Args:
+            messages: The current conversation messages. If None, uses
+                      self._session_messages (last run_conversation state).
+            min_turns: Minimum user turns required to trigger the flush.
+                       None = use config value (flush_min_turns).
+                       0 = always flush (used for compression).
+        """
+        if self._memory_flush_min_turns == 0 and min_turns is None:
+            return
+        if "memory" not in self.valid_tool_names or not self._memory_store:
+            return
+        effective_min = min_turns if min_turns is not None else self._memory_flush_min_turns
+        if self._user_turn_count < effective_min:
+            return
+
+        if messages is None:
+            messages = getattr(self, '_session_messages', None)
+        if not messages or len(messages) < 3:
+            return
+
+        flush_content = (
+            "[System: The session is being compressed. "
+            "Save anything worth remembering — prioritize user preferences, "
+            "corrections, and recurring patterns over task-specific details.]"
+        )
+        _sentinel = f"__flush_{id(self)}_{time.monotonic()}"
+        flush_msg = {"role": "user", "content": flush_content, "_flush_sentinel": _sentinel}
+        messages.append(flush_msg)
+
+        try:
+            # Build API messages for the flush call
+            _needs_sanitize = self._should_sanitize_tool_calls()
+            api_messages = []
+            for msg in messages:
+                api_msg = msg.copy()
+                self._copy_reasoning_content_for_api(msg, api_msg)
+                api_msg.pop("reasoning", None)
+                api_msg.pop("finish_reason", None)
+                api_msg.pop("_flush_sentinel", None)
+                api_msg.pop("_thinking_prefill", None)
+                api_msg.pop("timestamp", None)
+                if _needs_sanitize:
+                    self._sanitize_tool_calls_for_strict_api(api_msg)
+                api_messages.append(api_msg)
+
+            if self._cached_system_prompt:
+                api_messages = [{"role": "system", "content": self._cached_system_prompt}] + api_messages
+
+            # Make one API call with only the memory tool available
+            memory_tool_def = None
+            for t in (self.tools or []):
+                if t.get("function", {}).get("name") == "memory":
+                    memory_tool_def = t
+                    break
+
+            if not memory_tool_def:
+                messages.pop()  # remove flush msg
+                return
+
+            # Use auxiliary client for the flush call when available --
+            # it's cheaper and avoids Codex Responses API incompatibility.
+            from agent.auxiliary_client import (
+                call_llm as _call_llm,
+                _fixed_temperature_for_model,
+                OMIT_TEMPERATURE,
+            )
+            _aux_available = True
+            # Kimi models manage temperature server-side — omit it entirely.
+            # Other models with a fixed contract get that value; everyone else
+            # gets the historical 0.3 default.
+            _fixed_temp = _fixed_temperature_for_model(self.model, self.base_url)
+            _omit_temperature = _fixed_temp is OMIT_TEMPERATURE
+            if _omit_temperature:
+                _flush_temperature = None
+            elif _fixed_temp is not None:
+                _flush_temperature = _fixed_temp
+            else:
+                _flush_temperature = 0.3
+            try:
+                response = _call_llm(
+                    task="flush_memories",
+                    messages=api_messages,
+                    tools=[memory_tool_def],
+                    temperature=_flush_temperature,
+                    max_tokens=5120,
+                    # timeout resolved from auxiliary.flush_memories.timeout config
+                )
+            except RuntimeError:
+                _aux_available = False
+                response = None
+
+            if not _aux_available and self.api_mode == "codex_responses":
+                # No auxiliary client -- use the Codex Responses path directly
+                codex_kwargs = self._build_api_kwargs(api_messages)
+                codex_kwargs["tools"] = self._get_transport().convert_tools([memory_tool_def])
+                if _flush_temperature is not None:
+                    codex_kwargs["temperature"] = _flush_temperature
+                else:
+                    codex_kwargs.pop("temperature", None)
+                if "max_output_tokens" in codex_kwargs:
+                    codex_kwargs["max_output_tokens"] = 5120
+                response = self._run_codex_stream(codex_kwargs)
+            elif not _aux_available and self.api_mode == "anthropic_messages":
+                # Native Anthropic — use the transport for kwargs
+                _tflush = self._get_transport()
+                ant_kwargs = _tflush.build_kwargs(
+                    model=self.model, messages=api_messages,
+                    tools=[memory_tool_def], max_tokens=5120,
+                    reasoning_config=None,
+                    preserve_dots=self._anthropic_preserve_dots(),
+                )
+                response = self._anthropic_messages_create(ant_kwargs)
+            elif not _aux_available:
+                api_kwargs = {
+                    "model": self.model,
+                    "messages": api_messages,
+                    "tools": [memory_tool_def],
+                    **self._max_tokens_param(5120),
+                }
+                if _flush_temperature is not None:
+                    api_kwargs["temperature"] = _flush_temperature
+                from agent.auxiliary_client import _get_task_timeout
+                response = self._ensure_primary_openai_client(reason="flush_memories").chat.completions.create(
+                    **api_kwargs, timeout=_get_task_timeout("flush_memories")
+                )
+
+            # Extract tool calls from the response, handling all API formats
+            tool_calls = []
+            if self.api_mode == "codex_responses" and not _aux_available:
+                _ct_flush = self._get_transport()
+                _cnr_flush = _ct_flush.normalize_response(response)
+                if _cnr_flush and _cnr_flush.tool_calls:
+                    tool_calls = [
+                        SimpleNamespace(
+                            id=tc.id, type="function",
+                            function=SimpleNamespace(name=tc.name, arguments=tc.arguments),
+                        ) for tc in _cnr_flush.tool_calls
+                    ]
+            elif self.api_mode == "anthropic_messages" and not _aux_available:
+                _tfn = self._get_transport()
+                _flush_result = _tfn.normalize_response(response, strip_tool_prefix=self._is_anthropic_oauth)
+                if _flush_result and _flush_result.tool_calls:
+                    tool_calls = [
+                        SimpleNamespace(
+                            id=tc.id, type="function",
+                            function=SimpleNamespace(name=tc.name, arguments=tc.arguments),
+                        ) for tc in _flush_result.tool_calls
+                    ]
+            elif self.api_mode in ("chat_completions", "bedrock_converse"):
+                # chat_completions / bedrock — normalize through transport
+                _flush_result = self._get_transport().normalize_response(response)
+                if _flush_result.tool_calls:
+                    tool_calls = _flush_result.tool_calls
+            elif _aux_available and hasattr(response, "choices") and response.choices:
+                # Auxiliary client returned OpenAI-shaped response while main
+                # api_mode is codex/anthropic — extract tool_calls from .choices
+                _aux_msg = response.choices[0].message
+                if hasattr(_aux_msg, "tool_calls") and _aux_msg.tool_calls:
+                    tool_calls = _aux_msg.tool_calls
+
+            for tc in tool_calls:
+                if tc.function.name == "memory":
+                    try:
+                        args = json.loads(tc.function.arguments)
+                        flush_target = args.get("target", "memory")
+                        from tools.memory_tool import memory_tool as _memory_tool
+                        _memory_tool(
+                            action=args.get("action"),
+                            target=flush_target,
+                            content=args.get("content"),
+                            old_text=args.get("old_text"),
+                            store=self._memory_store,
+                        )
+                        if not self.quiet_mode:
+                            print(f"  🧠 Memory flush: saved to {args.get('target', 'memory')}")
+                    except Exception as e:
+                        logger.debug("Memory flush tool call failed: %s", e)
+        except Exception as e:
+            logger.debug("Memory flush API call failed: %s", e)
+        finally:
+            # Strip flush artifacts: remove everything from the flush message onward.
+            # Use sentinel marker instead of identity check for robustness.
+            while messages and messages[-1].get("_flush_sentinel") != _sentinel:
+                messages.pop()
+                if not messages:
+                    break
+            if messages and messages[-1].get("_flush_sentinel") == _sentinel:
+                messages.pop()
+
     def _compress_context(self, messages: list, system_message: str, *, approx_tokens: int = None, task_id: str = "default", focus_topic: str = None) -> tuple:
         """Compress conversation context and split the session in SQLite.
 
@@ -12350,7 +12553,7 @@ class AIAgent:
             for msg in messages:
                 api_msg = msg.copy()
                 self._copy_reasoning_content_for_api(msg, api_msg)
-                for internal_field in ("reasoning", "finish_reason", "_thinking_prefill"):
+                for internal_field in ("reasoning", "finish_reason", "_thinking_prefill", "timestamp"):
                     api_msg.pop(internal_field, None)
                 if _needs_sanitize:
                     self._sanitize_tool_calls_for_strict_api(api_msg)
@@ -12555,6 +12758,7 @@ class AIAgent:
         task_id: str = None,
         stream_callback: Optional[callable] = None,
         persist_user_message: Optional[str] = None,
+        persist_user_timestamp: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Run a complete conversation with tool calling until completion.
@@ -12570,7 +12774,8 @@ class AIAgent:
             persist_user_message: Optional clean user message to store in
                 transcripts/history when user_message contains API-only
                 synthetic prefixes.
-                    or queuing follow-up prefetch work.
+            persist_user_timestamp: Optional platform event timestamp to store
+                as metadata on the persisted current-turn user message.
 
         Returns:
             Dict: Complete conversation result with final response and message history
@@ -12626,6 +12831,7 @@ class AIAgent:
         self._stream_callback = stream_callback
         self._persist_user_message_idx = None
         self._persist_user_message_override = persist_user_message
+        self._persist_user_message_timestamp = persist_user_timestamp
         # Generate unique task_id if not provided to isolate VMs between concurrent tasks
         effective_task_id = task_id or str(uuid.uuid4())
         # Expose the active task_id so tools running mid-turn (e.g. delegate_task
@@ -13173,6 +13379,7 @@ class AIAgent:
                     api_msg.pop("finish_reason")
                 # Strip internal thinking-prefill marker
                 api_msg.pop("_thinking_prefill", None)
+                api_msg.pop("timestamp", None)
                 # Strip Codex Responses API fields (call_id, response_item_id) for
                 # strict providers like Mistral, Fireworks, etc. that reject unknown fields.
                 # Uses new dicts so the internal messages list retains the fields

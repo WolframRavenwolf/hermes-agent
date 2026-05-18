@@ -1445,6 +1445,7 @@ class SessionDB:
         reasoning_details: Any = None,
         codex_reasoning_items: Any = None,
         codex_message_items: Any = None,
+        timestamp: Any = None,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
@@ -1470,6 +1471,16 @@ class SessionDB:
         # cannot bind list/dict parameters directly.
         stored_content = self._encode_content(content)
 
+        message_timestamp = time.time()
+        if timestamp is not None:
+            try:
+                if hasattr(timestamp, "timestamp"):
+                    message_timestamp = float(timestamp.timestamp())
+                else:
+                    message_timestamp = float(timestamp)
+            except (TypeError, ValueError):
+                logger.debug("Ignoring invalid explicit message timestamp: %r", timestamp)
+
         # Pre-compute tool call count
         num_tool_calls = 0
         if tool_calls is not None:
@@ -1489,7 +1500,7 @@ class SessionDB:
                     tool_call_id,
                     tool_calls_json,
                     tool_name,
-                    time.time(),
+                    message_timestamp,
                     token_count,
                     finish_reason,
                     reasoning,
@@ -1540,6 +1551,16 @@ class SessionDB:
             for msg in messages:
                 role = msg.get("role", "unknown")
                 tool_calls = msg.get("tool_calls")
+                message_timestamp = now_ts
+                if msg.get("timestamp") is not None:
+                    try:
+                        ts_value = msg.get("timestamp")
+                        if hasattr(ts_value, "timestamp"):
+                            message_timestamp = float(ts_value.timestamp())
+                        else:
+                            message_timestamp = float(ts_value)
+                    except (TypeError, ValueError):
+                        logger.debug("Ignoring invalid explicit message timestamp: %r", msg.get("timestamp"))
                 reasoning_details = msg.get("reasoning_details") if role == "assistant" else None
                 codex_reasoning_items = (
                     msg.get("codex_reasoning_items") if role == "assistant" else None
@@ -1572,7 +1593,7 @@ class SessionDB:
                         msg.get("tool_call_id"),
                         tool_calls_json,
                         msg.get("tool_name"),
-                        now_ts,
+                        message_timestamp,
                         msg.get("token_count"),
                         msg.get("finish_reason"),
                         msg.get("reasoning") if role == "assistant" else None,
@@ -1587,7 +1608,7 @@ class SessionDB:
                     total_tool_calls += (
                         len(tool_calls) if isinstance(tool_calls, list) else 1
                     )
-                now_ts += 1e-6
+                now_ts = max(now_ts + 1e-6, message_timestamp + 1e-6)
 
             conn.execute(
                 "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
@@ -1699,8 +1720,8 @@ class SessionDB:
             rows = self._conn.execute(
                 "SELECT role, content, tool_call_id, tool_calls, tool_name, "
                 "finish_reason, reasoning, reasoning_content, reasoning_details, "
-                "codex_reasoning_items, codex_message_items "
-                f"FROM messages WHERE session_id IN ({placeholders}) ORDER BY id",
+                "codex_reasoning_items, codex_message_items, timestamp "
+                f"FROM messages WHERE session_id IN ({placeholders}) ORDER BY timestamp, id",
                 tuple(session_ids),
             ).fetchall()
 
@@ -1710,6 +1731,8 @@ class SessionDB:
             if row["role"] in {"user", "assistant"} and isinstance(content, str):
                 content = sanitize_context(content).strip()
             msg = {"role": row["role"], "content": content}
+            if row["timestamp"]:
+                msg["timestamp"] = row["timestamp"]
             if row["tool_call_id"]:
                 msg["tool_call_id"] = row["tool_call_id"]
             if row["tool_name"]:
@@ -2963,4 +2986,3 @@ class SessionDB:
                 (error[:500], session_id),
             )
         self._execute_write(_do)
-
