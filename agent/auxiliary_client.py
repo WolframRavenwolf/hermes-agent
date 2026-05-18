@@ -626,6 +626,48 @@ def _convert_content_for_responses(content: Any) -> Any:
     return converted or ""
 
 
+def _normalize_aux_reasoning_config(reasoning_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize auxiliary reasoning config across provider wrappers."""
+    effort = str(reasoning_config.get("effort") or "").strip().lower()
+    enabled = reasoning_config.get("enabled")
+    if enabled is False or effort in {"none", "off", "false", "disabled", "disable"}:
+        return {"enabled": False}
+    return dict(reasoning_config)
+
+
+def _extract_reasoning_config_from_kwargs(kwargs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Extract reasoning config from auxiliary chat.completions kwargs.
+
+    OpenAI-compatible callers commonly pass provider-specific fields through
+    `extra_body={"reasoning": ...}`.  Hermes-native callers may pass the same
+    data as `reasoning_config`.  Auxiliary wrappers normalize both forms so
+    Codex/Anthropic subscription-backed calls keep the same reasoning-effort
+    semantics as OpenRouter calls.
+    """
+    reasoning_config = kwargs.get("reasoning_config")
+    if isinstance(reasoning_config, dict):
+        return _normalize_aux_reasoning_config(reasoning_config)
+    extra_body = kwargs.get("extra_body")
+    if isinstance(extra_body, dict):
+        extra_reasoning = extra_body.get("reasoning")
+        if isinstance(extra_reasoning, dict):
+            return _normalize_aux_reasoning_config(extra_reasoning)
+    return None
+
+
+def _reasoning_explicitly_disabled(kwargs: Dict[str, Any]) -> bool:
+    """Return True when the caller explicitly passed reasoning.enabled=false."""
+    reasoning_config = kwargs.get("reasoning_config")
+    if isinstance(reasoning_config, dict):
+        return reasoning_config.get("enabled") is False
+    extra_body = kwargs.get("extra_body")
+    if isinstance(extra_body, dict):
+        extra_reasoning = extra_body.get("reasoning")
+        if isinstance(extra_reasoning, dict):
+            return extra_reasoning.get("enabled") is False
+    return False
+
+
 class _CodexCompletionsAdapter:
     """Drop-in shim that accepts chat.completions.create() kwargs and
     routes them through the Codex Responses streaming API."""
@@ -637,6 +679,7 @@ class _CodexCompletionsAdapter:
     def create(self, **kwargs) -> Any:
         messages = kwargs.get("messages", [])
         model = kwargs.get("model", self._model)
+        reasoning_config = _extract_reasoning_config_from_kwargs(kwargs)
 
         # Separate system/instructions from conversation messages.
         # Convert chat.completions multimodal content blocks to Responses
@@ -669,40 +712,19 @@ class _CodexCompletionsAdapter:
         if timeout is not None:
             resp_kwargs["timeout"] = timeout
 
+        if isinstance(reasoning_config, dict):
+            if reasoning_config.get("enabled") is False:
+                if not _reasoning_explicitly_disabled(kwargs):
+                    resp_kwargs["include"] = []
+            else:
+                effort = str(reasoning_config.get("effort") or "medium").lower()
+                if effort == "minimal":
+                    effort = "low"
+                resp_kwargs["reasoning"] = {"effort": effort, "summary": "auto"}
+                resp_kwargs["include"] = ["reasoning.encrypted_content"]
+
         # Note: the Codex endpoint (chatgpt.com/backend-api/codex) does NOT
         # support max_output_tokens or temperature — omit to avoid 400 errors.
-
-        # Translate extra_body.reasoning (chat.completions shape) into the
-        # Responses API's top-level reasoning + include fields.  Mirrors
-        # agent/transports/codex.py::build_kwargs() so auxiliary callers
-        # that configure reasoning via auxiliary.<task>.extra_body get the
-        # same behavior as the main agent's Codex transport.
-        extra_body = kwargs.get("extra_body") or {}
-        if isinstance(extra_body, dict):
-            reasoning_cfg = extra_body.get("reasoning")
-            if isinstance(reasoning_cfg, dict):
-                if reasoning_cfg.get("enabled") is False:
-                    # Reasoning explicitly disabled — do not set reasoning
-                    # or include.  The Codex backend still thinks by
-                    # default, but we honor the caller's intent where the
-                    # API allows it.
-                    pass
-                else:
-                    # Truthy-only check mirrors agent/transports/codex.py
-                    # build_kwargs(): falsy values (None, "", 0) fall back
-                    # to the default rather than being forwarded to the
-                    # Codex backend, which rejects e.g. {"effort": null}
-                    # with a 400.
-                    effort = reasoning_cfg.get("effort") or "medium"
-                    # Codex backend rejects "minimal"; clamp to "low" to
-                    # match the main-agent Codex transport behavior.
-                    if effort == "minimal":
-                        effort = "low"
-                    resp_kwargs["reasoning"] = {
-                        "effort": effort,
-                        "summary": "auto",
-                    }
-                    resp_kwargs["include"] = ["reasoning.encrypted_content"]
 
         # Tools support for auxiliary callers (e.g. skills_hub) that pass function schemas
         tools = kwargs.get("tools")
@@ -949,10 +971,11 @@ class AsyncCodexAuxiliaryClient:
 class _AnthropicCompletionsAdapter:
     """OpenAI-client-compatible adapter for Anthropic Messages API."""
 
-    def __init__(self, real_client: Any, model: str, is_oauth: bool = False):
+    def __init__(self, real_client: Any, model: str, is_oauth: bool = False, base_url: str = None):
         self._client = real_client
         self._model = model
         self._is_oauth = is_oauth
+        self._base_url = base_url
 
     def create(self, **kwargs) -> Any:
         from agent.anthropic_adapter import build_anthropic_kwargs
@@ -971,6 +994,7 @@ class _AnthropicCompletionsAdapter:
         else:
             max_tokens = kwargs.get("max_tokens") or kwargs.get("max_completion_tokens") or 2000
         temperature = kwargs.get("temperature")
+        reasoning_config = _extract_reasoning_config_from_kwargs(kwargs)
 
         normalized_tool_choice = None
         if isinstance(tool_choice, str):
@@ -987,9 +1011,10 @@ class _AnthropicCompletionsAdapter:
             messages=messages,
             tools=tools,
             max_tokens=max_tokens,
-            reasoning_config=None,
+            reasoning_config=reasoning_config,
             tool_choice=normalized_tool_choice,
             is_oauth=self._is_oauth,
+            base_url=self._base_url,
         )
         # Opus 4.7+ rejects any non-default temperature/top_p/top_k; only set
         # temperature for models that still accept it. build_anthropic_kwargs
@@ -1047,7 +1072,7 @@ class AnthropicAuxiliaryClient:
 
     def __init__(self, real_client: Any, model: str, api_key: str, base_url: str, is_oauth: bool = False):
         self._real_client = real_client
-        adapter = _AnthropicCompletionsAdapter(real_client, model, is_oauth=is_oauth)
+        adapter = _AnthropicCompletionsAdapter(real_client, model, is_oauth=is_oauth, base_url=base_url)
         self.chat = _AnthropicChatShim(adapter)
         self.api_key = api_key
         self.base_url = base_url

@@ -683,13 +683,13 @@ class TestGetTextAuxiliaryClient:
         assert mock_openai.call_args.kwargs["base_url"] == "https://api.openai.com/v1"
         assert mock_openai.call_args.kwargs["api_key"] == "sk-test"
 
-
 class TestVisionClientFallback:
     """Vision client auto mode resolves known-good multimodal backends."""
 
     def test_vision_auto_includes_active_provider_when_configured(self, monkeypatch):
         """Active provider appears in available backends when credentials exist."""
         monkeypatch.setenv("ANTHROPIC_API_KEY", "***")
+
         with (
             patch("agent.auxiliary_client._read_nous_auth", return_value=None),
             patch("agent.auxiliary_client._read_main_provider", return_value="anthropic"),
@@ -713,6 +713,185 @@ class TestVisionClientFallback:
         assert client is not None
         assert client.__class__.__name__ == "AnthropicAuxiliaryClient"
         assert model == "claude-haiku-4-5-20251001"
+
+
+class TestAuxiliaryWrapperReasoning:
+    def test_codex_auxiliary_forwards_extra_body_reasoning_to_responses_api(self):
+        captured = {}
+
+        class FakeStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __iter__(self):
+                return iter([])
+
+            def get_final_response(self):
+                return SimpleNamespace(
+                    output=[SimpleNamespace(
+                        type="message",
+                        content=[SimpleNamespace(type="output_text", text="ok")],
+                    )],
+                    usage=None,
+                )
+
+        class FakeResponses:
+            def stream(self, **kwargs):
+                captured.update(kwargs)
+                return FakeStream()
+
+        from agent.auxiliary_client import CodexAuxiliaryClient
+
+        real_client = SimpleNamespace(
+            responses=FakeResponses(),
+            api_key="tok",
+            base_url="https://chatgpt.com/backend-api/codex",
+            close=lambda: None,
+        )
+        client = CodexAuxiliaryClient(real_client, "gpt-5.5")
+
+        response = client.chat.completions.create(
+            model="gpt-5.5",
+            messages=[{"role": "user", "content": "think hard"}],
+            extra_body={"reasoning": {"enabled": True, "effort": "xhigh"}},
+        )
+
+        assert response.choices[0].message.content == "ok"
+        assert captured["reasoning"] == {"effort": "xhigh", "summary": "auto"}
+
+    def test_anthropic_auxiliary_forwards_extra_body_reasoning_to_adapter(self):
+        captured_build = {}
+
+        class FakeMessages:
+            def create(self, **kwargs):
+                return SimpleNamespace(usage=None)
+
+        fake_transport = SimpleNamespace(
+            normalize_response=lambda response, strip_tool_prefix=False: SimpleNamespace(
+                content="ok",
+                tool_calls=None,
+                reasoning=None,
+                finish_reason="stop",
+            )
+        )
+
+        def fake_build_anthropic_kwargs(**kwargs):
+            captured_build.update(kwargs)
+            return {"model": kwargs["model"], "messages": []}
+
+        from agent.auxiliary_client import AnthropicAuxiliaryClient
+
+        client = AnthropicAuxiliaryClient(
+            SimpleNamespace(messages=FakeMessages()),
+            "claude-opus-4-6",
+            "anthropic-token",
+            "https://api.anthropic.com",
+            is_oauth=False,
+        )
+
+        with (
+            patch("agent.anthropic_adapter.build_anthropic_kwargs", side_effect=fake_build_anthropic_kwargs),
+            patch("agent.transports.get_transport", return_value=fake_transport),
+        ):
+            response = client.chat.completions.create(
+                model="claude-opus-4-6",
+                messages=[{"role": "user", "content": "think hard"}],
+                extra_body={"reasoning": {"enabled": True, "effort": "xhigh"}},
+            )
+
+        assert response.choices[0].message.content == "ok"
+        assert captured_build["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
+
+    def test_codex_auxiliary_effort_none_disables_reasoning(self):
+        captured = {}
+
+        class FakeStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __iter__(self):
+                return iter([])
+
+            def get_final_response(self):
+                return SimpleNamespace(
+                    output=[SimpleNamespace(
+                        type="message",
+                        content=[SimpleNamespace(type="output_text", text="ok")],
+                    )],
+                    usage=None,
+                )
+
+        class FakeResponses:
+            def stream(self, **kwargs):
+                captured.update(kwargs)
+                return FakeStream()
+
+        from agent.auxiliary_client import CodexAuxiliaryClient
+
+        real_client = SimpleNamespace(
+            responses=FakeResponses(),
+            api_key="tok",
+            base_url="https://chatgpt.com/backend-api/codex",
+            close=lambda: None,
+        )
+        client = CodexAuxiliaryClient(real_client, "gpt-5.5")
+
+        client.chat.completions.create(
+            model="gpt-5.5",
+            messages=[{"role": "user", "content": "think normally"}],
+            extra_body={"reasoning": {"effort": "none"}},
+        )
+
+        assert "reasoning" not in captured
+        assert captured["include"] == []
+
+    def test_anthropic_auxiliary_effort_none_disables_reasoning(self):
+        captured_build = {}
+
+        class FakeMessages:
+            def create(self, **kwargs):
+                return SimpleNamespace(usage=None)
+
+        fake_transport = SimpleNamespace(
+            normalize_response=lambda response, strip_tool_prefix=False: SimpleNamespace(
+                content="ok",
+                tool_calls=None,
+                reasoning=None,
+                finish_reason="stop",
+            )
+        )
+
+        def fake_build_anthropic_kwargs(**kwargs):
+            captured_build.update(kwargs)
+            return {"model": kwargs["model"], "messages": []}
+
+        from agent.auxiliary_client import AnthropicAuxiliaryClient
+
+        client = AnthropicAuxiliaryClient(
+            SimpleNamespace(messages=FakeMessages()),
+            "claude-opus-4-6",
+            "anthropic-token",
+            "https://api.anthropic.com",
+            is_oauth=False,
+        )
+
+        with (
+            patch("agent.anthropic_adapter.build_anthropic_kwargs", side_effect=fake_build_anthropic_kwargs),
+            patch("agent.transports.get_transport", return_value=fake_transport),
+        ):
+            client.chat.completions.create(
+                model="claude-opus-4-6",
+                messages=[{"role": "user", "content": "think normally"}],
+                extra_body={"reasoning": {"effort": "none"}},
+            )
+
+        assert captured_build["reasoning_config"] == {"enabled": False}
 
 
 class TestAuxiliaryPoolAwareness:
