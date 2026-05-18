@@ -3601,41 +3601,222 @@ def _launchd_fallback_to_detached(reason: str, *, exit_on_failure: bool = True) 
     return False
 
 
+def _launchd_target() -> str:
+    return f"{_launchd_domain()}/{get_launchd_label()}"
+
+
+def _launchd_reload_pending_path(plist_path: Path | None = None) -> Path:
+    """Return the marker path used when a launchd plist reload was deferred."""
+    path = plist_path or get_launchd_plist_path()
+    return path.with_name(f"{path.name}.reload-pending")
+
+
+def _mark_launchd_reload_pending(plist_path: Path | None = None) -> None:
+    marker = _launchd_reload_pending_path(plist_path)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("launchd plist reload pending\n", encoding="utf-8")
+
+
+def _clear_launchd_reload_pending(plist_path: Path | None = None) -> None:
+    marker = _launchd_reload_pending_path(plist_path)
+    try:
+        marker.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _launchd_reload_is_pending(plist_path: Path | None = None) -> bool:
+    return _launchd_reload_pending_path(plist_path).exists()
+
+
+def _launchd_loaded_job_pid() -> int | None:
+    """Return the PID launchd has loaded for this gateway label, if known."""
+    try:
+        result = subprocess.run(
+            ["launchctl", "print", _launchd_target()],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    for line in (result.stdout or "").splitlines():
+        key, sep, value = line.strip().partition("=")
+        if sep and key.strip().lower() == "pid":
+            try:
+                pid = int(value.strip().rstrip(";"))
+            except ValueError:
+                return None
+            return pid if pid > 0 else None
+    return None
+
+
+def _reload_launchd_plist_now(plist_path: Path, label: str | None = None, *, check_bootstrap: bool = False) -> bool:
+    """Force launchd to re-read *plist_path* with bootout/bootstrap."""
+    target = f"{_launchd_domain()}/{label or get_launchd_label()}"
+    subprocess.run(["launchctl", "bootout", target], check=False, timeout=90)
+    result = subprocess.run(
+        ["launchctl", "bootstrap", _launchd_domain(), str(plist_path)],
+        check=check_bootstrap,
+        timeout=30,
+    )
+    if result.returncode == 0:
+        _clear_launchd_reload_pending(plist_path)
+        return True
+    print(f"⚠ launchd bootstrap failed with exit {result.returncode}; reload marker preserved")
+    return False
+
+
+def _is_running_inside_gateway_process_tree() -> bool:
+    """Return True when this command is executing under the live gateway process.
+
+    launchd ``bootout``/``kickstart -k`` kills the gateway process tree.  When a
+    tool subprocess invokes service management from inside that same tree, doing
+    the reload inline can kill the command before it has a chance to bootstrap
+    the updated plist again.
+    """
+    try:
+        from gateway.status import get_running_pid
+
+        pid = get_running_pid()
+    except Exception:
+        return False
+    if pid is None or not _is_pid_ancestor_of_current_process(pid):
+        return False
+    if is_macos():
+        launchd_pid = _launchd_loaded_job_pid()
+        if launchd_pid is not None and launchd_pid != pid:
+            return False
+    return True
+
+
+def _launchd_path_entry_exists(path: str) -> bool:
+    """Return True when a PATH entry exists and can be inherited by launchd."""
+    try:
+        return Path(path).exists()
+    except (OSError, ValueError):
+        return False
+
+
+def _launchd_logical_hermes_path(path: str | Path | None) -> Path | None:
+    """Map physical paths under HERMES_HOME back to the configured logical home."""
+    if path is None:
+        return None
+    hermes_home = get_hermes_home()
+    candidate = Path(path).expanduser()
+    candidate_paths = [candidate]
+    if not candidate.is_absolute():
+        candidate_paths.append(candidate.resolve())
+    try:
+        candidate_paths.append(candidate.resolve())
+    except OSError:
+        pass
+    home_paths = [hermes_home]
+    try:
+        home_paths.append(hermes_home.resolve())
+    except OSError:
+        pass
+    for candidate_path in candidate_paths:
+        for home_path in home_paths:
+            try:
+                relative = candidate_path.relative_to(home_path)
+            except ValueError:
+                continue
+            return hermes_home / relative
+    return candidate
+
+
+def _launchd_should_keep_inherited_path_entry(path: str) -> bool:
+    """Return True for inherited PATH entries worth preserving in launchd."""
+    entry = path.strip()
+    if not entry:
+        return False
+    lowered = entry.lower()
+    stale_markers = (
+        "/.codex/tmp/",
+        "/codex.system/bootstrap/",
+        "/applications/codex.app/",
+        "/opt/pkg/env/",
+        "/opt/pmk/env/",
+    )
+    if any(marker in lowered for marker in stale_markers):
+        return False
+    if entry == "/config" or entry.startswith("/config/"):
+        return False
+    if entry == "/share" or entry.startswith("/share/"):
+        return False
+    return _launchd_path_entry_exists(entry)
+
+
+def _append_launchd_path_entry(entries: list[str], path: str | Path | None) -> None:
+    """Append an existing launchd PATH entry once, preserving order."""
+    if path is None:
+        return
+    entry = str(path)
+    if _launchd_path_entry_exists(entry) and entry not in entries:
+        entries.append(entry)
+
+
 def generate_launchd_plist(app_wrapper: bool = False) -> str:
     detected_venv = _detect_venv_dir()
+    launchd_project_root = _launchd_logical_hermes_path(PROJECT_ROOT) or PROJECT_ROOT
+    launchd_venv = _launchd_logical_hermes_path(detected_venv)
     python_path = (
         str(get_launchd_app_wrapper_executable_path())
         if app_wrapper
-        else get_python_path()
+        else str(_launchd_logical_hermes_path(get_python_path()) or get_python_path())
     )
-    # Stable cwd anchor — never the volatile source checkout. See
-    # _stable_service_working_dir() for the rationale (same rot risk applies
-    # to launchd's WorkingDirectory as to systemd's).
-    working_dir = _stable_service_working_dir()
-    hermes_home = str(get_hermes_home().resolve())
+    # Preserve the configured logical home in the launchd environment. On macOS
+    # `/amy` is a synthetic root link to the physical runtime directory; resolving
+    # it here would silently turn HERMES_HOME back into the physical user-home path.
+    hermes_home_path = get_hermes_home()
+    hermes_home = str(_launchd_logical_hermes_path(hermes_home_path) or hermes_home_path)
+    # Stable cwd anchor — prefer logical HERMES_HOME over the source checkout so
+    # launchd does not depend on a volatile worktree path.
+    working_dir = hermes_home if _launchd_path_entry_exists(hermes_home) else str(launchd_project_root)
     log_dir = get_hermes_home() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     label = get_launchd_label()
     profile_arg = _profile_arg(hermes_home)
-    # Build a sane PATH for the launchd plist.  launchd provides only a
-    # minimal default (/usr/bin:/bin:/usr/sbin:/sbin) which misses Homebrew,
-    # nvm, cargo, etc.  We prepend venv/bin and node_modules/.bin (matching
-    # the systemd unit), then capture the user's full shell PATH so every
-    # user-installed tool (node, ffmpeg, …) is reachable.
-    venv_dir = str(detected_venv) if detected_venv else str(PROJECT_ROOT / "venv")
+    # Build a sane PATH for the launchd plist. launchd starts with only a
+    # minimal system PATH, while an interactive/dev environment may contain
+    # stale Codex/bootstrap entries. Prioritize Hermes' own venv and Amy-owned
+    # bin directories first, then keep only inherited entries that still exist.
+    venv_bin = str(launchd_venv / "bin") if launchd_venv else str(launchd_project_root / "venv" / "bin")
+    venv_dir = str(launchd_venv) if launchd_venv else str(launchd_project_root / "venv")
+    node_bin = str(launchd_project_root / "node_modules" / ".bin")
+    priority_dirs: list[str] = []
+    for candidate in (
+        venv_bin,
+        hermes_home_path / "bin",
+        "/amy/bin",
+        hermes_home_path / ".go" / "bin",
+        "/amy/.go/bin",
+        node_bin,
+    ):
+        _append_launchd_path_entry(priority_dirs, candidate)
+
+    inherited_dirs = [
+        p for p in os.environ.get("PATH", "").split(":")
+        if _launchd_should_keep_inherited_path_entry(p)
+    ]
+
     # Resolve the directory containing the node binary (e.g. Homebrew, nvm)
     # so it's explicitly in PATH even if the user's shell PATH changes later.
-    priority_dirs = _build_service_path_dirs()
+    # Validate the resolved parent through the same stale-entry filter used for
+    # inherited PATH entries; otherwise a stale Codex/bootstrap node can sneak
+    # back into the launchd plist before the inherited PATH is filtered.
     resolved_node = shutil.which("node")
     if resolved_node:
         resolved_node_dir = str(Path(resolved_node).resolve().parent)
-        if resolved_node_dir not in priority_dirs:
-            priority_dirs.append(resolved_node_dir)
-    sane_path = ":".join(
-        dict.fromkeys(
-            priority_dirs + [p for p in os.environ.get("PATH", "").split(":") if p]
-        )
-    )
+        if _launchd_should_keep_inherited_path_entry(resolved_node_dir):
+            _append_launchd_path_entry(priority_dirs, resolved_node_dir)
+
+    system_fallback_dirs = ["/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+    system_dirs = [p for p in system_fallback_dirs if _launchd_path_entry_exists(p)]
+    sane_path = ":".join(dict.fromkeys(priority_dirs + inherited_dirs + system_dirs))
 
     environment = {
         "PATH": sane_path,
@@ -3690,12 +3871,7 @@ def launchd_plist_is_current(app_wrapper: bool | None = None) -> bool:
 
 
 def refresh_launchd_plist_if_needed(app_wrapper: bool | None = None) -> bool:
-    """Rewrite the installed launchd plist when the generated definition has changed.
-
-    Unlike systemd, launchd picks up plist changes on the next ``launchctl kill``/
-    ``launchctl kickstart`` cycle — no daemon-reload is needed. We still bootout/
-    bootstrap to make launchd re-read the updated plist immediately.
-    """
+    """Rewrite/reload the installed launchd plist when its definition changed."""
     plist_path = get_launchd_plist_path()
     if not plist_path.exists():
         return False
@@ -3704,75 +3880,31 @@ def refresh_launchd_plist_if_needed(app_wrapper: bool | None = None) -> bool:
     if target_app_wrapper and not launchd_app_wrapper_is_current():
         install_launchd_app_wrapper(force=True)
 
-    if launchd_plist_is_current(app_wrapper=target_app_wrapper):
-        return False
-
-    new_plist = generate_launchd_plist(app_wrapper=target_app_wrapper)
-    if _refuse_temp_home_service_write(new_plist, "launchd plist"):
-        return False
-
-    plist_path.write_text(new_plist, encoding="utf-8")
     label = get_launchd_label()
-    domain = _launchd_domain()
-    target = f"{domain}/{label}"
+    reload_pending = _launchd_reload_is_pending(plist_path)
+    plist_current = launchd_plist_is_current(app_wrapper=target_app_wrapper)
+    if plist_current and not reload_pending:
+        return False
 
-    # If this refresh is running INSIDE the gateway's own launchd process tree
-    # (e.g. the agent triggered a self-update via its terminal tool), a direct
-    # `launchctl bootout` tears down the service's process group — which
-    # includes THIS CLI — before the follow-up `bootstrap` can run. The gateway
-    # then stays unloaded and KeepAlive can't revive it (#43842). Detect that
-    # case and hand the reload to a detached session that survives the bootout.
-    gateway_pid = None
-    try:
-        from gateway.status import get_running_pid
-        gateway_pid = get_running_pid()
-    except Exception:
-        gateway_pid = None
-
-    if (
-        gateway_pid is not None
-        and _is_pid_ancestor_of_current_process(gateway_pid)
-        and hasattr(os, "setsid")  # POSIX-only; launchd is macOS so always true here
-    ):
-        # Delegate to a new session: `start_new_session=True` detaches the
-        # helper from the gateway's process group, so the bootout that kills
-        # the gateway (and us) does not kill the helper before it bootstraps.
-        reload_script = (
-            f"sleep 2; "
-            f"launchctl bootout {shlex.quote(target)} 2>/dev/null; "
-            f"sleep 1; "
-            f"launchctl bootstrap {shlex.quote(domain)} {shlex.quote(str(plist_path))} 2>/dev/null"
-        )
-        try:
-            subprocess.Popen(
-                ["/bin/bash", "-c", reload_script],
-                start_new_session=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except Exception as e:
-            logger.warning("Deferred launchd reload could not be spawned: %s", e)
+    if not plist_current:
+        new_plist = generate_launchd_plist(app_wrapper=target_app_wrapper)
+        if _refuse_temp_home_service_write(new_plist, "launchd plist"):
             return False
-        print(
-            "↻ Updated gateway launchd service definition; reload deferred to a "
-            "detached helper (refresh ran inside the gateway process tree)"
-        )
+        plist_path.write_text(new_plist, encoding="utf-8")
+        reload_pending = True
+
+    if _is_running_inside_gateway_process_tree():
+        if reload_pending:
+            _mark_launchd_reload_pending(plist_path)
+        print("↻ Updated gateway launchd service definition to match the current Hermes install")
+        print("⚠ launchd reload deferred because this command is running inside the gateway process tree")
+        print("  Run 'hermes gateway start' from an external shell to make launchd re-read the plist")
         return True
 
-    # Bootout/bootstrap so launchd picks up the new definition
-    subprocess.run(
-        ["launchctl", "bootout", target],
-        check=False,
-        timeout=90,
-    )
-    subprocess.run(
-        ["launchctl", "bootstrap", domain, str(plist_path)],
-        check=False,
-        timeout=30,
-    )
-    print(
-        "↻ Updated gateway launchd service definition to match the current Hermes install"
-    )
+    # Bootout/bootstrap so launchd picks up the new definition. This also
+    # consumes reload-pending markers from previous in-gateway refreshes.
+    _reload_launchd_plist_now(plist_path, label)
+    print("↻ Updated gateway launchd service definition to match the current Hermes install")
     return True
 
 
@@ -3856,12 +3988,13 @@ def launchd_start():
         print("↻ launchd plist missing; regenerating service definition")
         plist_path.parent.mkdir(parents=True, exist_ok=True)
         plist_path.write_text(new_plist, encoding="utf-8")
+        if _is_running_inside_gateway_process_tree():
+            _mark_launchd_reload_pending(plist_path)
+            print("⚠ launchd bootstrap deferred because this command is running inside the gateway process tree")
+            print("  Run 'hermes gateway start' from an external shell to load the regenerated plist")
+            return
         try:
-            subprocess.run(
-                ["launchctl", "bootstrap", _launchd_domain(), str(plist_path)],
-                check=True,
-                timeout=30,
-            )
+            _reload_launchd_plist_now(plist_path, label, check_bootstrap=True)
             subprocess.run(
                 ["launchctl", "kickstart", f"{_launchd_domain()}/{label}"],
                 check=True,
@@ -3875,7 +4008,13 @@ def launchd_start():
         print("✓ Service started")
         return
 
-    refresh_launchd_plist_if_needed()
+    refreshed = refresh_launchd_plist_if_needed()
+    if _is_running_inside_gateway_process_tree():
+        if not refreshed:
+            print("✓ Gateway service is already running")
+        print("⚠ Not kickstarting launchd from inside the gateway process tree")
+        print("  Run 'hermes gateway start' from an external shell if launchd must be reloaded")
+        return
     try:
         subprocess.run(
             ["launchctl", "kickstart", f"{_launchd_domain()}/{label}"],
@@ -3992,16 +4131,41 @@ def _wait_for_gateway_exit(
 
 
 def launchd_restart():
-    if _installed_launchd_plist_uses_app_wrapper() and not launchd_app_wrapper_is_current():
+    plist_path = get_launchd_plist_path()
+    target_app_wrapper = _resolve_launchd_app_wrapper_mode(None)
+    if target_app_wrapper and not launchd_app_wrapper_is_current():
         install_launchd_app_wrapper(force=True)
     label = get_launchd_label()
-    target = f"{_launchd_domain()}/{label}"
+    domain = _launchd_domain()
+    target = f"{domain}/{label}"
     drain_timeout = _get_restart_drain_timeout()
     from gateway.status import get_running_pid
 
     try:
+        reload_pending = _launchd_reload_is_pending(plist_path)
+        if not reload_pending:
+            plist_current = True
+            try:
+                plist_current = launchd_plist_is_current(app_wrapper=target_app_wrapper)
+            except Exception:
+                # A failed freshness check should not make restart impossible;
+                # fall back to the historical kickstart path when no explicit
+                # reload marker tells us launchd needs a bootstrap.
+                plist_current = True
+            if not plist_current:
+                new_plist = generate_launchd_plist(app_wrapper=target_app_wrapper)
+                if _refuse_temp_home_service_write(new_plist, "launchd plist"):
+                    return
+                plist_path.parent.mkdir(parents=True, exist_ok=True)
+                plist_path.write_text(new_plist, encoding="utf-8")
+                reload_pending = True
+
         pid = get_running_pid()
-        if pid is not None and _request_gateway_self_restart(pid):
+        # A self-requested restart cannot make launchd re-read a changed plist.
+        # If a refresh was previously deferred (or the plist is stale), manage
+        # launchd from this external command path instead so ProgramArguments,
+        # PATH, HERMES_HOME, and app-wrapper changes actually take effect.
+        if pid is not None and not reload_pending and _request_gateway_self_restart(pid):
             print("✓ Service restart requested")
             return
         if pid is not None:
@@ -4015,7 +4179,12 @@ def launchd_restart():
                     print(
                         f"⚠ Gateway drain timed out after {drain_timeout:.0f}s — forcing launchd restart"
                     )
-        subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
+        if reload_pending:
+            print("↻ Reloading launchd service definition before restart")
+            _reload_launchd_plist_now(plist_path, label, check_bootstrap=True)
+            subprocess.run(["launchctl", "kickstart", target], check=True, timeout=30)
+        else:
+            subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
         print("✓ Service restarted")
     except subprocess.CalledProcessError as e:
         if not _launchd_error_indicates_unloaded(e):
@@ -4061,6 +4230,9 @@ def launchd_status(deep: bool = False):
         loaded_output = ""
 
     print(f"Launchd plist: {plist_path}")
+    if _launchd_reload_is_pending(plist_path):
+        print("⚠ launchd service definition reload is pending")
+        print("  Run: hermes gateway restart")
     if launchd_plist_is_current():
         print("✓ Service definition matches the current Hermes install")
     else:
