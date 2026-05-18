@@ -67,6 +67,20 @@ overrides used by `/model` and compression.
 **Verification:** `tests/gateway/test_status_command.py`,
 `tests/hermes_cli/test_model_switch_context_display.py`.
 
+### macOS LaunchAgent Path Cleanup (2026-05-17)
+
+The Mac mini migration left the generated launchd `PATH` depending on legacy
+root-level `/config` compatibility shims. Removed `/config/amy/bin` and
+`/config/.go/bin` from the LaunchAgent path generator so native macOS runtime
+startup uses canonical `/amy` / `HERMES_HOME` paths only, and filters inherited
+`/config` / `/share` entries so stale shell environments cannot reintroduce the
+old shims.
+
+**Files:** `hermes_cli/gateway.py`, `tests/hermes_cli/test_gateway_service.py`
+
+**Verification:** focused launchd PATH test, `tests/hermes_cli/test_gateway_service.py`,
+and live LaunchAgent refresh after commit.
+
 ### Session Search: Lazy DB Creation (`154785c3`)
 
 The `session_search` tool passed `db=None` to the search function when no pre-initialized `SessionDB` existed — silently returning zero results in cron jobs and background agents (memory flush). Direct SQL queries against `state.db` worked fine, confirming the issue was in tool initialization. Fixed by adding a `_session_search_handler` that lazily creates a `SessionDB` instance when none is provided.
