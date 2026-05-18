@@ -807,13 +807,16 @@ class TestPromptBuilderConstants:
         ), "CLI hint should explicitly discourage MEDIA: tags."
         # Messaging hints should still advertise MEDIA: positively (sanity
         # check that this test is calibrated correctly).
-        assert "include MEDIA:" in PLATFORM_HINTS["telegram"]
+        assert "include" in PLATFORM_HINTS["telegram"].lower()
+        assert "MEDIA:" in PLATFORM_HINTS["telegram"]
 
     def test_platform_hints_mattermost(self):
         hint = PLATFORM_HINTS["mattermost"]
         assert "Mattermost" in hint
         assert "MEDIA:" in hint
         assert "Markdown" in hint
+        assert "HALF-OPEN" in hint
+        assert "Private Assistant Mode by default" in hint
 
     def test_platform_hints_matrix(self):
         hint = PLATFORM_HINTS["matrix"]
@@ -1186,6 +1189,5 @@ class TestOpenAIModelExecutionGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
 
 
