@@ -11219,6 +11219,34 @@ class AIAgent:
         )
         return compressed, new_system_prompt
 
+    def _get_budget_warning(self, api_call_count: int) -> Optional[str]:
+        """Return a budget pressure warning if iterations are running low.
+
+        Thresholds:
+        - <10% remaining -> CRITICAL warning
+        - <25% remaining -> CAUTION warning
+        - Otherwise -> None
+
+        The warning is injected into the last tool result so the LLM
+        naturally sees it and can wrap up or prioritize remaining work.
+        """
+        remaining = self.max_iterations - api_call_count
+        total = self.max_iterations
+        if total <= 0:
+            return None
+        ratio = remaining / total
+        if ratio <= 0.10:
+            return (
+                f"⚠️ BUDGET CRITICAL: Only {remaining}/{total} iterations remaining! "
+                "Wrap up immediately — deliver your best answer with what you have."
+            )
+        elif ratio <= 0.25:
+            return (
+                f"💡 BUDGET CAUTION: {remaining}/{total} iterations remaining. "
+                "Start wrapping up — avoid unnecessary tool calls."
+            )
+        return None
+
     def _set_tool_guardrail_halt(self, decision: ToolGuardrailDecision) -> None:
         """Record the first guardrail decision that should stop this turn."""
         if decision.should_halt and self._tool_guardrail_halt_decision is None:
@@ -11818,6 +11846,26 @@ class AIAgent:
         # so the steer marker is never truncated. See steer() for details.
         if num_tools > 0:
             self._apply_pending_steer_to_tool_results(messages, num_tools)
+        # ── Budget pressure injection ────────────────────────────────────
+        budget_warning = self._get_budget_warning(api_call_count)
+        if budget_warning and messages and messages[-1].get("role") == "tool":
+            last_content = messages[-1]["content"]
+            # Don't inject budget warnings into multimodal image results — they
+            # may contain large base64 data that must stay untouched.
+            if isinstance(last_content, str) and '"_inject_image"' not in last_content:
+                try:
+                    parsed = json.loads(last_content)
+                    if isinstance(parsed, dict):
+                        parsed["_budget_warning"] = budget_warning
+                        messages[-1]["content"] = json.dumps(parsed, ensure_ascii=False)
+                    else:
+                        messages[-1]["content"] = last_content + f"\n\n{budget_warning}"
+                except (json.JSONDecodeError, TypeError):
+                    messages[-1]["content"] = last_content + f"\n\n{budget_warning}"
+            if not self.quiet_mode:
+                remaining = self.max_iterations - api_call_count
+                tier = "⚠️  WARNING" if remaining <= self.max_iterations * 0.1 else "💡 CAUTION"
+                print(f"{self.log_prefix}{tier}: {remaining} iterations remaining")
 
     def _execute_tool_calls_sequential(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools."""
@@ -12258,6 +12306,29 @@ class AIAgent:
         # applied to sequential execution as well.
         if num_tools_seq > 0:
             self._apply_pending_steer_to_tool_results(messages, num_tools_seq)
+        # ── Budget pressure injection ─────────────────────────────────
+        # After all tool calls in this turn are processed, check if we're
+        # approaching max_iterations. If so, inject a warning into the LAST
+        # tool result's JSON so the LLM sees it naturally when reading results.
+        budget_warning = self._get_budget_warning(api_call_count)
+        if budget_warning and messages and messages[-1].get("role") == "tool":
+            last_content = messages[-1]["content"]
+            # Don't inject budget warnings into multimodal image results — they
+            # may contain large base64 data that must stay untouched.
+            if isinstance(last_content, str) and '"_inject_image"' not in last_content:
+                try:
+                    parsed = json.loads(last_content)
+                    if isinstance(parsed, dict):
+                        parsed["_budget_warning"] = budget_warning
+                        messages[-1]["content"] = json.dumps(parsed, ensure_ascii=False)
+                    else:
+                        messages[-1]["content"] = last_content + f"\n\n{budget_warning}"
+                except (json.JSONDecodeError, TypeError):
+                    messages[-1]["content"] = last_content + f"\n\n{budget_warning}"
+            if not self.quiet_mode:
+                remaining = self.max_iterations - api_call_count
+                tier = "⚠️  WARNING" if remaining <= self.max_iterations * 0.1 else "💡 CAUTION"
+                print(f"{self.log_prefix}{tier}: {remaining} iterations remaining")
 
 
     def _handle_max_iterations(self, messages: list, api_call_count: int) -> str:

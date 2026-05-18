@@ -16,6 +16,7 @@ from tools.vision_tools import (
     _determine_mime_type,
     _image_to_base64_data_url,
     _resize_image_for_vision,
+    _handle_inject_image,
     _is_image_size_error,
     _MAX_BASE64_BYTES,
     _RESIZE_TARGET_BYTES,
@@ -888,6 +889,50 @@ class TestResizeImageForVision:
                 result = _resize_image_for_vision(path, max_base64_bytes=100)
                 # Should return the original (oversized) data url
                 assert len(result) > 100
+
+
+class TestInjectImage:
+    def test_default_inject_image_downscales_to_jpeg_review_payload(self, tmp_path):
+        try:
+            from PIL import Image
+        except ImportError:
+            pytest.skip("Pillow not installed")
+
+        path = tmp_path / "large.png"
+        Image.new("RGB", (2400, 1200), (120, 40, 200)).save(path, "PNG")
+
+        result = _handle_inject_image({"image_path": str(path)})
+        parsed = result
+
+        assert parsed["_multimodal"] is True
+        metadata = parsed["meta"]
+        image_part = parsed["content"][1]
+        assert image_part["image_url"]["url"].startswith("data:image/jpeg;base64,")
+        assert metadata["injected_dimensions"] == {"width": 1024, "height": 512}
+        assert metadata["original_dimensions"] == {"width": 2400, "height": 1200}
+        assert metadata["resized"] is True
+        assert metadata["base64_size_chars"] < metadata["source_size_bytes"] * 2
+        assert metadata["injected_media_type"] == "image/jpeg"
+        assert "data" not in metadata
+
+    def test_full_resolution_inject_image_preserves_original_payload(self, tmp_path):
+        try:
+            from PIL import Image
+        except ImportError:
+            pytest.skip("Pillow not installed")
+
+        path = tmp_path / "small.png"
+        Image.new("RGB", (32, 16), (10, 20, 30)).save(path, "PNG")
+
+        result = _handle_inject_image({"image_path": str(path), "full_resolution": True})
+        parsed = result
+
+        metadata = parsed["meta"]
+        image_part = parsed["content"][1]
+        assert image_part["image_url"]["url"].startswith("data:image/png;base64,")
+        assert metadata.get("injected_dimensions", metadata.get("original_dimensions")) == {"width": 32, "height": 16}
+        assert metadata["full_resolution"] is True
+        assert metadata["resized"] is False
 
 
 # ---------------------------------------------------------------------------
