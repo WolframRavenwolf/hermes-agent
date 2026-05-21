@@ -243,6 +243,53 @@ Platform-aware zipper mode defaults for Amy's persona:
 
 ## 🐛 Bug Fixes
 
+### Dependency Pins: Restore CVE-Fixed pyproject Metadata (2026-05-21)
+
+**Problem:** `uv.lock` was dirty because a local `uv lock` run regenerated the
+lockfile from stale `pyproject.toml` pins. The dirty lock would have downgraded
+`aiohttp` 3.13.4 → 3.13.3 and `anthropic` 0.87.0 → 0.86.0, while removing the
+explicit `cryptography==46.0.7` core pin. That would undo upstream commit
+`d725407c5`'s CVE-fixed dependency floors and leave `pyproject.toml`,
+`uv.lock`, and `tools/lazy_deps.py` disagreeing.
+
+**Solution:** Reapplied the CVE-fixed dependency pins to `pyproject.toml` so it
+matches the committed lockfile and lazy-install map, then regenerated `uv.lock`
+with Wolfram's global uv release-age guard. The final lock keeps
+`aiohttp==3.13.4`, `anthropic==0.87.0`, `cryptography==46.0.7`, keeps the
+editable root package on the rebased upstream version, and records uv's 24h
+`exclude-newer-span` option.
+
+**Affected files:** `pyproject.toml`, `uv.lock`
+
+**Session reference:** 2026-05-21 dependency-lock maintenance review.
+
+**Verification:** `uv lock --check`, metadata consistency assertions for
+`pyproject.toml`/`uv.lock`, and `git diff --check`.
+
+### Mattermost MEDIA Attachments: Keep Thread Context (2026-05-19)
+
+**Problem:** In Mattermost `MATTERMOST_REPLY_MODE=thread`, normal text replies
+used `metadata.thread_id`/`root_id`, but image attachments extracted from
+`MEDIA:` tags were routed through the Mattermost `send_multiple_images()` batch
+path. That path uploaded files and posted `file_ids` without setting
+`root_id`, so images landed in the parent channel while the surrounding text
+stayed in the thread.
+
+**Solution:** `MattermostAdapter.send_multiple_images()` now honors
+`metadata.thread_id` when reply mode is `thread`, sets `root_id` on the batch
+file post, and mirrors the existing invalid-root flat fallback used by normal
+messages and single-file sends. Added a regression test covering batched local
+MEDIA image uploads with Mattermost thread metadata.
+
+**Affected files:** `gateway/platforms/mattermost.py`,
+`tests/gateway/test_mattermost.py`
+
+**Session reference:** 2026-05-19 Mattermost media-threading regression review.
+
+**Verification:**
+`tests/gateway/test_mattermost.py::TestMattermostSend::test_send_multiple_images_uses_metadata_thread_id`,
+`tests/gateway/test_mattermost.py`, `tests/gateway/test_send_multiple_images.py`.
+
 ### Gateway /status: Provider-Aware Idle Context Window (2026-05-19)
 
 `/status` shows model, context usage, and cumulative token labels. Its idle
