@@ -313,6 +313,36 @@ metadata path while deliberately avoiding account-usage/billing calls.
 `tests/gateway/test_status_command.py::test_status_command_includes_persisted_model_and_context_when_agent_not_running`,
 full `tests/gateway/test_status_command.py`, and command registry tests.
 
+### Gateway /resume: Restore Cross-Platform/Full Listing Semantics (2026-05-31)
+
+**Problem:** The old public #4689 branch was stale and not carried in the current
+22-patch stack. Current `/resume <session_id>` could reopen a known session
+across apps, but `/resume` discovery was limited to titled sessions on the
+current platform. That broke the intended Mattermost ↔ Telegram/API workflow:
+users could not conveniently list sessions from other platforms or unnamed
+sessions whose IDs were not already known.
+
+**Solution:** Re-ported only the still-needed semantics on top of the current
+0.15.x SessionDB model: `/resume` keeps listing named sessions for the current
+platform; `/resume --all` lists named sessions across all platforms;
+`/resume --full` includes unnamed sessions on the current platform; and
+`/resume --all --full` lists all sessions across platforms with source tags.
+Flags are `--`-prefixed so a session titled `all` remains resumable, and direct
+session lookup now accepts exact or unique-prefix session IDs before falling
+back to title/lineage lookup. Deprecated old API-server/json-log restoration
+code was not resurrected because current upstream stores gateway/API history in
+SessionDB.
+
+**Affected files:** `gateway/run.py`, `hermes_cli/commands.py`,
+`tests/gateway/test_resume_command.py`
+
+**Verification:**
+`tests/gateway/test_resume_command.py::TestHandleResumeCommand::test_resume_all_lists_named_sessions_across_platforms`,
+`test_resume_full_lists_unnamed_sessions_on_current_platform_only`,
+`test_resume_all_full_lists_unnamed_sessions_across_platforms`,
+`test_resume_session_named_all_is_not_treated_as_flag`, full
+`tests/gateway/test_resume_command.py`, and command registry tests.
+
 ### macOS LaunchAgent Path Cleanup (2026-05-17)
 
 The Mac mini migration left the generated launchd `PATH` depending on legacy

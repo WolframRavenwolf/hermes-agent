@@ -2844,9 +2844,19 @@ class GatewaySlashCommandsMixin:
             parts = shlex.split(raw_args)
         except ValueError as exc:
             return t("gateway.resume.parse_error", error=exc)
+
         allow_all = "--all" in parts
+        allow_full = "--full" in parts
         allow_cross_room = "--cross-room" in parts
-        name = " ".join(p for p in parts if p not in {"--all", "--cross-room"}).strip()
+        known_flags = {"--all", "--full", "--cross-room"}
+        unknown_flags = [p for p in parts if p.startswith("--") and p not in known_flags]
+        name_parts = [p for p in parts if p not in known_flags]
+        name = " ".join(name_parts).strip()
+        if unknown_flags and not name:
+            # Preserve old fail-closed behavior for unknown flags: treat the
+            # literal text as the lookup target so the user gets the normal
+            # not-found response instead of accidentally widening scope.
+            name = " ".join(parts).strip()
 
         # Strip common outer brackets/quotes users may type literally from the
         # usage hint (e.g. ``/resume <abc123>``). Mirrors the CLI behavior.
@@ -2858,53 +2868,86 @@ class GatewaySlashCommandsMixin:
         ):
             name = name[1:-1].strip()
 
-        def _list_titled_sessions() -> list[dict]:
-            user_source = source.platform.value if source.platform else None
-            sessions = self._session_db.list_sessions_rich(source=user_source, limit=10)
-            return [s for s in sessions if s.get("title")][:10]
+        def _list_sessions_for_scope(*, cross_platform: bool, show_unnamed: bool, limit: int) -> list[dict]:
+            user_source = None if cross_platform else (source.platform.value if source.platform else None)
+            sessions = self._session_db.list_sessions_rich(source=user_source, limit=limit)
+            if source.platform == Platform.MATRIX and not cross_platform:
+                scoped = []
+                for s in sessions:
+                    origin = self._gateway_session_origin_for_id(str(s.get("id") or ""))
+                    if self._same_matrix_room(source, origin):
+                        scoped.append(s)
+                sessions = scoped
+            if not show_unnamed:
+                sessions = [s for s in sessions if s.get("title")]
+            return sessions
 
+        def _list_titled_sessions() -> list[dict]:
+            return _list_sessions_for_scope(cross_platform=False, show_unnamed=False, limit=10)[:10]
+
+        # Listing modes:
+        #   /resume              named sessions, current platform
+        #   /resume --all        named sessions, all platforms
+        #   /resume --full       all sessions, current platform
+        #   /resume --all --full all sessions, all platforms
         if not name:
-            # List recent titled sessions for this user/platform
             try:
-                titled = _list_titled_sessions()
-                if source.platform == Platform.MATRIX and not allow_all:
-                    scoped = []
-                    for s in titled:
-                        origin = self._gateway_session_origin_for_id(str(s.get("id") or ""))
-                        if self._same_matrix_room(source, origin):
-                            scoped.append(s)
-                    titled = scoped
-                if not titled:
-                    if source.platform == Platform.MATRIX and not allow_all:
-                        return t("gateway.resume.matrix_no_named_sessions")
-                    return t("gateway.resume.no_named_sessions")
-                lines = [t("gateway.resume.list_header")]
-                for idx, s in enumerate(titled[:10], start=1):
-                    title = s["title"]
-                    if source.platform == Platform.MATRIX and allow_all:
-                        origin = self._gateway_session_origin_for_id(str(s.get("id") or ""))
-                        if origin:
-                            title = f"{title} — {origin.chat_name or origin.chat_id}"
-                    preview = s.get("preview", "")[:40]
+                if not (allow_all or allow_full):
+                    titled = _list_titled_sessions()
+                    if not titled:
+                        if source.platform == Platform.MATRIX:
+                            return t("gateway.resume.matrix_no_named_sessions")
+                        return t("gateway.resume.no_named_sessions")
+                    lines = [t("gateway.resume.list_header")]
+                    for idx, s in enumerate(titled[:10], start=1):
+                        title = s["title"]
+                        preview = s.get("preview", "")[:40]
+                        preview_part = t("gateway.resume.list_preview_suffix", preview=preview) if preview else ""
+                        lines.append(t("gateway.resume.list_item_numbered", index=idx, title=title, preview_part=preview_part))
+                    lines.append(t("gateway.resume.list_footer_numbered"))
+                    return "\n".join(lines)
+
+                sessions = _list_sessions_for_scope(
+                    cross_platform=allow_all,
+                    show_unnamed=allow_full,
+                    limit=50,
+                )
+                if not sessions:
+                    scope = "across all platforms" if allow_all else "on this platform"
+                    kind = "sessions" if allow_full else "named sessions"
+                    return (
+                        f"No {kind} found {scope}.\n"
+                        "Use `/title My Session` to name your current session, "
+                        "then `/resume My Session` to return to it later."
+                    )
+
+                scope_label = "All Platforms" if allow_all else (source.platform.value.title() if source.platform else "Unknown")
+                header_kind = "All Sessions" if allow_full else "Named Sessions"
+                lines = [f"📋 **{header_kind} — {scope_label}**\n"]
+                for idx, s in enumerate(sessions[:20], start=1):
+                    title = s.get("title")
+                    preview = (s.get("preview") or "")[:40]
                     preview_part = t("gateway.resume.list_preview_suffix", preview=preview) if preview else ""
-                    lines.append(t("gateway.resume.list_item_numbered", index=idx, title=title, preview_part=preview_part))
-                lines.append(t("gateway.resume.list_footer_numbered"))
+                    source_tag = f" [{s.get('source', '?')}]" if allow_all else ""
+                    if title:
+                        label = f"**{title}**"
+                    else:
+                        label = f"`{str(s.get('id', '???'))[:20]}`"
+                    lines.append(f"{idx}. {label}{preview_part}{source_tag}")
+                lines.append("\nUsage: `/resume <session name>` or `/resume <session_id>`")
+                if not allow_all:
+                    lines.append("Tip: `/resume --all` for cross-platform, `/resume --full` to include unnamed sessions.")
+                elif not allow_full:
+                    lines.append("Tip: `/resume --all --full` to include unnamed sessions.")
                 return "\n".join(lines)
             except Exception as e:
-                logger.debug("Failed to list titled sessions: %s", e)
+                logger.debug("Failed to list sessions: %s", e)
                 return t("gateway.resume.list_failed", error=e)
 
-        # Resolve a numbered choice or a title to a session ID.
+        # Resolve a numbered choice, session ID/prefix, or title to a session ID.
         if name.isdigit():
             try:
                 titled = _list_titled_sessions()
-                if source.platform == Platform.MATRIX and not allow_all:
-                    scoped = []
-                    for s in titled:
-                        origin = self._gateway_session_origin_for_id(str(s.get("id") or ""))
-                        if self._same_matrix_room(source, origin):
-                            scoped.append(s)
-                    titled = scoped
             except Exception as e:
                 logger.debug("Failed to list titled sessions for numeric resume: %s", e)
                 return t("gateway.resume.list_failed", error=e)
@@ -2915,12 +2958,14 @@ class GatewaySlashCommandsMixin:
             target_id = target.get("id")
             name = target.get("title") or name
         else:
-            # Try direct session ID lookup first (so `/resume <session_id>`
-            # works in the gateway, not just `/resume <title>`).
-            session = self._session_db.get_session(name)
-            if session:
-                target_id = session["id"]
-            else:
+            # Try direct/exact-or-unique-prefix session ID lookup first (so
+            # `/resume <session_id>` and `/resume <id-prefix>` work globally),
+            # then fall back to global title/lineage lookup.
+            try:
+                target_id = self._session_db.resolve_session_id(name)
+            except Exception:
+                target_id = None
+            if not target_id:
                 target_id = self._session_db.resolve_session_by_title(name)
         if not target_id:
             return t("gateway.resume.not_found", name=name)

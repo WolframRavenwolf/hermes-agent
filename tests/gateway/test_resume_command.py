@@ -364,6 +364,95 @@ class TestHandleResumeCommand:
 
 
 
+    @pytest.mark.asyncio
+    async def test_resume_all_lists_named_sessions_across_platforms(self, tmp_path):
+        """`/resume --all` lists titled sessions from every platform, not just the current app."""
+        from hermes_state import SessionDB
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("telegram_named", "telegram")
+        db.set_session_title("telegram_named", "Telegram Work")
+        db.append_message("telegram_named", "user", "telegram preview")
+        db.create_session("mattermost_named", "mattermost")
+        db.set_session_title("mattermost_named", "Mattermost Work")
+        db.append_message("mattermost_named", "user", "mattermost preview")
+
+        event = _make_event(text="/resume --all", platform=Platform.MATTERMOST)
+        runner = _make_runner(session_db=db, event=event)
+        result = await runner._handle_resume_command(event)
+
+        assert "Named Sessions — All Platforms" in result
+        assert "Telegram Work" in result
+        assert "Mattermost Work" in result
+        assert "[telegram]" in result
+        assert "[mattermost]" in result
+        assert "telegram_unnamed" not in result
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_resume_full_lists_unnamed_sessions_on_current_platform_only(self, tmp_path):
+        """`/resume --full` includes unnamed sessions but still scopes to the current platform."""
+        from hermes_state import SessionDB
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("telegram_unnamed", "telegram")
+        db.append_message("telegram_unnamed", "user", "telegram unnamed preview")
+        db.create_session("mattermost_unnamed", "mattermost")
+        db.append_message("mattermost_unnamed", "user", "mattermost unnamed preview")
+
+        event = _make_event(text="/resume --full", platform=Platform.MATTERMOST)
+        runner = _make_runner(session_db=db, event=event)
+        result = await runner._handle_resume_command(event)
+
+        assert "All Sessions — Mattermost" in result
+        assert "`mattermost_unnamed`" in result
+        assert "mattermost unnamed preview" in result
+        assert "telegram_unnamed" not in result
+        assert "telegram unnamed preview" not in result
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_resume_all_full_lists_unnamed_sessions_across_platforms(self, tmp_path):
+        """`/resume --all --full` shows unnamed sessions from other platforms for cross-app restore."""
+        from hermes_state import SessionDB
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("telegram_unnamed", "telegram")
+        db.append_message("telegram_unnamed", "user", "telegram unnamed preview")
+        db.create_session("mattermost_unnamed", "mattermost")
+        db.append_message("mattermost_unnamed", "user", "mattermost unnamed preview")
+
+        event = _make_event(text="/resume --all --full", platform=Platform.MATTERMOST)
+        runner = _make_runner(session_db=db, event=event)
+        result = await runner._handle_resume_command(event)
+
+        assert "All Sessions — All Platforms" in result
+        assert "`telegram_unnamed`" in result
+        assert "`mattermost_unnamed`" in result
+        assert "[telegram]" in result
+        assert "[mattermost]" in result
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_resume_session_named_all_is_not_treated_as_flag(self, tmp_path):
+        """Only --all is a flag; a titled session named 'all' remains resumable."""
+        from hermes_state import SessionDB
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("session_named_all", "telegram")
+        db.set_session_title("session_named_all", "all")
+        db.create_session("current_session_001", "telegram")
+
+        event = _make_event(text="/resume all")
+        runner = _make_runner(
+            session_db=db,
+            current_session_id="current_session_001",
+            event=event,
+        )
+        result = await runner._handle_resume_command(event)
+
+        assert "Resumed" in result
+        call_args = runner.session_store.switch_session.call_args
+        assert call_args[0][1] == "session_named_all"
+        db.close()
+
+
 class TestHandleSessionsCommand:
     """Tests for GatewayRunner._handle_sessions_command."""
 
