@@ -290,19 +290,28 @@ MEDIA image uploads with Mattermost thread metadata.
 `tests/gateway/test_mattermost.py::TestMattermostSend::test_send_multiple_images_uses_metadata_thread_id`,
 `tests/gateway/test_mattermost.py`, `tests/gateway/test_send_multiple_images.py`.
 
-### Gateway /status: Provider-Aware Idle Context Window (2026-05-19)
+### Gateway /status: Restore Model/Context Cockpit Info (2026-05-31)
 
-`/status` shows model, context usage, and cumulative token labels. Its idle
-fallback resolves the model context window provider-aware instead of using raw
-`DEFAULT_CONTEXT_LENGTHS`, so `gpt-5.5` via `openai-codex` displays the real
-272,000-token Codex OAuth window instead of the direct-OpenAI 1,050,000-token
-window. The same path respects provider/base URL/custom-provider/context
-overrides used by `/model` and compression.
+**Problem:** The old public #4678 feature had drifted out of the current
+`amy/patches` stack during the 0.15.x upgrade/rebase path. `/usage` still exposed
+model/context details, but `/status` no longer showed the at-a-glance model,
+context window, or explicit cumulative token label that Wolfram uses to monitor
+context pressure from chat.
 
-**Files:** `gateway/run.py`, `tests/gateway/test_status_command.py`
+**Solution:** Re-ported the feature onto the current gateway status handler:
+`/status` now shows the live or cached agent model/provider and context usage
+when available, falls back to the persisted SessionDB model plus the
+SessionStore's `last_prompt_tokens` between turns, and labels token totals as
+cumulative. Context length resolution follows the current provider-aware
+metadata path while deliberately avoiding account-usage/billing calls.
 
-**Verification:** `tests/gateway/test_status_command.py`,
-`tests/hermes_cli/test_model_switch_context_display.py`.
+**Affected files:** `gateway/run.py`, `hermes_cli/commands.py`, `locales/en.yaml`,
+`tests/gateway/test_status_command.py`
+
+**Verification:**
+`tests/gateway/test_status_command.py::test_status_command_includes_live_agent_model_and_context`,
+`tests/gateway/test_status_command.py::test_status_command_includes_persisted_model_and_context_when_agent_not_running`,
+full `tests/gateway/test_status_command.py`, and command registry tests.
 
 ### macOS LaunchAgent Path Cleanup (2026-05-17)
 

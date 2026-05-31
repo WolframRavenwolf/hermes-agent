@@ -498,11 +498,25 @@ class GatewaySlashCommandsMixin:
             model_cfg = user_config.get("model", {}) if isinstance(user_config, dict) else {}
             if isinstance(model_cfg, dict):
                 provider_name = _clean_str(model_cfg.get("provider"))
-        if not context_total:
-            model_cfg = user_config.get("model", {}) if isinstance(user_config, dict) else {}
-            configured_context = model_cfg.get("context_length") if isinstance(model_cfg, dict) else None
-            if isinstance(configured_context, int) and configured_context > 0:
-                context_total = configured_context
+        if not context_total and model_name:
+            try:
+                from agent.model_metadata import get_model_context_length
+
+                model_cfg = user_config.get("model", {}) if isinstance(user_config, dict) else {}
+                configured_context = None
+                if isinstance(model_cfg, dict):
+                    configured_context = model_cfg.get("context_length")
+                custom_providers = user_config.get("custom_providers") if isinstance(user_config, dict) else None
+                context_total = get_model_context_length(
+                    model_name,
+                    base_url=base_url,
+                    api_key="",
+                    config_context_length=configured_context if isinstance(configured_context, int) else None,
+                    provider=provider_name,
+                    custom_providers=custom_providers if isinstance(custom_providers, list) else None,
+                )
+            except Exception:
+                context_total = 0
 
         model_line = ""
         if model_name:

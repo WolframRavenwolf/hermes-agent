@@ -238,13 +238,18 @@ async def test_status_command_includes_persisted_model_and_context_when_agent_no
         "billing_provider": "openai-codex",
         "billing_base_url": "https://example.invalid/v1",
     }
-    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {"model": {"context_length": 272_000}})
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {"model": {}})
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: 272_000,
+    )
 
     result = await runner._handle_message(_make_event("/status"))
 
     assert "**Model:** `openai/gpt-persisted` (openai-codex)" in result
     assert "**Context:** 24,000 / 272,000 (9%)" in result
     assert "**Cumulative API tokens (re-sent each call):** 2,500" in result
+    assert "2,500 (cumulative)" not in result
 
 
 @pytest.mark.asyncio
