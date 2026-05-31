@@ -142,6 +142,81 @@ async def test_status_command_includes_live_agent_model_and_context():
 
 
 @pytest.mark.asyncio
+async def test_status_command_includes_persisted_model_and_context_when_agent_not_running(
+    monkeypatch,
+):
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=0,
+        last_prompt_tokens=24_000,
+    )
+    runner = _make_runner(session_entry)
+    runner._session_db._db.get_session.return_value = {
+        "input_tokens": 2000,
+        "output_tokens": 500,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": 0,
+        "model": "openai/gpt-persisted",
+        "billing_provider": "openai-codex",
+        "billing_base_url": "https://example.invalid/v1",
+    }
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {"model": {}})
+    metadata_lookup = AsyncMock(return_value=272_000)
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length_async",
+        metadata_lookup,
+    )
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert "**Model:** `openai/gpt-persisted` (openai-codex)" in result
+    assert "**Context:** 24,000 / 272,000 (9%)" in result
+    assert "**Lifetime tokens billed:** 2,500" in result
+    metadata_lookup.assert_awaited_once_with(
+        "openai/gpt-persisted",
+        base_url="https://example.invalid/v1",
+        api_key="",
+        config_context_length=None,
+        provider="openai-codex",
+        custom_providers=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_status_command_includes_cached_agent_model_and_context():
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=0,
+    )
+    runner = _make_runner(session_entry)
+    cached_agent = SimpleNamespace(
+        model="anthropic/claude-sonnet-test",
+        provider="openrouter",
+        context_compressor=SimpleNamespace(
+            last_prompt_tokens=10_000,
+            context_length=200_000,
+        ),
+    )
+    runner._agent_cache = {session_entry.session_key: (cached_agent, time.time())}
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert "**Model:** `anthropic/claude-sonnet-test` (openrouter)" in result
+    assert "**Context:** 10,000 / 200,000 (5%)" in result
+
+
+@pytest.mark.asyncio
 async def test_agents_command_reports_active_agents_and_processes(monkeypatch):
     session_key = build_session_key(_make_source())
     session_entry = SessionEntry(
