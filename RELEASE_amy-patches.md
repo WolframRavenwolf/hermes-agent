@@ -1,11 +1,89 @@
 # Amy's Patches - Changelog (Branch: amy/patches)
 
 **Current base:** Hermes Agent v2026.6.19
-**Current patch stack:** Rebased Amy/private patch stack after launchd restart reload-pending fix
-**Current reconciliation reviewed through:** v0.17.0 rebase in progress; upstream-absorbed patches dropped, Amy-private patches retained
+**Current patch stack:** 21 local Amy patches on Hermes Agent v2026.6.19 after v0.17.0 rebase, gateway self-management hardening, restart-script detector comment fix, and Raft optional-platform log quieting
+**Current reconciliation reviewed through:** v0.17.0 rebase/verification on 2026-06-21 plus post-restart stack classification on 2026-06-22; upstream-absorbed patches dropped, Amy-private patches retained
 **Author:** Amy Ravenwolf <amy@ravenwolf.de>
 
 > Current goal: keep only Amy/private patches local, and submit every generally useful feature/fix upstream as an open PR so future upgrades have less custom patch baggage.
+
+---
+
+## Current Patch-Stack Classification (2026-06-22)
+
+Counted from the release base, not by diffing against a moving upstream branch or an unsynced fork branch. Fork `main` is supposed to match the release version that `amy/patches` is based on; it may intentionally lag current `upstream/main` between upgrades.
+
+- Current base: `v2026.6.19`
+- Current stack: `21` patches on `amy/patches`
+- Pre-v0.17 backup for comparison: `amy/patches-backup-v2026.6.19-20260621-140428`
+- Pre-v0.17 stack: `32` patches on `v2026.6.5`
+- Exact patch-id absorption check against current `upstream/main`: all 21 current patches show `+`, so none are exact patch-id matches on upstream `main`; semantic absorption still has to be judged by workflow/code inspection.
+
+### Dropped During the v0.17 Rebase
+
+These old local patches are no longer carried in the current stack because Hermes v0.17.0 or current upstream provides the workflow, or because the old documentation commit was replaced by current reconciliation docs.
+
+| Old patch subject | Current disposition |
+|---|---|
+| `feat(memory): configurable background memory update notifications` | Dropped - upstream absorbed. |
+| `feat(display): add independent thinking_progress config option` | Dropped - upstream absorbed. |
+| `feat(display): show delegate_task goals in tool progress notifications` | Dropped - upstream absorbed. |
+| `feat(display): verbose skill change notifications with content previews` | Dropped - upstream absorbed. |
+| `fix(display): preserve generic skill patch notifications` | Dropped - upstream absorbed. |
+| `feat(prompt): make context-file truncation limit configurable` | Dropped - upstream absorbed with stronger dynamic/explicit cap support. |
+| `feat(hooks): session:compress event_callback for MemPalace sync` | Dropped - upstream absorbed. |
+| `feat: add tool_progress_style config (accumulate vs separate)` | Dropped - upstream absorbed under `tool_progress_grouping`. |
+| `fix(config): read browser inactivity timeout from config` | Dropped - upstream replaced/integrated. |
+| `feat(gateway): inject stable human-readable message timestamps` | Dropped as code - upstream has config-gated timestamp support; Amy preserves behavior through config. |
+| `fix(state): skip redundant trigram backfill before v11 FTS rebuild` | Dropped - upstream absorbed. |
+| `fix(skills): ignore support docs in skill discovery` | Dropped - upstream absorbed. |
+| `fix(mattermost): keep plugin sends in threads` | Dropped - upstream absorbed. |
+| `fix(mattermost): harden delivery hygiene` | Dropped - upstream absorbed. |
+| Old upstream PR reconciliation doc commits | Replaced by current `docs(patches)` reconciliation commit. |
+
+### New or Re-Spun Since the v0.17 Rebase
+
+| Current commit | Subject | Classification |
+|---|---|---|
+| `9286c41c8` | `feat(status): restore model and context in gateway status` | Re-spun local delta on top of upstream's refactored status command. |
+| `505373d78` | `docs(patches): update upstream PR reconciliation` | Re-spun private patch-stack documentation. |
+| `8927afe69` | `feat(tools): keep send_message in explicit messaging toolset` | New Amy-local policy patch after upstream removed agent-callable `send_message` from default surfaces. |
+| `2e4db11d1` | `test(auxiliary): make codex timeout check deterministic` | New upstream-worthy test flake fix. |
+| `f1abee591` | `fix(gateway): harden self-management guard` | New upstream-worthy gateway safety fix, including restart-helper detector follow-up. |
+| `ee2c36ff3` | `fix(raft): quiet optional dependency checks` | New upstream-worthy optional-plugin noise fix; likely droppable after a release containing upstream's equivalent Raft quieting. |
+
+### Current 21-Patch Stack
+
+| Commit | Subject | Current classification |
+|---|---|---|
+| `c2bc868aa` | `fix: WhatsApp voice messages + bridge audio download + npm deps` | Upstream-worthy and still locally needed against `v2026.6.19`; original PR #41616 closed unmerged. |
+| `ab38f124c` | `feat(tool_progress): add 'full' mode - unlimited tool args in gateway chat` | Upstream-worthy and still locally needed; original PR #41617 closed unmerged. |
+| `3534f1cc7` | `feat(prompt): add Amy platform hints and Mattermost Private Assistant default` | Private Amy/persona patch - do not upstream. |
+| `985992a36` | `docs: add Amy's patches changelog for v0.6.0 fork` | Private fork documentation - do not upstream. |
+| `33fad8f85` | `fix: suppress pkg_resources deprecation warning from lark_oapi` | Upstream-worthy and still locally needed; original PR #41621 closed unmerged. |
+| `35b9fa2e0` | `fix(addon): make dashboard assets work behind HA ingress` | Upstream-worthy and still locally needed; original PR #41629 closed unmerged. |
+| `73d6a66c3` | `feat(vision): add provider-safe inject_image tool` | Upstream-worthy and still locally needed; original PR #41632 closed unmerged. |
+| `4761ff163` | `feat(moa): route experts through provider-aware clients` | Partially superseded by upstream MoA/virtual-provider redesign; keep locally against `v2026.6.19`, re-evaluate on next release. |
+| `9fc7aa5ca` | `feat(gateway): add macOS app-wrapper launchd identity` | Upstream-worthy/local Mac runtime patch; original PR #41635 was closed as too broad, but Amy still needs the app-wrapper/TCC workflow. |
+| `835926beb` | `fix: enable GPT-5.5 priority processing fast mode` | Likely partially superseded by broader upstream fast-routing work; keep as local regression coverage until next release comparison proves redundant. |
+| `a798832f7` | `fix(gateway): keep macOS launchd runtime paths logical` | Upstream-worthy/local launchd hardening; partially related upstream fixes exist, but this exact logical-path/app-wrapper workflow remains local. |
+| `850e92d6f` | `fix(deps): restore CVE-fixed pyproject pins` | Partially upstream-covered; keep until upstream fully covers the direct dependency-pin/lock consistency Amy needs. |
+| `9286c41c8` | `feat(status): restore model and context in gateway status` | Partially upstream-covered; local provider/context delta remains needed for Amy's `/status` workflow. |
+| `c741830f0` | `feat(resume): restore cross-platform full session listing` | Upstream has `/sessions`, but not the exact `/resume --all/--full` compatibility workflow; keep locally, possible compatibility PR. |
+| `505373d78` | `docs(patches): update upstream PR reconciliation` | Private fork documentation - do not upstream. |
+| `f7bcf08bd` | `fix(mattermost): caption file-only media posts` | Upstream-worthy and still locally needed; upstream PR #48014 open. |
+| `538fd6ec6` | `fix(mattermost): make post length configurable` | Upstream-worthy and still locally needed; upstream PR #48015 open. |
+| `8927afe69` | `feat(tools): keep send_message in explicit messaging toolset` | Amy-local trusted-runtime policy patch; upstream deliberately removed broad agent-callable `send_message`. |
+| `2e4db11d1` | `test(auxiliary): make codex timeout check deterministic` | Upstream-worthy test flake fix; no upstream PR yet. |
+| `f1abee591` | `fix(gateway): harden self-management guard` | Upstream-worthy safety fix; no upstream PR yet. |
+| `ee2c36ff3` | `fix(raft): quiet optional dependency checks` | Semantically likely superseded on upstream `main`, but locally needed against `v2026.6.19`; probably droppable next release. |
+
+### Push/Upgrade Implications
+
+- Local `amy/patches` is the authoritative validated stack after the v0.17 restart smoke.
+- Rebased patch-stack pushes require `--force-with-lease`; after the 2026-06-22 push, `origin/amy/patches` matched local `amy/patches`.
+- Future rebase watchpoints: MoA redesign, GPT fast-mode routing, dependency pins, Raft quieting, and macOS launchd/app-wrapper split.
+- Private patches to preserve across future upgrades: Amy platform hints, private patch docs, and explicit `send_message` messaging toolset unless Wolfram changes the policy.
 
 ---
 
@@ -117,10 +195,10 @@ Wolfram approved Amy's "best local solution" for `send_message`.
 **Session reference:** 2026-06-17 Mattermost thread on reducing long-post splitting and repeated `Show more` clicks.
 
 ---
-## Current Upstream PR Reconciliation (2026-06-08)
+## Historical Upstream PR Reconciliation (2026-06-08)
 
 Counted with `git describe --tags --abbrev=0 HEAD` and `git rev-list --count v2026.6.5..HEAD`.
-Do not count against stale `main`; tag-to-HEAD is the authoritative patch stack.
+Do not count by diffing against a moving upstream branch or an unsynced fork branch; tag-to-HEAD is the authoritative patch stack. Fork `main`, when synced correctly, is the release-base mirror for `amy/patches`.
 
 | Commit | Subject | Upstream disposition |
 |---|---|---|
@@ -189,12 +267,11 @@ Private/local-only patches after reconciliation: Amy platform/persona hints (`34
 ---
 
 ## Historical v0.6.0 Patch Notes
-
 **Base:** Hermes Agent v0.6.0 (v2026.3.30)
-**Patch Period:** March 30–31, 2026
+**Patch Period:** March 30-31, 2026
 **Author:** Amy Ravenwolf <amy@ravenwolf.de>
 
-> 10 patches on top of upstream v0.6.0 — session management, tool progress relay, platform hints, WhatsApp fixes, and cross-platform /resume.
+> 10 patches on top of upstream v0.6.0 - session management, tool progress relay, platform hints, WhatsApp fixes, and cross-platform /resume.
 
 ---
 
