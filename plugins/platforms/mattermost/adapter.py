@@ -36,6 +36,26 @@ logger = logging.getLogger(__name__)
 # practical limit for readable messages — matching OpenClaw's choice).
 MAX_POST_LENGTH = 4000
 
+
+def _file_post_message(caption: Optional[str], filenames: List[str]) -> str:
+    """Return a Mattermost post body for file attachments.
+
+    Mattermost accepts posts whose only visible content is ``file_ids`` with an
+    empty ``message``, but some clients/threads can make those file-only replies
+    easy to miss.  Use the explicit caption when present; otherwise include a
+    tiny filename line so attachment posts remain visible and discoverable.
+    """
+    body = (caption or "").strip()
+    if body:
+        return body
+    clean = [str(name).strip() for name in filenames if str(name).strip()]
+    if not clean:
+        return "📎 Attachment"
+    if len(clean) == 1:
+        return f"📎 {clean[0]}"
+    return "\n".join(f"📎 {name}" for name in clean)
+
+
 # Channel type codes returned by the Mattermost API.
 _CHANNEL_TYPE_MAP = {
     "D": "dm",
@@ -528,7 +548,7 @@ class MattermostAdapter(BasePlatformAdapter):
 
         payload: Dict[str, Any] = {
             "channel_id": chat_id,
-            "message": caption or "",
+            "message": _file_post_message(caption, [fname]),
             "file_ids": [file_id],
         }
         resolved_root = await self._thread_root_for_send(reply_to, metadata)
@@ -569,7 +589,7 @@ class MattermostAdapter(BasePlatformAdapter):
 
         payload: Dict[str, Any] = {
             "channel_id": chat_id,
-            "message": caption or "",
+            "message": _file_post_message(caption, [fname]),
             "file_ids": [file_id],
         }
         resolved_root = await self._thread_root_for_send(reply_to, metadata)
@@ -611,6 +631,7 @@ class MattermostAdapter(BasePlatformAdapter):
                 await asyncio.sleep(human_delay)
 
             file_ids: List[str] = []
+            uploaded_names: List[str] = []
             caption_parts: List[str] = []
             try:
                 for image_url, alt_text in chunk:
@@ -651,13 +672,14 @@ class MattermostAdapter(BasePlatformAdapter):
                     fid = await self._upload_file(chat_id, file_data, fname, ct)
                     if fid:
                         file_ids.append(fid)
+                        uploaded_names.append(fname)
 
                 if not file_ids:
                     continue
 
                 payload: Dict[str, Any] = {
                     "channel_id": chat_id,
-                    "message": "\n".join(caption_parts),
+                    "message": _file_post_message("\n".join(caption_parts), uploaded_names),
                     "file_ids": file_ids,
                 }
                 resolved_root = await self._thread_root_for_send(None, metadata)

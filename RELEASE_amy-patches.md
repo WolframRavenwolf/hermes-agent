@@ -343,6 +343,93 @@ editable root package on the rebased upstream version, and records uv's 24h
 **Verification:** `uv lock --check`, metadata consistency assertions for
 `pyproject.toml`/`uv.lock`, and `git diff --check`.
 
+### Mattermost Plugin Thread Routing: Keep All Conversation Bubbles in Threads (2026-05-31)
+
+**Problem:** After the Hermes Agent 0.15.x upgrade, Mattermost delivery was
+served by the plugin adapter path. Our earlier thread fixes covered parts of the
+old built-in adapter, but the plugin `send()` path ignored `metadata.thread_id`.
+Gateway status/commentary/interim bubbles rely on that metadata, so they landed
+as flat channel posts while tool-progress bubbles could still appear in the
+thread. In other channels the inverse could happen depending on which send path
+was used. Conversation context became split across channel and thread.
+
+**Solution:** Re-ported and expanded the Mattermost thread-routing fix on the
+plugin adapter: `send()`, URL/local file uploads, voice/video/document sends,
+and batched multi-image MEDIA posts now resolve `reply_to` or
+`metadata.thread_id` to a valid Mattermost `root_id`, refuse silent flat-channel
+fallback when a threaded post is rejected, and top-level channel posts in
+`reply_mode=thread` seed their own post ID as the conversation thread root while
+DMs stay stable. Gateway progress routing now treats Mattermost like Slack for
+top-level thread roots instead of requiring a pre-existing `source.thread_id`.
+
+**Affected files:** `gateway/run.py`,
+`plugins/platforms/mattermost/adapter.py`, `tests/gateway/test_mattermost.py`
+
+**Session reference:** 2026-05-31 Mattermost thread-routing regression review.
+
+**Verification:** `python3 -m py_compile gateway/run.py
+plugins/platforms/mattermost/adapter.py tests/gateway/test_mattermost.py`,
+`tests/gateway/test_mattermost.py`, `tests/gateway/test_status_command.py`,
+`tests/gateway/test_resume_command.py`, `tests/hermes_cli/test_commands.py`.
+
+### Mattermost Visible Media Posts: Caption Empty Attachments (2026-06-14)
+
+**Problem:** Mattermost accepted Hermes media delivery posts that contained only
+`file_ids` and an empty `message`, and the server-side API showed the uploaded
+image with preview metadata. In the live Mattermost thread, however, Wolfram did
+not see the new GPT Image 2 attachment even though earlier media posts had used
+the same empty-body pattern. Empty file-only thread replies are too easy for
+clients to hide, miss, or fail to surface in a busy thread.
+
+**Solution:** Mattermost file delivery now preserves explicit captions, but when
+a local/URL/batched image or file upload has no caption it adds a minimal visible
+filename line such as `📎 example.png` to the post body. The attachment remains a
+native Mattermost `file_ids` upload in the same thread, but the post is no
+longer visually empty.
+
+**Affected files:** `plugins/platforms/mattermost/adapter.py`,
+`tests/gateway/test_mattermost.py`
+
+**Session reference:** 2026-06-14 Mattermost media-visibility regression review.
+
+**Verification:** `tests/gateway/test_mattermost.py::TestMattermostSend`,
+`tests/gateway/test_mattermost.py::TestMattermostFileUpload`,
+`tests/gateway/test_mattermost.py::TestMattermostFormatMessage`, and full
+`tests/gateway/test_mattermost.py`.
+
+### Mattermost Delivery Hygiene: Block Scratch Leaks and Final-Only Flat Fallback (2026-06-01)
+
+**Problem:** A large/broken Mattermost thread exposed two coupled delivery
+hazards. Internal scratch/commentary text such as `_thinking`/reasoning progress
+could become visible in persistent Mattermost threads when global display toggles
+were enabled, and a rejected `root_id` could make a real final answer appear lost.
+At the same time, allowing every failed threaded send to fall back flat would
+spray tool/status/progress noise into the parent channel.
+
+**Solution:** Mattermost now requires an explicit
+`display.platforms.mattermost.*` opt-in for scratch displays like
+`thinking_progress`, `show_reasoning`, and `interim_assistant_messages`; global
+display settings no longer leak those into Mattermost by default. Final
+user-visible text/media/file replies use the existing `notify=True` metadata
+marker, and the Mattermost plugin adapter uses that marker to retry rejected
+threaded user-visible posts flat in the channel with a visible warning prefix
+only when the failure looks like a broken thread/root. Tool/status/progress and
+other non-notify sends remain thread-strict and do not flat-fallback.
+
+**Affected files:** `gateway/run.py`, `gateway/platforms/base.py`,
+`gateway/stream_consumer.py`, `plugins/platforms/mattermost/adapter.py`,
+`tests/gateway/test_mattermost.py`,
+`tests/gateway/test_stream_consumer_thread_routing.py`
+
+**Session reference:** 2026-06-01 Mattermost delivery-hygiene regression review.
+
+**Verification:** targeted RED/GREEN tests for Mattermost display opt-in,
+notify-only broken-thread fallback, and stream `notify=True` metadata; full relevant regression
+files `tests/gateway/test_mattermost.py`, `tests/gateway/test_stream_consumer.py`,
+`tests/gateway/test_stream_consumer_thread_routing.py`,
+`tests/gateway/test_stream_consumer_fresh_final.py`, and
+`tests/gateway/test_stream_consumer_draft.py`.
+
 ### Mattermost MEDIA Attachments: Keep Thread Context (2026-05-19)
 
 **Problem:** In Mattermost `MATTERMOST_REPLY_MODE=thread`, normal text replies
