@@ -46,6 +46,19 @@ from plugins.platforms.discord.adapter import (
 )
 
 
+def test_send_message_registered_as_explicit_messaging_toolset():
+    """Amy keeps send_message opt-in via the messaging toolset, not core."""
+    from tools.registry import registry
+    from toolsets import resolve_toolset
+
+    entry = registry.get_entry("send_message")
+    assert entry is not None
+    assert entry.toolset == "messaging"
+    assert entry.schema["name"] == "send_message"
+    assert registry.get_tool_names_for_toolset("messaging") == ["send_message"]
+    assert resolve_toolset("messaging") == ["send_message"]
+
+
 async def _send_discord(
     token,
     chat_id,

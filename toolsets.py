@@ -211,6 +211,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "messaging": {
+        "description": "Opt-in cross-platform outbound messaging toolset",
+        "tools": ["send_message"],
+        "includes": [],
+    },
+
     "context_engine": {
         "description": "Runtime tools exposed by the active context engine",
         "tools": [],

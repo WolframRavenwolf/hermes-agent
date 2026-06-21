@@ -153,19 +153,25 @@ Wolfram still wants the capability available when explicitly enabled, while not
 silently restoring it to every default toolset.
 
 **Solution:** Re-registered `send_message` locally under an explicit
-`messaging` toolset. This keeps the upstream safety posture for broad/default
-Hermes toolsets, but lets Amy opt in via `platform_toolsets` with
-`messaging` (for example alongside `hermes-cli`). The shared send engine remains
-unchanged for cron delivery, `hermes send`, the gateway kanban notifier, and MCP.
+`messaging` toolset and exposed that toolset in the non-interactive
+`hermes tools` configurator. This keeps the upstream safety posture for
+broad/default Hermes toolsets, but lets Amy opt in via `platform_toolsets` with
+`messaging` (for example alongside `hermes-cli` or `hermes-mattermost`). The
+shared send engine remains unchanged for cron delivery, `hermes send`, the
+gateway kanban notifier, and MCP.
 
 **Affected files:**
 
 - `tools/send_message_tool.py`
+- `toolsets.py`
+- `hermes_cli/tools_config.py`
 - `tests/tools/test_send_message_tool.py`
+- `tests/hermes_cli/test_tools_config.py`
 - `RELEASE_amy-patches.md`
 
-**Verification:** Targeted registry regression in
-`tests/tools/test_send_message_tool.py::test_send_message_registered_as_explicit_messaging_toolset`.
+**Verification:** Targeted registry/configurator regression in
+`tests/tools/test_send_message_tool.py::test_send_message_registered_as_explicit_messaging_toolset`
+and `tests/hermes_cli/test_tools_config.py::test_messaging_toolset_is_configurable_but_default_off`.
 
 **Session reference:** 2026-06-21 Mattermost Hermes v0.17.0 upgrade/rebase;
 Wolfram approved Amy's "best local solution" for `send_message`.
