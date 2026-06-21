@@ -7,7 +7,7 @@ import pytest
 
 from cron.jobs import create_job, get_job, list_jobs
 from hermes_cli import cron as cron_cli
-from hermes_cli.cron import cron_command
+from hermes_cli.cron import cron_command, _contains_gateway_lifecycle_command
 
 
 @pytest.fixture()
@@ -234,3 +234,115 @@ def test_cron_create_failure_returns_nonzero(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert rc == 1
     assert "Failed to create job: boom" in out
+
+class TestGatewayLifecycleDetection:
+    def test_shell_comment_does_not_block_canonical_restart_script(self):
+        command = "\n".join(
+            [
+                "# Execute the canonical Hermes gateway restart helper, no ad-hoc runner #",
+                "set -euo pipefail",
+                "/srv/hermes/scripts/restart-gateway.sh --dry-run",
+            ]
+        )
+
+        assert _contains_gateway_lifecycle_command(
+            command,
+            ignore_full_line_shell_comments=True,
+        ) is False
+
+    def test_cron_prompt_hash_heading_still_blocks_gateway_lifecycle(self):
+        assert _contains_gateway_lifecycle_command("# hermes gateway restart") is True
+
+    def test_terminal_comment_preamble_can_mention_new_systemctl_verbs(self):
+        command = (
+            "# Never run systemctl --user reload-or-restart hermes-gateway.service\n"
+            "# or systemctl --user disable --now hermes-gateway.service here\n"
+            "printf 'safe helper'"
+        )
+
+        assert _contains_gateway_lifecycle_command(command) is True
+        assert _contains_gateway_lifecycle_command(
+            command,
+            ignore_full_line_shell_comments=True,
+        ) is False
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "cat <<EOF\n# $(launchctl kickstart -k gui/501/ai.hermes.gateway)\nEOF",
+            "printf '%s\\n' \"\n# $(systemctl --user restart hermes-gateway)\n\"",
+        ],
+    )
+    def test_nonleading_hash_lines_in_shell_context_remain_scannable(self, command):
+        """Hash-prefixed lines after executable text may expand shell commands."""
+        assert _contains_gateway_lifecycle_command(
+            command,
+            ignore_full_line_shell_comments=True,
+        ) is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "hermes gateway restart",
+            "launchctl kickstart -k gui/501/ai.hermes.gateway",
+            "systemctl --user restart hermes-gateway",
+            "pkill -f hermes.*gateway",
+        ],
+    )
+    def test_executable_gateway_lifecycle_commands_stay_blocked(self, command):
+        assert _contains_gateway_lifecycle_command(command) is True
+        assert _contains_gateway_lifecycle_command(
+            command,
+            ignore_full_line_shell_comments=True,
+        ) is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "systemctl --user kill hermes-gateway.service",
+            "systemctl --user try-restart hermes-gateway",
+            "systemctl reload-or-restart --user hermes-gateway.service --no-block",
+            "systemctl --no-block --user 'reload-or-try-restart' 'hermes-gateway.service'",
+            'systemctl "--user" "condrestart" "hermes-gateway.service"',
+            "systemctl --user disable --now hermes-gateway.service",
+            "systemctl --now --user mask 'hermes-gateway.service'",
+            "systemctl mask hermes-gateway.service --user --now",
+            "/usr/bin/systemctl --user --no-block kill --kill-whom=main hermes-gateway.service",
+            (
+                "systemctl --user \\"
+                "\nreload-or-restart \\"
+                "\nhermes-gateway.service"
+            ),
+            (
+                'bash -c "systemctl --user\nreload-or-try-restart\n'
+                'hermes-gateway.service"'
+            ),
+        ],
+    )
+    def test_systemctl_lifecycle_variants_are_blocked(self, command):
+        assert _contains_gateway_lifecycle_command(command) is True
+        assert _contains_gateway_lifecycle_command(
+            command,
+            ignore_full_line_shell_comments=True,
+        ) is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "systemctl --user kill nginx.service",
+            "systemctl reload-or-restart --user hermes-meta.service",
+            "systemctl --user disable --now backup.service",
+            "systemctl --user mask --now hermes-cron-helper.service",
+            "systemctl --user disable hermes-gateway.service",
+            "systemctl --user mask hermes-gateway.service",
+            "systemctl --user status hermes-gateway.service --no-pager",
+        ],
+    )
+    def test_systemctl_unrelated_or_nonterminating_operations_are_allowed(
+        self, command
+    ):
+        assert _contains_gateway_lifecycle_command(command) is False
+        assert _contains_gateway_lifecycle_command(
+            command,
+            ignore_full_line_shell_comments=True,
+        ) is False

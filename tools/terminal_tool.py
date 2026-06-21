@@ -2505,6 +2505,7 @@ def terminal_tool(
             from cron.lifecycle_guard import (
                 contains_gateway_lifecycle_command_or_referenced_script,
                 contains_launchctl_submit_command,
+                is_direct_canonical_restart_helper_command,
             )
             if contains_launchctl_submit_command(command):
                 return json.dumps({
@@ -2526,6 +2527,16 @@ def terminal_tool(
                 default_cwd=guard_cwd_base,
                 session_key=session_key,
             )
+
+            canonical_restart_helper = False
+            if env_type == "local":
+                from hermes_constants import get_hermes_home
+
+                canonical_restart_helper = is_direct_canonical_restart_helper_command(
+                    command,
+                    script_path=get_hermes_home() / "scripts" / "restart-gateway.sh",
+                    cwd=guard_cwd,
+                )
 
             def _read_script_in_env(script_path: str) -> Optional[str]:
                 """Best-effort script read; uses env.execute only when local read fails.
@@ -2557,10 +2568,14 @@ def terminal_tool(
                     pass
                 return None
 
-            if contains_gateway_lifecycle_command_or_referenced_script(
-                command,
-                cwd=guard_cwd,
-                read_remote_script=_read_script_in_env,
+            if (
+                not canonical_restart_helper
+                and contains_gateway_lifecycle_command_or_referenced_script(
+                    command,
+                    cwd=guard_cwd,
+                    read_remote_script=_read_script_in_env,
+                    ignore_full_line_shell_comments=True,
+                )
             ):
                 return json.dumps({
                     "output": "",

@@ -268,6 +268,13 @@ class TestTerminalToolGatewayLifecycleGuard:
         "systemctl restart hermes-gateway",
         "systemctl --user restart hermes-gateway",
         "systemctl stop hermes-gateway.service",
+        'systemctl "--user" "kill" "hermes-gateway.service"',
+        "systemctl try-restart --user hermes-gateway.service --no-block",
+        "systemctl --no-block reload-or-restart hermes-gateway.service --user",
+        "systemctl --user 'reload-or-try-restart' 'hermes-gateway.service'",
+        "systemctl condrestart --user hermes-gateway.service",
+        "systemctl --user disable hermes-gateway.service --now",
+        "systemctl --now mask --user hermes-gateway.service",
         "hermes gateway restart",
         "launchctl kickstart gui/501/ai.hermes.gateway",
         # #62891 exact reported shape and its bootstrap sibling.
@@ -540,25 +547,101 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert result["exit_code"] == 0
         assert calls == [command]
 
-    def test_safe_systemctl_commands_pass_through(self, monkeypatch):
-        """Non-hermes systemctl commands must not be blocked by this guard."""
+    @pytest.mark.parametrize("arg", ["", " --dry-run"])
+    def test_direct_canonical_restart_helper_passes_through(
+        self, monkeypatch, tmp_path, arg
+    ):
+        import hermes_constants
+        import tools.terminal_tool as tt
+
+        helper = tmp_path / "scripts" / "restart-gateway.sh"
+        helper.parent.mkdir()
+        helper.write_text(
+            "#!/bin/bash\nlaunchctl submit -l ai.hermes.restart -- /bin/true\n"
+        )
+        helper.chmod(0o700)
+        monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
+
+        calls = []
+
+        class _FakeEnv:
+            env = {}
+            cwd = str(tmp_path)
+
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                return {"output": "restart scheduled", "returncode": 0}
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda command, env, **kwargs: {"approved": True}
+        )
+        command = f"# Use the canonical detached restart helper #\n{helper}{arg}"
+
+        result = json.loads(tt.terminal_tool(command=command))
+
+        assert result["exit_code"] == 0
+        assert calls == [command]
+
+    @pytest.mark.parametrize(
+        "command_factory",
+        [
+            lambda helper: f"{helper} --worker",
+            lambda helper: f"/bin/bash {helper}",
+            lambda helper: f"SAFE=1 {helper}",
+            lambda helper: f"{helper}; printf done",
+            lambda helper: f"{helper} --dry-run > /tmp/not-allowed",
+        ],
+    )
+    def test_canonical_restart_exception_rejects_wrappers_and_extra_modes(
+        self, tmp_path, command_factory
+    ):
+        from cron.lifecycle_guard import is_direct_canonical_restart_helper_command
+
+        helper = tmp_path / "restart-gateway.sh"
+        helper.write_text("#!/bin/bash\n")
+        helper.chmod(0o700)
+
+        assert not is_direct_canonical_restart_helper_command(
+            command_factory(helper),
+            script_path=helper,
+            cwd=tmp_path,
+        )
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "systemctl status nginx",
+            "systemctl --user kill nginx.service",
+            "systemctl reload-or-restart --user hermes-meta.service",
+            "systemctl --user disable --now backup.service",
+            "systemctl --user mask --now hermes-cron-helper.service",
+            "systemctl --user disable hermes-gateway.service",
+            "systemctl --user mask hermes-gateway.service",
+        ],
+    )
+    def test_safe_systemctl_commands_pass_through(self, monkeypatch, cmd):
+        """Unrelated or nonterminating systemctl commands must pass through."""
         import tools.terminal_tool as tt
 
         calls = []
 
         class _FakeEnv:
             env = {}
+
             def execute(self, command, **kwargs):
                 calls.append(command)
                 return {"output": "Active: running", "returncode": 0}
 
         self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
-        monkeypatch.setattr(tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True})
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda command, env, **kwargs: {"approved": True}
+        )
 
-        result = json.loads(tt.terminal_tool(command="systemctl status nginx"))
+        result = json.loads(tt.terminal_tool(command=cmd))
 
         assert result["exit_code"] == 0
-        assert calls == ["systemctl status nginx"]
+        assert calls == [cmd]
 
 
 # ---------------------------------------------------------------------------
@@ -810,7 +893,7 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
             def execute(self, command, **kwargs):
                 calls.append(command)
                 if "cat" in command and "/remote/workspace/remote.sh" in command:
-                    return {"output": "#!/bin/bash\\nhermes gateway restart\\n", "returncode": 0}
+                    return {"output": "#!/bin/bash\nhermes gateway restart\n", "returncode": 0}
                 return {"output": "", "returncode": 0}
 
         fake_env = _RemoteEnv()

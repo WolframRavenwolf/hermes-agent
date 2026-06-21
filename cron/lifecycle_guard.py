@@ -91,13 +91,122 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
 # across genuinely separate lines.
 _SHELL_LINE_CONTINUATION = re.compile(r"\\\r?\n[ \t]*")
 
+# systemctl accepts global options before or after its verb, and the verbs that
+# can stop a live service are broader than restart/stop.
+_SYSTEMCTL_ALWAYS_BLOCKED_ACTIONS = frozenset(
+    {
+        "start",
+        "stop",
+        "restart",
+        "kill",
+        "try-restart",
+        "reload-or-restart",
+        "reload-or-try-restart",
+        "condrestart",
+    }
+)
+_SYSTEMCTL_NOW_BLOCKED_ACTIONS = frozenset({"disable", "mask"})
+_SYSTEMCTL_GATEWAY_UNIT_RE = re.compile(
+    r"^(?:ai[.\-])?hermes[.\-]?gateway"
+    r"(?:[-@][a-z0-9_.@\-]+)?(?:\.service)?$",
+    re.IGNORECASE,
+)
+_SYSTEMCTL_SHELL_SEPARATORS = frozenset({";", "&", "|", "(", ")"})
 
-def contains_gateway_lifecycle_command(text: str) -> bool:
+
+def _systemctl_shellish_tokens(text: str) -> list[str]:
+    """Tokenize one command-shaped line, retaining common shell separators."""
+    try:
+        lexer = shlex.shlex(text, posix=True, punctuation_chars=";&|()")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        return list(lexer)
+    except ValueError:
+        return re.findall(r"[A-Za-z0-9_@./:=+\-]+|[;&|()]+", text)
+
+
+def _is_systemctl_token(token: str) -> bool:
+    return token.rsplit("/", 1)[-1].casefold() == "systemctl"
+
+
+def _is_gateway_systemd_unit(token: str) -> bool:
+    normalized = token.strip("'\"`$,:")
+    normalized = normalized.rsplit("/", 1)[-1]
+    return bool(_SYSTEMCTL_GATEWAY_UNIT_RE.fullmatch(normalized))
+
+
+def _systemctl_tokens_target_gateway_lifecycle(tokens: list[str]) -> bool:
+    for index, token in enumerate(tokens):
+        if not _is_systemctl_token(token):
+            continue
+        invocation: list[str] = []
+        for candidate in tokens[index + 1 :]:
+            if candidate and set(candidate) <= _SYSTEMCTL_SHELL_SEPARATORS:
+                break
+            invocation.append(candidate)
+        normalized = {candidate.casefold() for candidate in invocation}
+        if not any(_is_gateway_systemd_unit(candidate) for candidate in invocation):
+            continue
+        if normalized & _SYSTEMCTL_ALWAYS_BLOCKED_ACTIONS:
+            return True
+        if normalized & _SYSTEMCTL_NOW_BLOCKED_ACTIONS and "--now" in normalized:
+            return True
+    return False
+
+
+def _contains_systemctl_gateway_lifecycle(text: str) -> bool:
+    """Scan systemctl invocations with token/quote/option normalization."""
+    normalized_text = _SHELL_LINE_CONTINUATION.sub(" ", text)
+    for line in normalized_text.splitlines() or [normalized_text]:
+        tokens = _systemctl_shellish_tokens(line)
+        if _systemctl_tokens_target_gateway_lifecycle(tokens):
+            return True
+        for token in tokens:
+            if "systemctl" not in token.casefold() or not any(
+                char.isspace() for char in token
+            ):
+                continue
+            nested = _systemctl_shellish_tokens(token)
+            if nested != [token] and _systemctl_tokens_target_gateway_lifecycle(nested):
+                return True
+    if "\n" in normalized_text:
+        for token in _systemctl_shellish_tokens(normalized_text):
+            if "\n" not in token or "systemctl" not in token.casefold():
+                continue
+            nested = _systemctl_shellish_tokens(token)
+            if nested != [token] and _systemctl_tokens_target_gateway_lifecycle(nested):
+                return True
+    return False
+
+
+def _strip_leading_full_line_shell_comments(text: str) -> str:
+    """Remove only inert leading shell comments, preserving later shell text."""
+    lines = text.splitlines(keepends=True)
+    first_executable = 0
+    while first_executable < len(lines):
+        stripped = lines[first_executable].lstrip()
+        if not stripped.strip() or stripped.startswith("#"):
+            first_executable += 1
+            continue
+        break
+    return "".join(lines[first_executable:])
+
+
+def contains_gateway_lifecycle_command(
+    text: str,
+    *,
+    ignore_full_line_shell_comments: bool = False,
+) -> bool:
     """Return True if *text* contains a gateway lifecycle command pattern."""
     if not text:
         return False
+    if ignore_full_line_shell_comments:
+        text = _strip_leading_full_line_shell_comments(text)
     normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
-    return bool(_GATEWAY_LIFECYCLE_PATTERN.search(normalized))
+    return bool(
+        _GATEWAY_LIFECYCLE_PATTERN.search(normalized)
+        or _contains_systemctl_gateway_lifecycle(normalized)
+    )
 
 
 _SHELL_EXECUTABLES = frozenset({"sh", "bash", "dash", "ksh", "zsh"})
@@ -147,6 +256,42 @@ def _command_token_index(segment: list[str]) -> Optional[int]:
             continue
         return index
     return None
+
+
+def is_direct_canonical_restart_helper_command(
+    command: str,
+    *,
+    script_path: str | Path,
+    cwd: Optional[str] = None,
+) -> bool:
+    """Allow only one direct invocation of the trusted restart entrypoint.
+
+    The command may contain inert leading call-shot comments, but no environment
+    assignments, shell wrapper, control operator, redirection, or internal
+    worker arguments. Only the normal restart and read-only ``--dry-run`` modes
+    are part of this narrow gateway exception.
+    """
+    segments = list(_iter_command_segments(command))
+    if len(segments) != 1:
+        return False
+    segment = segments[0]
+    index = _command_token_index(segment)
+    if index != 0:
+        return False
+    arguments = segment[1:]
+    if arguments not in ([], ["--dry-run"]):
+        return False
+
+    candidate = _resolve_terminal_script_path(segment[0], cwd)
+    canonical = Path(script_path).expanduser()
+    try:
+        return (
+            candidate.is_file()
+            and canonical.is_file()
+            and candidate.resolve(strict=True) == canonical.resolve(strict=True)
+        )
+    except OSError:
+        return False
 
 
 def contains_launchctl_submit_command(command: str) -> bool:
@@ -292,10 +437,12 @@ def _contains_unsafe_gateway_action(
     depth: int,
     visited: set[Path],
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
+    ignore_full_line_shell_comments: bool = False,
 ) -> bool:
-    if contains_gateway_lifecycle_command(command) or contains_launchctl_submit_command(
-        command
-    ):
+    if contains_gateway_lifecycle_command(
+        command,
+        ignore_full_line_shell_comments=ignore_full_line_shell_comments,
+    ) or contains_launchctl_submit_command(command):
         return True
     if depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
         return True
@@ -307,6 +454,7 @@ def _contains_unsafe_gateway_action(
             depth=depth + 1,
             visited=visited,
             read_remote_script=read_remote_script,
+            ignore_full_line_shell_comments=ignore_full_line_shell_comments,
         ):
             return True
 
@@ -338,6 +486,7 @@ def _contains_unsafe_gateway_action(
             depth=depth + 1,
             visited=visited,
             read_remote_script=read_remote_script,
+            ignore_full_line_shell_comments=ignore_full_line_shell_comments,
         ):
             return True
     return False
@@ -348,6 +497,7 @@ def contains_gateway_lifecycle_command_or_referenced_script(
     *,
     cwd: Optional[str] = None,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
+    ignore_full_line_shell_comments: bool = False,
 ) -> bool:
     """Detect lifecycle/submit commands, including bounded nested scripts."""
     return _contains_unsafe_gateway_action(
@@ -356,6 +506,7 @@ def contains_gateway_lifecycle_command_or_referenced_script(
         depth=0,
         visited=set(),
         read_remote_script=read_remote_script,
+        ignore_full_line_shell_comments=ignore_full_line_shell_comments,
     )
 
 

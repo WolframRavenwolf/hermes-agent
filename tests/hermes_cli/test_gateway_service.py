@@ -1003,6 +1003,42 @@ class TestLaunchdServiceRecovery:
         assert "PID 88888" in out
         assert "NOT available" in out
 
+    @pytest.mark.parametrize(
+        ("subcmd", "forbidden"),
+        [("stop", "launchd_stop"), ("restart", "launchd_restart")],
+    )
+    def test_gateway_stop_restart_refuse_gateway_tree_even_without_env_marker(
+        self, tmp_path, monkeypatch, capsys, subcmd, forbidden
+    ):
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text(gateway_cli.generate_launchd_plist(), encoding="utf-8")
+
+        monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(
+            gateway_cli, "_is_running_inside_gateway_process_tree", lambda: True
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            forbidden,
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError(f"{forbidden} must not run from the gateway process tree")
+            ),
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            gateway_cli._gateway_command_inner(
+                SimpleNamespace(gateway_command=subcmd, all=False, system=False)
+            )
+
+        assert exc.value.code == 1
+        output = capsys.readouterr()
+        combined = output.err + output.out
+        assert "inside the gateway process tree" in combined
+        assert "external shell" in combined
+
 
 class TestLaunchdDomainDetection:
     """Regression tests for _launchd_domain() probing (#40831).
