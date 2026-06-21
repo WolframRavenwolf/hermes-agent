@@ -1,5 +1,6 @@
 """Tests for the Raft channel adapter."""
 
+import logging
 import os
 from unittest.mock import AsyncMock, patch
 
@@ -8,6 +9,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import Platform, PlatformConfig
+from plugins.platforms.raft import adapter as raft_adapter
 from plugins.platforms.raft.adapter import (
     ACTIVITY_DRAIN_SCHEMA,
     ACTIVITY_EVENT_SCHEMA,
@@ -407,6 +409,52 @@ class TestRaftActivityHttp:
 
 
 class TestRaftConfig:
+    def test_check_requirements_keeps_missing_cli_quiet_without_raft_opt_in(
+        self, monkeypatch, caplog
+    ):
+        monkeypatch.delenv("RAFT_PROFILE", raising=False)
+        monkeypatch.setattr(raft_adapter, "AIOHTTP_AVAILABLE", True)
+        monkeypatch.setattr(raft_adapter.shutil, "which", lambda name: None)
+        monkeypatch.setattr(
+            "hermes_cli.config.read_raw_config",
+            lambda: {"platforms": {"raft": {"extra": {"enabled": False}}}},
+        )
+        caplog.set_level(logging.DEBUG, logger=raft_adapter.logger.name)
+
+        assert check_raft_requirements() is False
+
+        assert "raft CLI not found" not in caplog.text
+        assert "raft CLI unavailable" in caplog.text
+
+    def test_check_requirements_warns_missing_cli_when_profile_is_set(
+        self, monkeypatch, caplog
+    ):
+        monkeypatch.setenv("RAFT_PROFILE", "dev")
+        monkeypatch.setattr(raft_adapter, "AIOHTTP_AVAILABLE", True)
+        monkeypatch.setattr(raft_adapter.shutil, "which", lambda name: None)
+        monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: {})
+        caplog.set_level(logging.WARNING, logger=raft_adapter.logger.name)
+
+        assert check_raft_requirements() is False
+
+        assert "raft CLI not found" in caplog.text
+
+    def test_check_requirements_warns_missing_cli_when_config_explicitly_enabled(
+        self, monkeypatch, caplog
+    ):
+        monkeypatch.delenv("RAFT_PROFILE", raising=False)
+        monkeypatch.setattr(raft_adapter, "AIOHTTP_AVAILABLE", True)
+        monkeypatch.setattr(raft_adapter.shutil, "which", lambda name: None)
+        monkeypatch.setattr(
+            "hermes_cli.config.read_raw_config",
+            lambda: {"platforms": {"raft": {"extra": {"enabled": True}}}},
+        )
+        caplog.set_level(logging.WARNING, logger=raft_adapter.logger.name)
+
+        assert check_raft_requirements() is False
+
+        assert "raft CLI not found" in caplog.text
+
     def test_env_enablement_auto_enables_with_raft_profile(self, monkeypatch):
         monkeypatch.setenv("RAFT_PROFILE", "my-agent")
 

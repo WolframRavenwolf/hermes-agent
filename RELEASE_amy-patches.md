@@ -87,6 +87,36 @@ These old local patches are no longer carried in the current stack because Herme
 
 ---
 
+## 2026-06-21 - Raft Optional-Platform Log Quieting
+
+**Problem:** Bundled plugin-platform inventory calls each plugin entry's
+`check_fn()` from gateway config/status code. The Raft adapter treated a missing
+`raft` CLI as a warning even when Raft was not configured or enabled, so normal
+Hermes starts/status checks could write `[raft] raft CLI not found` into gateway
+error logs for an unused optional feature.
+
+**Solution:** `check_raft_requirements()` now distinguishes explicit Raft opt-in
+from passive plugin discovery. Missing `aiohttp` or `raft` remains a warning when
+`RAFT_PROFILE` is set or `platforms.raft.extra.enabled` is explicitly truthy in
+`config.yaml`; otherwise the unavailable optional dependency is logged at debug
+level only.
+
+**Affected files:**
+
+- `plugins/platforms/raft/adapter.py`
+- `tests/gateway/test_raft_adapter.py`
+- `RELEASE_amy-patches.md`
+
+**Verification:**
+
+- RED: `tests/gateway/test_raft_adapter.py::TestRaftConfig::test_check_requirements_keeps_missing_cli_quiet_without_raft_opt_in` failed because the old check logged `raft CLI not found` at warning level.
+- GREEN: new Raft check_fn regression tests passed (`3 passed`).
+- Targeted module: `tests/gateway/test_raft_adapter.py` -> `19 passed`.
+
+**Session reference:** 2026-06-21 Mattermost follow-up: optional Raft feature was screaming like a dying goat in `gateway.error.log` despite no Raft use.
+
+---
+
 ## 2026-06-21 - Gateway Self-Management Guard Hardening
 
 **Problem:** The stop/restart safety guard only checked the `_HERMES_GATEWAY`

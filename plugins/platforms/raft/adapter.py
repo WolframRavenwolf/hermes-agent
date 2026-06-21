@@ -97,13 +97,54 @@ _RAFT_TURN_IDS: set[str] = set()
 _RAFT_PROMPT_TURN_IDS: set[str] = set()
 
 
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
+def _raft_config_explicitly_enabled() -> bool:
+    """Return True when config.yaml explicitly opts Raft into dependency checks."""
+    try:
+        from hermes_cli.config import read_raw_config
+
+        raw = read_raw_config()
+    except Exception:
+        return False
+    if not isinstance(raw, dict):
+        return False
+    platforms = raw.get("platforms")
+    if not isinstance(platforms, dict):
+        return False
+    raft_cfg = platforms.get("raft")
+    if not isinstance(raft_cfg, dict):
+        return False
+    extra = raft_cfg.get("extra")
+    if not isinstance(extra, dict):
+        return False
+    return _truthy(extra.get("enabled"))
+
+
+def _raft_explicitly_opted_in() -> bool:
+    return bool(os.getenv("RAFT_PROFILE", "").strip()) or _raft_config_explicitly_enabled()
+
+
 def check_raft_requirements() -> bool:
     """Check if Raft channel dependencies are available."""
+    opted_in = _raft_explicitly_opted_in()
     if not AIOHTTP_AVAILABLE:
-        logger.warning("[raft] aiohttp is not installed — install with: pip install aiohttp")
+        if opted_in:
+            logger.warning("[raft] aiohttp is not installed — install with: pip install aiohttp")
+        else:
+            logger.debug("[raft] aiohttp unavailable (optional platform not configured)")
         return False
     if not shutil.which("raft"):
-        logger.warning("[raft] raft CLI not found in PATH — install from https://raft.build")
+        if opted_in:
+            logger.warning("[raft] raft CLI not found in PATH — install from https://raft.build")
+        else:
+            logger.debug("[raft] raft CLI unavailable (optional platform not configured)")
         return False
     return True
 
