@@ -5,7 +5,7 @@ from argparse import Namespace
 import pytest
 
 from cron.jobs import create_job, get_job, list_jobs
-from hermes_cli.cron import cron_command
+from hermes_cli.cron import cron_command, _contains_gateway_lifecycle_command
 
 
 @pytest.fixture()
@@ -121,3 +121,38 @@ class TestCronCommandLifecycle:
 
         out = capsys.readouterr().out
         assert "Repeat:    ∞" in out
+
+
+class TestGatewayLifecycleDetection:
+    def test_shell_comment_does_not_block_canonical_restart_script(self):
+        command = "\n".join(
+            [
+                "# Execute the canonical Hermes gateway restart helper, no ad-hoc runner #",
+                "set -euo pipefail",
+                "/amy/scripts/restart-gateway.sh --dry-run",
+            ]
+        )
+
+        assert _contains_gateway_lifecycle_command(
+            command,
+            ignore_full_line_shell_comments=True,
+        ) is False
+
+    def test_cron_prompt_hash_heading_still_blocks_gateway_lifecycle(self):
+        assert _contains_gateway_lifecycle_command("# hermes gateway restart") is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "hermes gateway restart",
+            "launchctl kickstart -k gui/501/ai.hermes.gateway",
+            "systemctl --user restart hermes-gateway",
+            "pkill -f hermes.*gateway",
+        ],
+    )
+    def test_executable_gateway_lifecycle_commands_stay_blocked(self, command):
+        assert _contains_gateway_lifecycle_command(command) is True
+        assert _contains_gateway_lifecycle_command(
+            command,
+            ignore_full_line_shell_comments=True,
+        ) is True

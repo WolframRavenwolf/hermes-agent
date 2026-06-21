@@ -87,6 +87,55 @@ These old local patches are no longer carried in the current stack because Herme
 
 ---
 
+## 2026-06-21 - Gateway Self-Management Guard Hardening
+
+**Problem:** The stop/restart safety guard only checked the `_HERMES_GATEWAY`
+environment marker. A gateway-hosted tool subprocess could remove that marker
+with `env -u _HERMES_GATEWAY` and still remain inside the live gateway process
+tree, allowing `hermes gateway restart` to SIGTERM the very gateway that was
+running the active agent turn. During the v0.17.0 cutover this left launchd
+unloaded with a stale plist plus reload-pending marker until an external
+operator shell recovered it. Follow-up verification exposed a companion false
+positive: the terminal hard-block reused the cron gateway-lifecycle detector on
+the whole shell input, so Amy's mandatory full-line call-shot comment containing
+"gateway restart" could block the canonical `/amy/scripts/restart-gateway.sh`
+helper even when the executable command itself was safe.
+
+**Solution:** Added a shared self-management guard for `hermes gateway stop` and
+`hermes gateway restart` that refuses both the explicit `_HERMES_GATEWAY=1`
+case and the structural process-tree case detected by
+`_is_running_inside_gateway_process_tree()`. The operator guidance now explicitly
+says to use an external shell and warns not to bypass the guard with
+`env -u _HERMES_GATEWAY`; stale/reload-pending/unloaded launchd repairs should
+be handled with `hermes gateway start` from outside the gateway process tree.
+The shared gateway-lifecycle detector now supports an explicit shell-command mode
+that strips full-line shell comments before matching, so terminal call-shot
+comments do not block the canonical restart helper while executable raw lifecycle
+commands still match and stay blocked. Cron prompts keep the default literal scan
+because they are natural-language task instructions, not shell syntax.
+
+**Affected files:**
+
+- `hermes_cli/gateway.py`
+- `hermes_cli/cron.py`
+- `tools/terminal_tool.py`
+- `tests/hermes_cli/test_gateway_service.py`
+- `tests/hermes_cli/test_cron.py`
+- `RELEASE_amy-patches.md`
+
+**Verification:**
+
+- RED: `tests/hermes_cli/test_gateway_service.py::TestLaunchdServiceRecovery::test_gateway_stop_restart_refuse_gateway_tree_even_without_env_marker` failed before the code change because `launchd_stop()` / `launchd_restart()` still ran.
+- RED follow-up: `tests/hermes_cli/test_cron.py::TestGatewayLifecycleDetection::test_shell_comment_does_not_block_canonical_restart_script` failed because a full-line call-shot comment containing "gateway restart" tripped the lifecycle detector.
+- GREEN: the new gateway tree regression passed after the guard change (`2 passed`).
+- GREEN follow-up: `tests/hermes_cli/test_cron.py::TestGatewayLifecycleDetection` -> `6 passed`.
+- Targeted module: `tests/hermes_cli/test_gateway_service.py` -> `187 passed` before the restart-script detector follow-up.
+- Focused regression after follow-up: `tests/hermes_cli/test_cron.py` -> `10 passed`; `tests/hermes_cli/test_gateway_service.py -k 'refuse_gateway_tree or launchd_stop_waits_for_process_exit'` -> `3 passed, 184 deselected`.
+
+**Session reference:** 2026-06-21 Mattermost Hermes v0.17.0 upgrade post-mortem; Wolfram provided the recovery report after Codex-Amy revived the unloaded gateway.
+
+---
+
 ## 2026-06-21 - Launchd Restart Consumes Deferred Plist Reloads
 
 **Problem:** During an in-gateway launchd plist refresh, Hermes writes a

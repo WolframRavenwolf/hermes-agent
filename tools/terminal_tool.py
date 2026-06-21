@@ -2067,7 +2067,10 @@ def terminal_tool(
         # but applies unconditionally (force=True cannot help here).
         if os.environ.get("_HERMES_GATEWAY") == "1":
             from hermes_cli.cron import _contains_gateway_lifecycle_command
-            if _contains_gateway_lifecycle_command(command):
+            if _contains_gateway_lifecycle_command(
+                command,
+                ignore_full_line_shell_comments=True,
+            ):
                 return json.dumps({
                     "output": "",
                     "exit_code": 1,

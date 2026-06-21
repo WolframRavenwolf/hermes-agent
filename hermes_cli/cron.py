@@ -30,8 +30,35 @@ _GATEWAY_LIFECYCLE_PATTERNS = re.compile(
 )
 
 
-def _contains_gateway_lifecycle_command(text: str) -> bool:
-    """Return True if *text* contains a gateway lifecycle command pattern."""
+def _strip_full_line_shell_comments(text: str) -> str:
+    """Drop shell-style full-line comments before lifecycle matching.
+
+    Gateway lifecycle detection is reused for terminal command strings, where
+    Hermes requires a human-readable call-shot comment before executable shell
+    input.  A comment like ``# run the gateway restart helper`` must not block
+    a safe command such as ``/amy/scripts/restart-gateway.sh --dry-run``.  Only
+    full-line comments are ignored; inline/executable command text remains
+    visible to the lifecycle patterns below.
+    """
+    return "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    )
+
+
+def _contains_gateway_lifecycle_command(
+    text: str,
+    *,
+    ignore_full_line_shell_comments: bool = False,
+) -> bool:
+    """Return True if *text* contains a gateway lifecycle command pattern.
+
+    ``ignore_full_line_shell_comments`` is only for already-shell-shaped command
+    text (for example terminal() input).  Cron prompts are natural-language task
+    instructions, not shell syntax, so callers must leave the default literal
+    scan in place there.
+    """
+    if ignore_full_line_shell_comments:
+        text = _strip_full_line_shell_comments(text)
     return bool(_GATEWAY_LIFECYCLE_PATTERNS.search(text))
 
 
