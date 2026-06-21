@@ -413,10 +413,21 @@ def _compute_tool_definitions(
             elif not quiet_mode:
                 print(f"⚠️  Unknown toolset: {toolset_name}")
     else:
-        # Default: start with everything
+        # Default: include every toolset except those that explicitly opt out
+        # via generic ``default_off`` metadata.  Subtract the resolved tools of
+        # default-off toolsets after collecting the rest so a broad composite
+        # cannot accidentally re-introduce them.  Explicit enabled_toolsets
+        # (including composites / ``all``) remain an intentional opt-in.
         from toolsets import get_all_toolsets
-        for ts_name in get_all_toolsets():
-            tools_to_include.update(resolve_toolset(ts_name))
+        all_toolsets = get_all_toolsets()
+        default_off_tools: set = set()
+        for ts_name, toolset in all_toolsets.items():
+            resolved = resolve_toolset(ts_name)
+            if toolset.get("default_off"):
+                default_off_tools.update(resolved)
+            else:
+                tools_to_include.update(resolved)
+        tools_to_include.difference_update(default_off_tools)
 
     # Always apply disabled toolsets as a subtraction step at the end.
     # This ensures that even if a composite toolset (like hermes-cli)

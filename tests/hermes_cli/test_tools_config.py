@@ -72,12 +72,37 @@ def test_partially_valid_platform_toolsets_no_runtime_warning(caplog):
     assert not any("#38798" in r.getMessage() for r in caplog.records)
 
 
+def test_messaging_toolset_is_configurable_but_default_off():
+    assert any(ts_key == "messaging" for ts_key, _, _ in CONFIGURABLE_TOOLSETS)
+    assert "messaging" in _DEFAULT_OFF_TOOLSETS
+
+    default_enabled = _get_platform_tools(
+        {}, "mattermost", include_default_mcp_servers=False
+    )
+    assert "messaging" not in default_enabled
+
+    explicit_enabled = _get_platform_tools(
+        {
+            "platform_toolsets": {
+                "mattermost": ["hermes-mattermost", "messaging"]
+            }
+        },
+        "mattermost",
+        include_default_mcp_servers=False,
+    )
+    assert "messaging" in explicit_enabled
 
 
+def test_save_platform_tools_preserves_messaging_opt_in(monkeypatch):
+    saved = {}
+    monkeypatch.setattr(
+        "hermes_cli.tools_config.save_config", lambda config: saved.update(config)
+    )
 
+    config = {"platform_toolsets": {}}
+    _save_platform_tools(config, "mattermost", {"web", "messaging"})
 
-
-
+    assert "messaging" in saved["platform_toolsets"]["mattermost"]
 
 
 def test_get_platform_tools_homeassistant_toolset_enabled_for_cron_when_hass_token_set(monkeypatch):

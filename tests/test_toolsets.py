@@ -57,6 +57,46 @@ class TestGetToolset:
 
 
 
+class TestDefaultOffToolsets:
+    def test_messaging_declares_generic_default_off_metadata(self):
+        messaging = get_toolset("messaging")
+
+        assert messaging is not None
+        assert messaging["default_off"] is True
+
+    def test_default_all_excludes_messaging_but_explicit_opt_in_includes_it(
+        self, monkeypatch
+    ):
+        from model_tools import _clear_tool_defs_cache, get_tool_definitions
+        from tools.registry import invalidate_check_fn_cache, registry
+
+        send_message = registry.get_entry("send_message")
+        assert send_message is not None
+        monkeypatch.setattr(send_message, "check_fn", lambda: True)
+        invalidate_check_fn_cache()
+        _clear_tool_defs_cache()
+
+        default_names = {
+            item["function"]["name"]
+            for item in get_tool_definitions(
+                enabled_toolsets=None,
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+            )
+        }
+        explicit_names = {
+            item["function"]["name"]
+            for item in get_tool_definitions(
+                enabled_toolsets=["messaging"],
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+            )
+        }
+
+        assert "send_message" not in default_names
+        assert "send_message" in explicit_names
+
+
 class TestResolveToolset:
     def test_leaf_toolset(self):
         tools = resolve_toolset("web")

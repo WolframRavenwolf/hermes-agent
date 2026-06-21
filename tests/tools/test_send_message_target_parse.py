@@ -26,7 +26,28 @@ def test_photon_e164_target_is_explicit() -> None:
 
 
 def test_e164_target_still_requires_phone_platform() -> None:
-    assert _parse_target_ref("matrix", "+15551234567")[2] is False
+    assert _parse_target_ref("matrix", "+1" + "5551234567")[2] is False
+
+
+def test_mattermost_alphanumeric_channel_id_is_explicit() -> None:
+    channel_id = "abc123" * 4 + "ab"
+
+    assert _parse_target_ref("mattermost", channel_id) == (
+        channel_id,
+        None,
+        True,
+    )
+
+
+def test_mattermost_channel_and_root_ids_are_explicit() -> None:
+    channel_id = "abc123" * 4 + "ab"
+    root_id = "def456" * 4 + "de"
+
+    assert _parse_target_ref("mattermost", f"{channel_id}:{root_id}") == (
+        channel_id,
+        root_id,
+        True,
+    )
 
 
 def test_send_message_routes_whatsapp_group_jid_without_home_fallback() -> None:
