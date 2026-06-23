@@ -1,7 +1,7 @@
 # Amy's Patches - Changelog (Branch: amy/patches)
 
 **Current base:** Hermes Agent v2026.6.19
-**Current patch stack:** 21 local Amy patches on Hermes Agent v2026.6.19 after v0.17.0 rebase, gateway self-management hardening, restart-script detector comment fix, and Raft optional-platform log quieting
+**Current patch stack:** 22 local Amy patches on Hermes Agent v2026.6.19 after v0.17.0 rebase, gateway self-management hardening, restart-script detector comment fix, Raft optional-platform log quieting, and auxiliary vision fallback parity
 **Current reconciliation reviewed through:** v0.17.0 rebase/verification on 2026-06-21 plus post-restart stack classification on 2026-06-22; upstream-absorbed patches dropped, Amy-private patches retained
 **Author:** Amy Ravenwolf <amy@ravenwolf.de>
 
@@ -14,10 +14,10 @@
 Counted from the release base, not by diffing against a moving upstream branch or an unsynced fork branch. Fork `main` is supposed to match the release version that `amy/patches` is based on; it may intentionally lag current `upstream/main` between upgrades.
 
 - Current base: `v2026.6.19`
-- Current stack: `21` patches on `amy/patches`
+- Current stack: `22` patches on `amy/patches`
 - Pre-v0.17 backup for comparison: `amy/patches-backup-v2026.6.19-20260621-140428`
 - Pre-v0.17 stack: `32` patches on `v2026.6.5`
-- Exact patch-id absorption check against current `upstream/main`: all 21 current patches show `+`, so none are exact patch-id matches on upstream `main`; semantic absorption still has to be judged by workflow/code inspection.
+- Exact patch-id absorption check against current `upstream/main`: all 22 current patches show `+`, so none are exact patch-id matches on upstream `main`; semantic absorption still has to be judged by workflow/code inspection.
 
 ### Dropped During the v0.17 Rebase
 
@@ -51,8 +51,9 @@ These old local patches are no longer carried in the current stack because Herme
 | `2e4db11d1` | `test(auxiliary): make codex timeout check deterministic` | New upstream-worthy test flake fix. |
 | `f1abee591` | `fix(gateway): harden self-management guard` | New upstream-worthy gateway safety fix, including restart-helper detector follow-up. |
 | `ee2c36ff3` | `fix(raft): quiet optional dependency checks` | New upstream-worthy optional-plugin noise fix; likely droppable after a release containing upstream's equivalent Raft quieting. |
+| `this commit` | `fix(auxiliary): preserve auto fallback policy for vision calls` | New upstream-worthy auxiliary fallback parity fix; keeps image analysis on `fallback_providers` when the auto-selected main provider is exhausted. |
 
-### Current 21-Patch Stack
+### Current 22-Patch Stack
 
 | Commit | Subject | Current classification |
 |---|---|---|
@@ -77,6 +78,7 @@ These old local patches are no longer carried in the current stack because Herme
 | `2e4db11d1` | `test(auxiliary): make codex timeout check deterministic` | Upstream-worthy test flake fix; no upstream PR yet. |
 | `f1abee591` | `fix(gateway): harden self-management guard` | Upstream-worthy safety fix; no upstream PR yet. |
 | `ee2c36ff3` | `fix(raft): quiet optional dependency checks` | Semantically likely superseded on upstream `main`, but locally needed against `v2026.6.19`; probably droppable next release. |
+| `this commit` | `fix(auxiliary): preserve auto fallback policy for vision calls` | Upstream-worthy and locally needed while Codex Pro quota can exhaust; keeps auto vision tasks on top-level fallback policy. |
 
 ### Push/Upgrade Implications
 
@@ -84,6 +86,40 @@ These old local patches are no longer carried in the current stack because Herme
 - Rebased patch-stack pushes require `--force-with-lease`; after the 2026-06-22 push, `origin/amy/patches` matched local `amy/patches`.
 - Future rebase watchpoints: MoA redesign, GPT fast-mode routing, dependency pins, Raft quieting, and macOS launchd/app-wrapper split.
 - Private patches to preserve across future upgrades: Amy platform hints, private patch docs, and explicit `send_message` messaging toolset unless Wolfram changes the policy.
+
+---
+
+## 2026-06-23 - Auxiliary Vision Auto Fallback Parity
+
+**Problem:** `auxiliary.vision.provider: auto` resolved the concrete vision client
+first, then stored that concrete provider (`openai-codex`) as the request's
+provider for error handling. When the main provider hit a 429 subscription usage
+limit, the fallback gate treated the call as an explicit `openai-codex` aux
+provider instead of an `auto` aux task, so it skipped the top-level
+`fallback_providers` chain. Text auxiliary tasks such as compression already kept
+`resolved_provider == "auto"` through the same fallback layer and could use the
+main fallback chain.
+
+**Solution:** `call_llm()` and `async_call_llm()` now remember whether the user's
+auxiliary selection policy was `auto` before vision resolution substitutes a
+concrete backend. Capacity/rate-limit fallback decisions use that remembered
+policy, while fallback logging and skip logic still receive the actual failed
+provider label. Auto vision calls now try task fallback, then top-level
+`fallback_providers`, before the built-in aux discovery chain, matching text aux
+fallback layering.
+
+**Affected files:**
+
+- `agent/auxiliary_client.py`
+- `tests/agent/test_auxiliary_client.py`
+- `RELEASE_amy-patches.md`
+
+**Verification:**
+
+- RED: `tests/agent/test_auxiliary_client.py::TestAuxiliaryFallbackLayering::test_auto_vision_failure_uses_top_level_main_fallback_chain` and `::test_async_auto_vision_failure_uses_top_level_main_fallback_chain` failed because the first Codex 429 was re-raised and `_try_main_fallback_chain()` was never called.
+- GREEN: the new sync and async vision auto fallback regressions passed (`2 passed`).
+
+**Session reference:** 2026-06-23 Mattermost thread after Codex Pro quota exhaustion; Wolfram added an OpenAI API fallback and asked that images and context compression use the general fallback instead of permanent aux pinning.
 
 ---
 

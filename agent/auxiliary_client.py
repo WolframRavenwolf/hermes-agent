@@ -5231,6 +5231,11 @@ def call_llm(
     """
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
+    fallback_policy_is_auto = resolved_provider in {"auto", "", None}
+    # Keep the user's selection policy separate from the concrete backend.
+    # Vision auto-resolution may return the main provider (e.g. openai-codex),
+    # but failures from that selected backend should still follow the auto
+    # fallback layers, including top-level fallback_providers.
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
 
@@ -5589,7 +5594,7 @@ def call_llm(
         # connection failures are capacity problems, not request constraints.
         # See #26803: daily token quota (429 + "too many tokens per day") must
         # fall back just like a 402 credit error.
-        is_auto = resolved_provider in {"auto", "", None}
+        is_auto = fallback_policy_is_auto
         # Capacity errors bypass the explicit-provider gate: the provider
         # literally cannot serve this request regardless of user intent.
         is_capacity_error = _is_payment_error(first_err) or _is_connection_error(first_err)
@@ -5740,6 +5745,11 @@ async def async_call_llm(
     """
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
+    fallback_policy_is_auto = resolved_provider in {"auto", "", None}
+    # Keep the user's selection policy separate from the concrete backend.
+    # Vision auto-resolution may return the main provider (e.g. openai-codex),
+    # but failures from that selected backend should still follow the auto
+    # fallback layers, including top-level fallback_providers.
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
 
@@ -6038,7 +6048,7 @@ async def async_call_llm(
         # Capacity errors (payment/quota/connection) bypass the explicit-provider
         # gate — the provider cannot serve the request regardless of user intent.
         # See #26803: daily token quota must fall back like a 402 credit error.
-        is_auto = resolved_provider in {"auto", "", None}
+        is_auto = fallback_policy_is_auto
         is_capacity_error = _is_payment_error(first_err) or _is_connection_error(first_err)
         if should_fallback and (is_auto or is_capacity_error):
             if _is_payment_error(first_err):
