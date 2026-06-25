@@ -8,9 +8,10 @@ fetches models automatically.
 The endpoint also accepts an optional ``openai-project`` header (``team/project``)
 for usage attribution. It is only required for accounts whose default project
 lacks Inference access. Because the value is per-user we do not ship a static
-``default_headers`` for it; users that need it supply it via
-``model.default_headers`` in ``config.yaml`` (see the provider docs), which
-``_apply_user_default_headers`` merges onto both the main and auxiliary clients.
+``default_headers`` for it; users that need it should supply it via
+``model.provider_headers.coreweave`` in ``config.yaml`` (see the provider docs)
+so the project attribution header is sent only to CoreWeave and not leaked to
+unrelated OpenAI-compatible providers.
 """
 
 from providers import register_provider

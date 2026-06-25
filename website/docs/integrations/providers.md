@@ -512,14 +512,18 @@ model:
 Get your API key at [wandb.ai/settings](https://wandb.ai/settings) (CoreWeave Inference keys are still issued there). The base URL can be overridden with `COREWEAVE_BASE_URL` (default: `https://api.inference.wandb.ai/v1`).
 
 :::note Project attribution header
-Most accounts work as-is. Accounts whose default project lacks Inference access must supply the `openai-project` header (`team/project`) — add it under `model.default_headers` in `config.yaml`:
+Most accounts work as-is. Accounts whose default project lacks Inference access must supply the `openai-project` header (`team/project`) — add it under `model.provider_headers.coreweave` in `config.yaml`:
 
 ```yaml
 model:
   provider: "coreweave"
-  default_headers:
-    openai-project: "your-team/your-project"
+  default: "meta-llama/Llama-3.3-70B-Instruct"
+  provider_headers:
+    coreweave:
+      openai-project: "your-team/your-project"
 ```
+
+Keep `openai-project` provider-scoped instead of putting it in `model.default_headers`; it is CoreWeave-specific attribution/billing metadata and should not be sent to unrelated OpenAI-compatible providers.
 :::
 
 ### StepFun
