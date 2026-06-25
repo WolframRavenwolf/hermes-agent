@@ -1,7 +1,7 @@
 # Amy's Patches - Changelog (Branch: amy/patches)
 
 **Current base:** Hermes Agent v2026.6.19
-**Current patch stack:** 22 local Amy patches on Hermes Agent v2026.6.19 after v0.17.0 rebase, gateway self-management hardening, restart-script detector comment fix, Raft optional-platform log quieting, and auxiliary vision fallback parity
+**Current patch stack:** 24 local Amy patches on Hermes Agent v2026.6.19 after v0.17.0 rebase, gateway self-management hardening, restart-script detector comment fix, Raft optional-platform log quieting, auxiliary vision fallback parity, and generic provider-profile/provider-scoped-header plumbing
 **Current reconciliation reviewed through:** v0.17.0 rebase/verification on 2026-06-21 plus post-restart stack classification on 2026-06-22; upstream-absorbed patches dropped, Amy-private patches retained
 **Author:** Amy Ravenwolf <amy@ravenwolf.de>
 
@@ -14,10 +14,10 @@
 Counted from the release base, not by diffing against a moving upstream branch or an unsynced fork branch. Fork `main` is supposed to match the release version that `amy/patches` is based on; it may intentionally lag current `upstream/main` between upgrades.
 
 - Current base: `v2026.6.19`
-- Current stack: `22` patches on `amy/patches`
+- Current stack: `24` patches on `amy/patches`
 - Pre-v0.17 backup for comparison: `amy/patches-backup-v2026.6.19-20260621-140428`
 - Pre-v0.17 stack: `32` patches on `v2026.6.5`
-- Exact patch-id absorption check against current `upstream/main`: all 22 current patches show `+`, so none are exact patch-id matches on upstream `main`; semantic absorption still has to be judged by workflow/code inspection.
+- Exact patch-id absorption check against current `upstream/main`: all 24 current patches show `+`, so none are exact patch-id matches on upstream `main`; semantic absorption still has to be judged by workflow/code inspection.
 
 ### Dropped During the v0.17 Rebase
 
@@ -52,8 +52,10 @@ These old local patches are no longer carried in the current stack because Herme
 | `f1abee591` | `fix(gateway): harden self-management guard` | New upstream-worthy gateway safety fix, including restart-helper detector follow-up. |
 | `ee2c36ff3` | `fix(raft): quiet optional dependency checks` | New upstream-worthy optional-plugin noise fix; likely droppable after a release containing upstream's equivalent Raft quieting. |
 | `this commit` | `fix(auxiliary): preserve auto fallback policy for vision calls` | New upstream-worthy auxiliary fallback parity fix; keeps image analysis on `fallback_providers` when the auto-selected main provider is exhausted. |
+| `new` | `fix(providers): resolve ProviderProfile plugins in CLI identity` | New upstream-worthy generic provider identity fix extracted while reviewing CoreWeave PR #44250. |
+| `new` | `feat(providers): support provider-scoped model headers` | New upstream-worthy provider-scoped header plumbing; prevents project/billing/proxy headers from leaking across OpenAI-compatible providers. |
 
-### Current 22-Patch Stack
+### Current 24-Patch Stack
 
 | Commit | Subject | Current classification |
 |---|---|---|
@@ -78,7 +80,9 @@ These old local patches are no longer carried in the current stack because Herme
 | `2e4db11d1` | `test(auxiliary): make codex timeout check deterministic` | Upstream-worthy test flake fix; no upstream PR yet. |
 | `f1abee591` | `fix(gateway): harden self-management guard` | Upstream-worthy safety fix; no upstream PR yet. |
 | `ee2c36ff3` | `fix(raft): quiet optional dependency checks` | Semantically likely superseded on upstream `main`, but locally needed against `v2026.6.19`; probably droppable next release. |
-| `this commit` | `fix(auxiliary): preserve auto fallback policy for vision calls` | Upstream-worthy and locally needed while Codex Pro quota can exhaust; keeps auto vision tasks on top-level fallback policy. |
+| `this commit` | `fix(auxiliary): preserve auto fallback policy for vision calls` | New upstream-worthy auxiliary fallback parity fix; keeps image analysis on `fallback_providers` when the auto-selected main provider is exhausted. |
+| `new` | `fix(providers): resolve ProviderProfile plugins in CLI identity` | New upstream-worthy generic provider identity fix extracted while reviewing CoreWeave PR #44250. |
+| `new` | `feat(providers): support provider-scoped model headers` | New upstream-worthy provider-scoped header plumbing; prevents project/billing/proxy headers from leaking across OpenAI-compatible providers. |
 
 ### Push/Upgrade Implications
 
@@ -120,6 +124,67 @@ fallback layering.
 - GREEN: the new sync and async vision auto fallback regressions passed (`2 passed`).
 
 **Session reference:** 2026-06-23 Mattermost thread after Codex Pro quota exhaustion; Wolfram added an OpenAI API fallback and asked that images and context compression use the general fallback instead of permanent aux pinning.
+
+---
+
+## 2026-06-25 - Generic Provider Profile and Scoped Header Plumbing
+
+**Problem:** Reviewing Juan-Lee Pang's CoreWeave Serverless Inference PR exposed
+two generic Hermes provider-framework gaps. First, declarative `ProviderProfile`
+plugins were not fully visible through the central CLI provider identity and
+model-switch path, so a provider plugin could exist but `/model --provider ...`
+and runtime resolution still lost important identity metadata. Second, provider
+attribution/billing/proxy headers such as project selectors needed a safe
+provider-scoped config path; putting them in `model.default_headers` would leak
+one provider's metadata to unrelated OpenAI-compatible endpoints.
+
+**Solution:** The local stack now carries two upstream-worthy generic commits:
+`fix(providers): resolve ProviderProfile plugins in CLI identity` and
+`feat(providers): support provider-scoped model headers`. ProviderProfile-backed
+providers are normalized through the central provider identity path, and
+`model.provider_headers.<provider>` is merged into main, auxiliary, async
+auxiliary, validation, and live catalog fetch paths without leaking to other
+providers. Header-dependent model catalog caches include configured model headers
+in their fingerprint, and the Ollama Cloud special cache stores the same request
+fingerprint so tenant/project header changes force a refresh.
+
+**Affected files:**
+
+- `hermes_cli/auth.py`
+- `hermes_cli/model_switch.py`
+- `hermes_cli/models.py`
+- `hermes_cli/providers.py`
+- `hermes_cli/runtime_provider.py`
+- `agent/auxiliary_client.py`
+- `providers/base.py`
+- `run_agent.py`
+- `tests/hermes_cli/test_model_switch_custom_providers.py`
+- `tests/hermes_cli/test_provider_scoped_model_headers.py`
+- `tests/agent/test_auxiliary_user_default_headers.py`
+- `tests/run_agent/test_provider_attribution_headers.py`
+- `RELEASE_amy-patches.md`
+
+**Verification:**
+
+- ProviderProfile branch: targeted verification after rebase to current
+  `upstream/main` passed (`217 passed in 39.19s`).
+- Provider-scoped headers branch: initial targeted verification passed
+  (`33 passed, 9 warnings`), Coven review found cache invalidation and direct
+  sync auxiliary path gaps, fixes were folded, and follow-up verification passed
+  (`37 passed, 9 warnings`). The GitHub CI failure in the pre-existing Ollama
+  Cloud stale-cache test was reproduced locally, fixed by tagging helper-created
+  cache entries with the current request fingerprint, and verified with the full
+  Ollama Cloud file plus header suite (`80 passed, 9 warnings`). Devin re-review
+  found additional async conversion paths where the resolved provider was not
+  propagated; those paths were fixed and verified with new regressions plus the
+  same targeted suite (`81 passed, 9 warnings`).
+- Coven follow-up (Brigid) verified both blocker fixes as LGTM.
+- Public author gates for the upstream PR branches and this public patch stack
+  pass with `Wolfram Ravenwolf <github.com@wolfram.ravenwolf.de>`. Amy-authored
+  commits remain confined to private repositories by policy.
+
+**Session reference:** 2026-06-25 Mattermost thread for CoreWeave Serverless
+Inference PR #44250 support and generic provider-framework extraction.
 
 ---
 

@@ -357,33 +357,30 @@ _OR_HEADERS_BASE = {
 _TRUTHY_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
 
 
-def _apply_user_default_headers(headers: dict | None) -> dict | None:
-    """Merge user-configured ``model.default_headers`` onto resolved headers.
+def _apply_user_default_headers(
+    headers: dict | None,
+    *,
+    provider: str | None = None,
+    base_url: str | None = None,
+) -> dict | None:
+    """Merge user-configured ``model`` headers onto resolved headers.
 
-    User values take precedence over provider/SDK defaults, mirroring the main
-    agent client (``AIAgent._apply_user_default_headers``). This lets a
-    ``custom`` OpenAI-compatible endpoint behind a gateway/WAF that rejects the
-    OpenAI SDK's identifying headers (``User-Agent: OpenAI/Python ...``,
-    ``X-Stainless-*``) override them for auxiliary calls too — otherwise the
-    main turn would succeed but title/compression/vision calls to the same
-    endpoint would still fail. (#40033)
-
-    Returns the merged dict, or the original ``headers`` (possibly ``None``)
-    when nothing is configured. No allocation when there are no overrides.
+    ``model.default_headers`` remains the backward-compatible global override.
+    ``model.provider_headers.<provider>`` applies provider-scoped headers (for
+    attribution/billing/proxy routing) only when the active provider or base URL
+    matches, so one OpenAI-compatible provider's metadata does not leak to
+    another.
     """
     try:
-        from hermes_cli.config import cfg_get, load_config
-        user_headers = cfg_get(load_config(), "model", "default_headers")
+        from hermes_cli.providers import merge_configured_provider_headers
+
+        return merge_configured_provider_headers(
+            headers,
+            provider=provider,
+            base_url=base_url,
+        )
     except Exception:
         return headers
-    if not isinstance(user_headers, dict) or not user_headers:
-        return headers
-    merged = dict(headers or {})
-    for key, value in user_headers.items():
-        if value is None:
-            continue
-        merged[str(key)] = str(value)
-    return merged or headers
 
 
 def build_or_headers(or_config: dict | None = None) -> dict:
@@ -1513,7 +1510,11 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
                         extra["default_headers"] = dict(_ph_aux.default_headers)
                 except Exception:
                     pass
-            _merged_aux = _apply_user_default_headers(extra.get("default_headers"))
+            _merged_aux = _apply_user_default_headers(
+                extra.get("default_headers"),
+                provider=provider_id,
+                base_url=base_url,
+            )
             if _merged_aux:
                 extra["default_headers"] = _merged_aux
             _client = OpenAI(api_key=api_key, base_url=base_url, **extra)
@@ -1553,7 +1554,11 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
                     extra["default_headers"] = dict(_ph_aux2.default_headers)
             except Exception:
                 pass
-        _merged_aux2 = _apply_user_default_headers(extra.get("default_headers"))
+        _merged_aux2 = _apply_user_default_headers(
+            extra.get("default_headers"),
+            provider=provider_id,
+            base_url=base_url,
+        )
         if _merged_aux2:
             extra["default_headers"] = _merged_aux2
         _client = OpenAI(api_key=api_key, base_url=base_url, **extra)
@@ -1575,17 +1580,27 @@ def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Op
             _mark_provider_unhealthy("openrouter", ttl=60)
             return None, None
         base_url = _pool_runtime_base_url(entry, OPENROUTER_BASE_URL) or OPENROUTER_BASE_URL
+        headers = _apply_user_default_headers(
+            build_or_headers(),
+            provider="openrouter",
+            base_url=base_url,
+        )
         logger.debug("Auxiliary client: OpenRouter via pool")
         return OpenAI(api_key=or_key, base_url=base_url,
-                       default_headers=build_or_headers()), model or _OPENROUTER_MODEL
+                       default_headers=headers), model or _OPENROUTER_MODEL
 
     or_key = explicit_api_key or os.getenv("OPENROUTER_API_KEY")
     if not or_key:
         _mark_provider_unhealthy("openrouter", ttl=60)
         return None, None
     logger.debug("Auxiliary client: OpenRouter")
+    headers = _apply_user_default_headers(
+        build_or_headers(),
+        provider="openrouter",
+        base_url=OPENROUTER_BASE_URL,
+    )
     return OpenAI(api_key=or_key, base_url=OPENROUTER_BASE_URL,
-                   default_headers=build_or_headers()), model or _OPENROUTER_MODEL
+                   default_headers=headers), model or _OPENROUTER_MODEL
 
 
 def _describe_openrouter_unavailable() -> str:
@@ -1676,10 +1691,19 @@ def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
             _mark_provider_unhealthy("nous", ttl=60)
             return None, None
         base_url = str((nous or {}).get("inference_base_url") or _nous_base_url()).rstrip("/")
+    headers = _apply_user_default_headers(
+        None,
+        provider="nous",
+        base_url=base_url,
+    )
+    extra = {}
+    if headers:
+        extra["default_headers"] = headers
     return (
         OpenAI(
             api_key=api_key,
             base_url=base_url,
+            **extra,
         ),
         model,
     )
@@ -1950,7 +1974,7 @@ def _try_custom_endpoint() -> Tuple[Optional[Any], Optional[str]]:
     # headers (User-Agent: OpenAI/Python ..., X-Stainless-*) on this custom
     # endpoint's auxiliary calls too — matching the main agent client so the
     # whole session reaches a gateway/WAF that rejects the SDK fingerprint. (#40033)
-    _custom_headers = _apply_user_default_headers(None)
+    _custom_headers = _apply_user_default_headers(None, provider="custom", base_url=_clean_base)
     if _custom_headers:
         _extra["default_headers"] = _custom_headers
     if custom_mode == "codex_responses":
@@ -3244,10 +3268,20 @@ def _resolve_single_provider(
     )
     return client
 
-def _resolve_auto(
+def _auto_provider_key(provider: str) -> str:
+    """Normalize logged fallback labels back to provider keys for header lookup."""
+    key = str(provider or "").strip().lower()
+    if key.endswith(")") and "(" in key:
+        key = key.rsplit("(", 1)[1][:-1].strip()
+    if key == "local/custom":
+        return "custom"
+    return key
+
+
+def _resolve_auto_with_provider(
     main_runtime: Optional[Dict[str, Any]] = None,
     task: Optional[str] = None,
-) -> Tuple[Optional[OpenAI], Optional[str]]:
+) -> Tuple[Optional[Any], Optional[str], str]:
     """Full auto-detection chain.
 
     Priority:
@@ -3343,7 +3377,7 @@ def _resolve_auto(
             if client is not None:
                 logger.info("Auxiliary auto-detect: using main provider %s (%s)",
                             main_provider, resolved or main_model)
-                return client, resolved or main_model
+                return client, resolved or main_model, _auto_provider_key(resolved_provider)
 
     # ── Step 2: user-configured fallback policy ─────────────────────────
     # In auto mode, respect the task-specific fallback chain first, then the
@@ -3354,11 +3388,11 @@ def _resolve_auto(
         fb_client, fb_model, _fb_label = _try_configured_fallback_chain(
             task, main_provider or "auto", reason="main provider unavailable")
         if fb_client is not None:
-            return fb_client, fb_model
+            return fb_client, fb_model, _auto_provider_key(_fb_label)
     fb_client, fb_model, _fb_label = _try_main_fallback_chain(
         task, main_provider or "auto", reason="main provider unavailable")
     if fb_client is not None:
-        return fb_client, fb_model
+        return fb_client, fb_model, _auto_provider_key(_fb_label)
 
     # ── Step 3: aggregator / fallback chain ──────────────────────────────
     tried = []
@@ -3374,13 +3408,22 @@ def _resolve_auto(
                             label, model or "default", ", ".join(tried))
             else:
                 logger.info("Auxiliary auto-detect: using %s (%s)", label, model or "default")
-            return client, model
+            return client, model, _auto_provider_key(label)
         tried.append(label)
     logger.warning("Auxiliary auto-detect: no provider available (tried: %s). "
                    "Compression, summarization, and memory flush will not work. "
                    "Set OPENROUTER_API_KEY or configure a local model in config.yaml.",
                    ", ".join(tried))
-    return None, None
+    return None, None, ""
+
+
+def _resolve_auto(
+    main_runtime: Optional[Dict[str, Any]] = None,
+    task: Optional[str] = None,
+) -> Tuple[Optional[Any], Optional[str]]:
+    """Backward-compatible two-value auto resolver."""
+    client, model, _provider = _resolve_auto_with_provider(main_runtime=main_runtime, task=task)
+    return client, model
 
 
 # ── Centralized Provider Router ─────────────────────────────────────────────
@@ -3394,7 +3437,12 @@ def _resolve_auto(
 # below — never look up auth env vars ad-hoc.
 
 
-def _to_async_client(sync_client, model: str, is_vision: bool = False):
+def _to_async_client(
+    sync_client,
+    model: str | None,
+    is_vision: bool = False,
+    provider: str | None = None,
+):
     """Convert a sync client to its async counterpart, preserving Codex routing.
 
     When ``is_vision=True`` and the underlying base URL is Copilot, the
@@ -3453,7 +3501,11 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
                     async_kwargs["default_headers"] = dict(_ph_async.default_headers)
         except Exception:
             pass
-    _merged_async = _apply_user_default_headers(async_kwargs.get("default_headers"))
+    _merged_async = _apply_user_default_headers(
+        async_kwargs.get("default_headers"),
+        provider=provider,
+        base_url=sync_base_url,
+    )
     if _merged_async:
         async_kwargs["default_headers"] = _merged_async
     return AsyncOpenAI(**async_kwargs), model
@@ -3602,7 +3654,10 @@ def resolve_provider_client(
 
     # ── Auto: try all providers in priority order ────────────────────
     if provider == "auto":
-        client, resolved = _resolve_auto(main_runtime=main_runtime, task=task)
+        client, resolved, auto_provider = _resolve_auto_with_provider(
+            main_runtime=main_runtime,
+            task=task,
+        )
         if client is None:
             return None, None
         # When auto-detection lands on a non-OpenRouter provider (e.g. a
@@ -3615,7 +3670,8 @@ def resolve_provider_client(
                 "auxiliary provider (using %r instead)", model, resolved)
             model = None
         final_model = model or resolved
-        return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+        auto_provider = auto_provider or provider
+        return (_to_async_client(client, final_model, is_vision=is_vision, provider=auto_provider) if async_mode
                 else (client, final_model))
 
     # ── OpenRouter ───────────────────────────────────────────
@@ -3628,7 +3684,7 @@ def resolve_provider_client(
             )
             return None, None
         final_model = _normalize_resolved_model(model or default, provider)
-        return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+        return (_to_async_client(client, final_model, is_vision=is_vision, provider=provider) if async_mode
                 else (client, final_model))
 
     # ── Nous Portal (OAuth) ──────────────────────────────────────────
@@ -3645,7 +3701,7 @@ def resolve_provider_client(
                            "but Nous Portal not configured (run: hermes auth)")
             return None, None
         final_model = _normalize_resolved_model(model or default, provider)
-        return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+        return (_to_async_client(client, final_model, is_vision=is_vision, provider=provider) if async_mode
                 else (client, final_model))
 
     # ── OpenAI Codex (OAuth → Responses API) ─────────────────────────
@@ -3679,7 +3735,7 @@ def resolve_provider_client(
                            "but no Codex OAuth token found (run: hermes model)")
             return None, None
         final_model = _normalize_resolved_model(model or default, provider)
-        return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+        return (_to_async_client(client, final_model, is_vision=is_vision, provider=provider) if async_mode
                 else (client, final_model))
 
     # ── xAI Grok OAuth (loopback PKCE → Responses API) ───────────────
@@ -3699,7 +3755,7 @@ def resolve_provider_client(
             )
             return None, None
         final_model = _normalize_resolved_model(model or default, provider)
-        return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+        return (_to_async_client(client, final_model, is_vision=is_vision, provider=provider) if async_mode
                 else (client, final_model))
 
     # ── Custom endpoint (OPENAI_BASE_URL + OPENAI_API_KEY) ───────────
@@ -3744,12 +3800,16 @@ def resolve_provider_client(
                         extra["default_headers"] = dict(_ph_custom.default_headers)
                 except Exception:
                     pass
-            _merged_custom = _apply_user_default_headers(extra.get("default_headers"))
+            _merged_custom = _apply_user_default_headers(
+                extra.get("default_headers"),
+                provider="custom",
+                base_url=_clean_base,
+            )
             if _merged_custom:
                 extra["default_headers"] = _merged_custom
             client = OpenAI(api_key=custom_key, base_url=_clean_base, **extra)
             client = _wrap_if_needed(client, final_model, custom_base, custom_key)
-            return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+            return (_to_async_client(client, final_model, is_vision=is_vision, provider=provider) if async_mode
                     else (client, final_model))
         # Try custom first, then API-key providers (Codex excluded here:
         # falling through to Codex with no model is a stale-constant trap).
@@ -3764,7 +3824,7 @@ def resolve_provider_client(
                 _raw_ckey = getattr(client, "api_key", "")
                 _ckey = "" if (callable(_raw_ckey) and not isinstance(_raw_ckey, str)) else str(_raw_ckey or "")
                 client = _wrap_if_needed(client, final_model, _cbase, _ckey)
-                return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+                return (_to_async_client(client, final_model, is_vision=is_vision, provider=provider) if async_mode
                         else (client, final_model))
         logger.warning("resolve_provider_client: custom/main requested "
                        "but no endpoint credentials found")
@@ -3823,7 +3883,11 @@ def resolve_provider_client(
                     raw_base_for_wrap = custom_base
                 _clean_base2, _dq2 = _extract_url_query_params(openai_base)
                 _extra2 = {"default_query": _dq2} if _dq2 else {}
-                _headers2 = _apply_user_default_headers(_extra2.get("default_headers"))
+                _headers2 = _apply_user_default_headers(
+                    _extra2.get("default_headers"),
+                    provider=provider,
+                    base_url=_clean_base2,
+                )
                 if _headers2:
                     _extra2["default_headers"] = _headers2
                 logger.debug(
@@ -3848,11 +3912,15 @@ def resolve_provider_client(
                         _fallback_base = _to_openai_base_url(custom_base)
                         _fb_clean, _fb_dq = _extract_url_query_params(_fallback_base)
                         _fb_extra = {"default_query": _fb_dq} if _fb_dq else {}
-                        _fb_headers = _apply_user_default_headers(_fb_extra.get("default_headers"))
+                        _fb_headers = _apply_user_default_headers(
+                            _fb_extra.get("default_headers"),
+                            provider=provider,
+                            base_url=_fb_clean,
+                        )
                         if _fb_headers:
                             _fb_extra["default_headers"] = _fb_headers
                         client = OpenAI(api_key=custom_key, base_url=_fb_clean, **_fb_extra)
-                        return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+                        return (_to_async_client(client, final_model, is_vision=is_vision, provider=provider) if async_mode
                                 else (client, final_model))
                     sync_anthropic = AnthropicAuxiliaryClient(
                         real_client, final_model, custom_key, custom_base, is_oauth=False,
@@ -3871,7 +3939,7 @@ def resolve_provider_client(
                     client = CodexAuxiliaryClient(client, final_model)
                 else:
                     client = _wrap_if_needed(client, final_model, raw_base_for_wrap, custom_key)
-                return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+                return (_to_async_client(client, final_model, is_vision=is_vision, provider=provider) if async_mode
                         else (client, final_model))
             logger.warning(
                 "resolve_provider_client: named custom provider %r has no base_url",
@@ -3911,7 +3979,7 @@ def resolve_provider_client(
             )
             return None, None
         final_model = _normalize_resolved_model(model or default_model, provider)
-        return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+        return (_to_async_client(client, final_model, is_vision=is_vision, provider=provider) if async_mode
                 else (client, final_model))
 
     # ── API-key providers from PROVIDER_REGISTRY ─────────────────────
@@ -3937,7 +4005,7 @@ def resolve_provider_client(
                 logger.warning("resolve_provider_client: anthropic requested but no Anthropic credentials found")
                 return None, None
             final_model = _normalize_resolved_model(model or default_model, provider)
-            return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode else (client, final_model))
+            return (_to_async_client(client, final_model, is_vision=is_vision, provider=provider) if async_mode else (client, final_model))
 
         creds = resolve_api_key_provider_credentials(provider)
         api_key = str(creds.get("api_key", "")).strip()
@@ -3973,7 +4041,7 @@ def resolve_provider_client(
             if is_native_gemini_base_url(base_url):
                 client = GeminiNativeClient(api_key=api_key, base_url=base_url)
                 logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
-                return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+                return (_to_async_client(client, final_model, is_vision=is_vision, provider=provider) if async_mode
                         else (client, final_model))
 
         # Provider-specific headers
@@ -3999,7 +4067,11 @@ def resolve_provider_client(
                     headers.update(_ph_main.default_headers)
             except Exception:
                 pass
-        _merged_main = _apply_user_default_headers(headers)
+        _merged_main = _apply_user_default_headers(
+            headers,
+            provider=provider,
+            base_url=base_url,
+        )
         if _merged_main:
             headers = _merged_main
         client = OpenAI(api_key=api_key, base_url=base_url,
@@ -4030,7 +4102,7 @@ def resolve_provider_client(
         client = _wrap_if_needed(client, final_model, raw_base_url, api_key)
 
         logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
-        return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+        return (_to_async_client(client, final_model, is_vision=is_vision, provider=provider) if async_mode
                 else (client, final_model))
 
     if pconfig.auth_type == "external_process":
@@ -4067,7 +4139,7 @@ def resolve_provider_client(
                 args=args,
             )
             logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
-            return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+            return (_to_async_client(client, final_model, is_vision=is_vision, provider=provider) if async_mode
                     else (client, final_model))
         logger.warning("resolve_provider_client: external-process provider %s not "
                        "directly supported", provider)
@@ -4103,7 +4175,7 @@ def resolve_provider_client(
             base_url=f"https://bedrock-runtime.{region}.amazonaws.com",
         )
         logger.debug("resolve_provider_client: bedrock (%s, %s)", final_model, region)
-        return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+        return (_to_async_client(client, final_model, is_vision=is_vision, provider=provider) if async_mode
                 else (client, final_model))
 
     elif pconfig.auth_type in {"oauth_device_code", "oauth_external"}:
@@ -4288,7 +4360,12 @@ def resolve_vision_provider_client(
             return resolved_provider, None, None
         final_model = resolved_model or default_model
         if async_mode:
-            async_client, async_model = _to_async_client(sync_client, final_model, is_vision=True)
+            async_client, async_model = _to_async_client(
+                sync_client,
+                final_model,
+                is_vision=True,
+                provider=resolved_provider,
+            )
             return resolved_provider, async_client, async_model
         return resolved_provider, sync_client, final_model
 
@@ -4548,7 +4625,12 @@ def _refresh_nous_auxiliary_client(
             current_loop = _aio.get_event_loop()
         except RuntimeError:
             pass
-        client, final_model = _to_async_client(sync_client, final_model or "", is_vision=is_vision)
+        client, final_model = _to_async_client(
+            sync_client,
+            final_model or "",
+            is_vision=is_vision,
+            provider="nous",
+        )
     else:
         client = sync_client
 
@@ -6094,7 +6176,10 @@ async def async_call_llm(
                     base_url=str(getattr(fb_client, "base_url", "") or ""))
                 # Convert sync fallback client to async
                 async_fb, async_fb_model = _to_async_client(
-                    fb_client, fb_model or "", is_vision=(task == "vision")
+                    fb_client,
+                    fb_model or "",
+                    is_vision=(task == "vision"),
+                    provider=_auto_provider_key(fb_label or ""),
                 )
                 if async_fb_model and async_fb_model != fb_kwargs.get("model"):
                     fb_kwargs["model"] = async_fb_model
