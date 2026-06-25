@@ -120,8 +120,40 @@ def test_runner_rehydrates_override_after_restart(store_factory):
     assert override["provider"] == "openai"
     assert override["base_url"] == "https://api.openai.example/v1"
     # Credentials come from live resolution, never from disk.
-    assert override["api_key"] == "sk-fresh-from-keychain"
+    assert override["api_key"] == "sk-" + "fresh-from-keychain"
     assert override["api_mode"] == "responses"
+
+
+def test_runner_rehydrate_forwards_persisted_model_to_provider_resolution(store_factory):
+    store = store_factory()
+    entry = store.get_or_create_session(_make_source())
+    session_key = entry.session_key
+    store.set_model_override(
+        session_key,
+        {
+            "model": "deepseek-v4-flash",
+            "provider": "opencode-zen",
+            "base_url": "https://opencode.ai/zen/v1",
+        },
+    )
+
+    runner = _make_runner(store_factory())
+    with patch(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        return_value={
+            "api_key": "opencode-key",
+            "api_mode": "chat_completions",
+            "base_url": "https://opencode.ai/zen/v1",
+            "provider": "opencode-zen",
+        },
+    ) as resolve_runtime_provider:
+        runner._rehydrate_session_model_override(session_key)
+
+    resolve_runtime_provider.assert_called_once_with(
+        requested="opencode-zen",
+        target_model="deepseek-v4-flash",
+    )
+    assert runner._session_model_overrides[session_key]["api_mode"] == "chat_completions"
 
 
 def test_sanitize_model_override():

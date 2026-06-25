@@ -426,6 +426,9 @@ TRANSPORT_TO_API_MODE: Dict[str, str] = {
     "codex_responses": "codex_responses",
     "bedrock_converse": "bedrock_converse",
 }
+API_MODE_TO_TRANSPORT: Dict[str, str] = {
+    api_mode: transport for transport, api_mode in TRANSPORT_TO_API_MODE.items()
+}
 
 
 # -- Helper functions ---------------------------------------------------------
@@ -440,12 +443,42 @@ def normalize_provider(name: str) -> str:
     return ALIASES.get(key, key)
 
 
+def _provider_profile_to_def(profile: Any) -> ProviderDef:
+    """Convert a declarative ProviderProfile into the CLI ProviderDef shape."""
+    env_vars = tuple(str(v) for v in (getattr(profile, "env_vars", ()) or ()))
+    api_key_env_vars = tuple(
+        v for v in env_vars if not v.endswith("_BASE_URL") and not v.endswith("_URL")
+    )
+    base_url_env_var = next(
+        (v for v in env_vars if v.endswith("_BASE_URL") or v.endswith("_URL")),
+        "",
+    )
+    api_mode = str(getattr(profile, "api_mode", "") or "chat_completions")
+    transport = API_MODE_TO_TRANSPORT.get(api_mode, "openai_chat")
+    display_name = str(getattr(profile, "display_name", "") or profile.name)
+    description = str(getattr(profile, "description", "") or "")
+    signup_url = str(getattr(profile, "signup_url", "") or "")
+    return ProviderDef(
+        id=profile.name,
+        name=display_name,
+        transport=transport,
+        api_key_env_vars=api_key_env_vars or env_vars,
+        base_url=str(getattr(profile, "base_url", "") or ""),
+        base_url_env_var=base_url_env_var,
+        is_aggregator=False,
+        auth_type=str(getattr(profile, "auth_type", "api_key") or "api_key"),
+        doc=description or signup_url,
+        source="provider-profile",
+    )
+
+
 def get_provider(name: str, *, allow_network: bool = True) -> Optional[ProviderDef]:
     """Look up a built-in provider by id or alias.
 
     Resolution order:
       1. Hermes overlays (for providers not in models.dev: nous, openai-codex, etc.)
       2. models.dev catalog + Hermes overlay
+      3. locally registered ProviderProfile plugins
 
     User-defined providers from config.yaml (``providers:`` / ``custom_providers:``)
     are resolved by :func:`resolve_provider_full`, which layers ``resolve_user_provider``
@@ -512,6 +545,18 @@ def get_provider(name: str, *, allow_network: bool = True) -> Optional[ProviderD
             auth_type=overlay.auth_type,
             source="hermes",
         )
+
+    try:
+        import providers as provider_registry
+
+        if canonical == "custom":
+            return None
+        get_profile = getattr(provider_registry, "get_provider_profile", None)
+        profile = get_profile(canonical) if get_profile else None
+        if profile is not None:
+            return _provider_profile_to_def(profile)
+    except Exception:
+        pass
 
     return None
 

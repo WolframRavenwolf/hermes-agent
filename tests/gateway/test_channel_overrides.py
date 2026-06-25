@@ -109,6 +109,55 @@ class TestGetSystemPromptForChannel:
 class TestResolveSessionAgentRuntimePriority:
     """Model/runtime priority: session /model → channel_overrides → global."""
 
+    def test_channel_override_forwards_model_to_provider_resolution(self):
+        runner = object.__new__(GatewayRunner)
+        runner._session_model_overrides = {}
+        runner.config = GatewayConfig(
+            platforms={
+                Platform.DISCORD: PlatformConfig(
+                    enabled=True,
+                    channel_overrides={
+                        "chan_1": ChannelOverride(
+                            model="deepseek-v4-flash",
+                            provider="opencode-zen",
+                        ),
+                    },
+                ),
+            },
+        )
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="chan_1",
+            user_id="u1",
+        )
+        with patch(
+            "gateway.run._resolve_gateway_model", return_value="claude-sonnet-4-6"
+        ), patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={
+                "provider": "anthropic",
+                "api_key": "global-key",
+                "base_url": "https://api.anthropic.com",
+                "api_mode": "anthropic_messages",
+            },
+        ), patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value={
+                "provider": "opencode-zen",
+                "api_key": "opencode-key",
+                "base_url": "https://opencode.ai/zen/v1",
+                "api_mode": "chat_completions",
+            },
+        ) as resolve_runtime_provider:
+            model, runtime = runner._resolve_session_agent_runtime(source=source)
+
+        resolve_runtime_provider.assert_called_once_with(
+            requested="opencode-zen",
+            target_model="deepseek-v4-flash",
+        )
+        assert model == "deepseek-v4-flash"
+        assert runtime["api_mode"] == "chat_completions"
+
     def test_channel_override_beats_global(self):
         runner = object.__new__(GatewayRunner)
         runner._session_model_overrides = {}

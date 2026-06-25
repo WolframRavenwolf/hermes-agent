@@ -62,6 +62,195 @@ def _fake_invoke_jwt(ttl_seconds=3600):
     return f"{header}.{payload}.sig"
 
 
+def test_provider_profile_api_mode_wins_over_url_autodetection(monkeypatch):
+    """An explicit profile transport must not be replaced by URL heuristics."""
+    provider = "unit-test-profile-transport"
+    monkeypatch.setattr(rp, "resolve_requested_provider", lambda requested: provider)
+    monkeypatch.setattr(rp, "resolve_provider", lambda *args, **kwargs: provider)
+    monkeypatch.setattr(rp, "_resolve_named_custom_runtime", lambda **kwargs: None)
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {"provider": provider})
+    monkeypatch.setattr(rp, "load_pool", lambda _provider: None)
+    monkeypatch.setitem(
+        rp.PROVIDER_REGISTRY,
+        provider,
+        SimpleNamespace(
+            auth_type="api_key",
+            extra={"api_mode": "anthropic_messages"},
+        ),
+    )
+    monkeypatch.setattr(
+        rp,
+        "resolve_api_key_provider_credentials",
+        lambda _provider: {
+            "api_key": "profile-test-key",
+            "base_url": "https://api.openai.com/v1",
+            "source": "test",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested=provider)
+
+    assert resolved["provider"] == provider
+    assert resolved["api_mode"] == "anthropic_messages"
+    assert resolved["base_url"] == "https://api.openai.com/v1"
+
+
+def test_provider_profile_api_mode_wins_in_credential_pool_path(monkeypatch):
+    provider = "unit-test-profile-pool"
+    entry = SimpleNamespace(
+        runtime_api_key="pool-profile-key",
+        access_token="",
+        runtime_base_url="https://api.openai.com/v1",
+        base_url="https://api.openai.com/v1",
+        source="env",
+    )
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            return entry
+
+    monkeypatch.setattr(rp, "resolve_requested_provider", lambda requested: provider)
+    monkeypatch.setattr(rp, "resolve_provider", lambda *args, **kwargs: provider)
+    monkeypatch.setattr(rp, "_resolve_named_custom_runtime", lambda **kwargs: None)
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {"provider": provider})
+    monkeypatch.setattr(rp, "load_pool", lambda _provider: _Pool())
+    monkeypatch.setitem(
+        rp.PROVIDER_REGISTRY,
+        provider,
+        SimpleNamespace(
+            auth_type="api_key",
+            extra={"api_mode": "anthropic_messages"},
+            inference_base_url="https://api.openai.com/v1",
+        ),
+    )
+
+    resolved = rp.resolve_runtime_provider(requested=provider)
+
+    assert resolved["api_mode"] == "anthropic_messages"
+    assert resolved["source"] == "env"
+    assert resolved["credential_pool"] is not None
+
+
+def test_provider_profile_api_mode_wins_in_explicit_runtime_path(monkeypatch):
+    provider = "unit-test-profile-explicit"
+    monkeypatch.setattr(rp, "resolve_requested_provider", lambda requested: provider)
+    monkeypatch.setattr(rp, "resolve_provider", lambda *args, **kwargs: provider)
+    monkeypatch.setattr(rp, "_resolve_named_custom_runtime", lambda **kwargs: None)
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "different-provider",
+            "api_mode": "codex_responses",
+        },
+    )
+    monkeypatch.setitem(
+        rp.PROVIDER_REGISTRY,
+        provider,
+        SimpleNamespace(
+            auth_type="api_key",
+            extra={"api_mode": "anthropic_messages"},
+            base_url_env_var=None,
+            inference_base_url="https://api.openai.com/v1",
+        ),
+    )
+
+    resolved = rp.resolve_runtime_provider(
+        requested=provider,
+        explicit_api_key="explicit-profile-key",
+        explicit_base_url="https://api.openai.com/v1",
+    )
+
+    assert resolved["api_mode"] == "anthropic_messages"
+    assert resolved["source"] == "explicit"
+
+
+def test_provider_alias_matches_runtime_family_and_configured_proxy(monkeypatch):
+    canonical = "unit-test-profile-canonical"
+    alias = "unit-test-profile-alias"
+    pconfig = SimpleNamespace(
+        id=canonical,
+        auth_type="api_key",
+        extra={"api_mode": "anthropic_messages"},
+        base_url_env_var=None,
+        inference_base_url="https://provider.example/v1",
+    )
+    monkeypatch.setitem(rp.PROVIDER_REGISTRY, canonical, pconfig)
+    monkeypatch.setitem(rp.PROVIDER_REGISTRY, alias, pconfig)
+    monkeypatch.setattr(rp, "resolve_requested_provider", lambda requested: alias)
+    monkeypatch.setattr(rp, "resolve_provider", lambda *args, **kwargs: canonical)
+    monkeypatch.setattr(rp, "_resolve_named_custom_runtime", lambda **kwargs: None)
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": alias,
+            "api_mode": "chat_completions",
+            "base_url": "https://proxy.example/v1",
+        },
+    )
+    monkeypatch.setattr(rp, "load_pool", lambda _provider: None)
+    monkeypatch.setattr(
+        rp,
+        "resolve_api_key_provider_credentials",
+        lambda _provider: {
+            "api_key": "alias-profile-key",
+            "base_url": "https://provider.example/v1",
+            "source": "test",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested=alias)
+
+    assert resolved["provider"] == canonical
+    assert resolved["api_mode"] == "chat_completions"
+    assert resolved["base_url"] == "https://proxy.example/v1"
+
+
+@pytest.mark.parametrize(
+    "target_model, explicit_base_url, expected_mode, expected_base_url",
+    [
+        (
+            "minimax-m2.7",
+            "https://opencode.ai/zen/go/v1",
+            "anthropic_messages",
+            "https://opencode.ai/zen/go",
+        ),
+        (
+            "deepseek-v4-flash",
+            "https://opencode.ai/zen/go",
+            "chat_completions",
+            "https://opencode.ai/zen/go/v1",
+        ),
+    ],
+)
+def test_explicit_opencode_go_uses_target_model_and_normalizes_base_url(
+    monkeypatch,
+    target_model,
+    explicit_base_url,
+    expected_mode,
+    expected_base_url,
+):
+    provider = "opencode-go"
+    monkeypatch.setattr(rp, "resolve_requested_provider", lambda requested: provider)
+    monkeypatch.setattr(rp, "resolve_provider", lambda *args, **kwargs: provider)
+    monkeypatch.setattr(rp, "_resolve_named_custom_runtime", lambda **kwargs: None)
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {"provider": provider})
+
+    resolved = rp.resolve_runtime_provider(
+        requested=provider,
+        explicit_api_key="opencode-explicit-key",
+        explicit_base_url=explicit_base_url,
+        target_model=target_model,
+    )
+
+    assert resolved["api_mode"] == expected_mode
+    assert resolved["base_url"] == expected_base_url
+
+
 def test_resolve_runtime_provider_uses_credential_pool(monkeypatch):
     class _Entry:
         access_token = "pool-token"
