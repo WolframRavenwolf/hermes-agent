@@ -473,6 +473,7 @@ try:
             inference_base_url=_pp.base_url,
             api_key_env_vars=_api_key_vars or _pp.env_vars,
             base_url_env_var=_base_url_var or "",
+            extra={"api_mode": _pp.api_mode},
         )
         # Also register aliases so resolve_provider() resolves them
         for _alias in _pp.aliases:

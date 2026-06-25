@@ -389,6 +389,10 @@ TRANSPORT_TO_API_MODE: Dict[str, str] = {
     "bedrock_converse": "bedrock_converse",
 }
 
+API_MODE_TO_TRANSPORT: Dict[str, str] = {
+    api_mode: transport for transport, api_mode in TRANSPORT_TO_API_MODE.items()
+}
+
 
 # -- Helper functions ---------------------------------------------------------
 
@@ -400,6 +404,35 @@ def normalize_provider(name: str) -> str:
     """
     key = name.strip().lower()
     return ALIASES.get(key, key)
+
+
+def _provider_profile_to_def(profile: Any) -> ProviderDef:
+    """Convert a declarative ProviderProfile into the CLI ProviderDef shape."""
+    env_vars = tuple(str(v) for v in (getattr(profile, "env_vars", ()) or ()))
+    api_key_env_vars = tuple(
+        v for v in env_vars if not v.endswith("_BASE_URL") and not v.endswith("_URL")
+    )
+    base_url_env_var = next(
+        (v for v in env_vars if v.endswith("_BASE_URL") or v.endswith("_URL")),
+        "",
+    )
+    api_mode = str(getattr(profile, "api_mode", "") or "chat_completions")
+    transport = API_MODE_TO_TRANSPORT.get(api_mode, "openai_chat")
+    display_name = str(getattr(profile, "display_name", "") or profile.name)
+    description = str(getattr(profile, "description", "") or "")
+    signup_url = str(getattr(profile, "signup_url", "") or "")
+    return ProviderDef(
+        id=profile.name,
+        name=display_name,
+        transport=transport,
+        api_key_env_vars=api_key_env_vars or env_vars,
+        base_url=str(getattr(profile, "base_url", "") or ""),
+        base_url_env_var=base_url_env_var,
+        is_aggregator=False,
+        auth_type=str(getattr(profile, "auth_type", "api_key") or "api_key"),
+        doc=description or signup_url,
+        source="provider-profile",
+    )
 
 
 def get_provider(name: str) -> Optional[ProviderDef]:
@@ -468,6 +501,18 @@ def get_provider(name: str) -> Optional[ProviderDef]:
             auth_type=overlay.auth_type,
             source="hermes",
         )
+
+    try:
+        import providers as provider_registry
+
+        if canonical == "custom":
+            return None
+        get_profile = getattr(provider_registry, "get_provider_profile", None)
+        profile = get_profile(canonical) if get_profile else None
+        if profile is not None:
+            return _provider_profile_to_def(profile)
+    except Exception:
+        pass
 
     return None
 

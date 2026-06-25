@@ -1797,7 +1797,8 @@ def resolve_runtime_provider(
         if cfg_provider == provider:
             cfg_base_url = (model_cfg.get("base_url") or "").strip().rstrip("/")
         base_url = cfg_base_url or creds.get("base_url", "").rstrip("/")
-        api_mode = "chat_completions"
+        profile_api_mode = str((pconfig.extra or {}).get("api_mode") or "").strip()
+        api_mode = profile_api_mode or "chat_completions"
         if provider == "copilot":
             api_mode = _copilot_runtime_api_mode(model_cfg, creds.get("api_key", ""))
         elif provider == "xai":
@@ -1824,9 +1825,10 @@ def resolve_runtime_provider(
                 # Auto-detect Anthropic-compatible endpoints by URL convention
                 # (e.g. https://api.minimax.io/anthropic, https://dashscope.../anthropic)
                 # plus api.openai.com → codex_responses and api.x.ai → codex_responses.
-                detected = _detect_api_mode_for_url(base_url)
-                if detected:
-                    api_mode = detected
+                if not profile_api_mode:
+                    detected = _detect_api_mode_for_url(base_url)
+                    if detected:
+                        api_mode = detected
         # Strip trailing /v1 for OpenCode Anthropic models (see comment above).
         if api_mode == "anthropic_messages" and provider in {"opencode-zen", "opencode-go"}:
             base_url = re.sub(r"/v1/?$", "", base_url)

@@ -736,7 +736,7 @@ def switch_model(
             user_providers,
             custom_providers,
         )
-        if pdef is None and explicit_provider.strip().lower() == "custom":
+        if explicit_provider.strip().lower() == "custom" and (pdef is None or not pdef.base_url):
             pdef = _bare_custom_provider_def(current_base_url)
         if pdef is None:
             _switch_err = (
