@@ -201,7 +201,10 @@ def build_gateway_parser(
         "--macos-app-wrapper",
         dest="macos_app_wrapper",
         action="store_true",
-        help="macOS only: run launchd through a Hermes Agent.app wrapper so privacy prompts show Hermes instead of python",
+        help=(
+            "macOS only: run launchd through a configurable app wrapper "
+            "so privacy prompts show Hermes/Amy instead of python"
+        ),
     )
 
     # gateway uninstall

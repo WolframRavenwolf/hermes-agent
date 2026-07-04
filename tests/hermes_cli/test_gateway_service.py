@@ -553,6 +553,10 @@ class TestGatewayStopCleanup:
 
 
 class TestLaunchdMacOSAppWrapper:
+    @pytest.fixture(autouse=True)
+    def _default_app_wrapper_config(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "read_raw_config", lambda: {})
+
     def test_generate_launchd_plist_prioritizes_amy_bins_and_filters_stale_path_entries(self, tmp_path, monkeypatch):
         home = tmp_path / "amy"
         repo = home / "hermes-agent"
@@ -776,6 +780,144 @@ class TestLaunchdMacOSAppWrapper:
         assert any(cmd[:5] == ["codesign", "--force", "--deep", "--sign", "-"] for cmd in calls)
         assert any(cmd[:4] == ["codesign", "--verify", "--deep", "--strict"] for cmd in calls)
         assert any(cmd[1:2] == ["-c"] and Path(cmd[0]).name == "Hermes Agent" for cmd in calls)
+
+    def test_install_launchd_app_wrapper_uses_configured_name_and_signing_identity(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        python_home = tmp_path / "cpython-3.13.13-macos-aarch64-none"
+        source_python = python_home / "bin" / "python3.13"
+        source_python.parent.mkdir(parents=True)
+        source_python.write_bytes(b"fake-macho-python")
+
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: home)
+        monkeypatch.setattr(gateway_cli, "_profile_suffix", lambda: "")
+        monkeypatch.setattr(gateway_cli, "get_python_path", lambda: str(source_python))
+        monkeypatch.setattr(
+            gateway_cli,
+            "read_raw_config",
+            lambda: {
+                "gateway": {
+                    "macos_app_wrapper": {
+                        "display_name": "Amy",
+                        "signing_identity": "Amy Local Code Signing",
+                    }
+                }
+            },
+        )
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        app_path = gateway_cli.install_launchd_app_wrapper(force=True)
+
+        app_exe = app_path / "Contents" / "MacOS" / "Amy"
+        info = plistlib.loads((app_path / "Contents" / "Info.plist").read_bytes())
+        source_info = plistlib.loads(
+            (
+                app_path
+                / "Contents"
+                / "Resources"
+                / gateway_cli.MACOS_APP_WRAPPER_SOURCE_INFO
+            ).read_bytes()
+        )
+        assert app_path == home / "macos" / "Amy.app"
+        assert app_exe.read_bytes() == b"fake-macho-python"
+        assert info["CFBundleDisplayName"] == "Amy"
+        assert source_info["DisplayName"] == "Amy"
+        assert source_info["SigningIdentity"] == "Amy Local Code Signing"
+        assert any(
+            cmd[:5] == ["codesign", "--force", "--deep", "--sign", "Amy Local Code Signing"]
+            for cmd in calls
+        )
+
+    @pytest.mark.parametrize(
+        "display_name",
+        [
+            "../Amy",
+            r"Amy\\Helper",
+            "Amy:Helper",
+            "Amy\nHelper",
+            "A" * 129,
+            "🧠" * 51,
+            ".",
+            "..",
+        ],
+    )
+    def test_launchd_app_wrapper_rejects_invalid_configured_name(self, monkeypatch, display_name):
+        monkeypatch.setattr(
+            gateway_cli,
+            "read_raw_config",
+            lambda: {"gateway": {"macos_app_wrapper": {"display_name": display_name}}},
+        )
+
+        assert gateway_cli._launchd_app_wrapper_display_name() == "Hermes Agent"
+
+    def test_launchd_app_wrapper_current_tracks_configured_identity_metadata(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        python_home = tmp_path / "cpython-3.13.13-macos-aarch64-none"
+        source_python = python_home / "bin" / "python3.13"
+        source_python.parent.mkdir(parents=True)
+        source_python.write_bytes(b"fake-macho-python")
+
+        config = {
+            "gateway": {
+                "macos_app_wrapper": {
+                    "display_name": "Amy",
+                    "signing_identity": "Amy Local Code Signing",
+                }
+            }
+        }
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: home)
+        monkeypatch.setattr(gateway_cli, "_profile_suffix", lambda: "")
+        monkeypatch.setattr(gateway_cli, "get_python_path", lambda: str(source_python))
+        monkeypatch.setattr(gateway_cli, "read_raw_config", lambda: config)
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )
+
+        gateway_cli.install_launchd_app_wrapper(force=True)
+        assert gateway_cli.launchd_app_wrapper_is_current() is True
+
+        config["gateway"]["macos_app_wrapper"]["signing_identity"] = "Other Signing Identity"
+        assert gateway_cli.launchd_app_wrapper_is_current() is False
+
+        config["gateway"]["macos_app_wrapper"]["signing_identity"] = "Amy Local Code Signing"
+        config["gateway"]["macos_app_wrapper"]["display_name"] = "Amy New"
+        assert gateway_cli.launchd_app_wrapper_is_current() is False
+
+    def test_generate_launchd_plist_uses_configured_app_wrapper_name(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        repo = tmp_path / "repo"
+        venv = repo / ".venv"
+        python_home = tmp_path / "cpython-3.13.13-macos-aarch64-none"
+        source_python = python_home / "bin" / "python3.13"
+        source_python.parent.mkdir(parents=True)
+        source_python.write_text("python", encoding="utf-8")
+        (venv / "bin").mkdir(parents=True)
+        (venv / "bin" / "python").write_text("venv-python", encoding="utf-8")
+        (venv / "lib" / "python3.13" / "site-packages").mkdir(parents=True)
+
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: home)
+        monkeypatch.setattr(gateway_cli, "_profile_suffix", lambda: "")
+        monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", repo)
+        monkeypatch.setattr(gateway_cli, "_detect_venv_dir", lambda: venv)
+        monkeypatch.setattr(gateway_cli, "get_python_path", lambda: str(source_python))
+        monkeypatch.setattr(gateway_cli.shutil, "which", lambda cmd: None)
+        monkeypatch.setattr(
+            gateway_cli,
+            "read_raw_config",
+            lambda: {"gateway": {"macos_app_wrapper": {"display_name": "Amy"}}},
+        )
+
+        plist = plistlib.loads(gateway_cli.generate_launchd_plist(app_wrapper=True).encode("utf-8"))
+
+        app_exe = home / "macos" / "Amy.app" / "Contents" / "MacOS" / "Amy"
+        assert plist["ProgramArguments"][:3] == [str(app_exe), "-m", "hermes_cli.main"]
 
     def test_install_launchd_app_wrapper_keeps_existing_bundle_when_validation_fails(self, tmp_path, monkeypatch):
         home = tmp_path / "home"
@@ -1273,6 +1415,11 @@ class TestLaunchdServiceRecovery:
         target = f"{gateway_cli._launchd_domain()}/{gateway_cli.get_launchd_label()}"
 
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 12.0)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_resolve_launchd_app_wrapper_mode",
+            lambda app_wrapper=None: False,
+        )
         monkeypatch.setattr(gateway_cli, "_launchd_reload_is_pending", lambda plist_path=None: False)
         monkeypatch.setattr(gateway_cli, "launchd_plist_is_current", lambda app_wrapper=None: True)
         monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: False)
@@ -1399,6 +1546,11 @@ class TestLaunchdServiceRecovery:
         monkeypatch.setattr(
             "gateway.status.get_running_pid",
             lambda: 321,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_resolve_launchd_app_wrapper_mode",
+            lambda app_wrapper=None: False,
         )
         monkeypatch.setattr(gateway_cli, "_launchd_reload_is_pending", lambda plist_path=None: False)
         monkeypatch.setattr(gateway_cli, "launchd_plist_is_current", lambda app_wrapper=None: True)

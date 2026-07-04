@@ -2158,9 +2158,54 @@ def get_launchd_plist_path() -> Path:
     return _launchd_user_home() / "Library" / "LaunchAgents" / f"{name}.plist"
 
 
-MACOS_APP_WRAPPER_DISPLAY_NAME = "Hermes Agent"
+MACOS_APP_WRAPPER_DEFAULT_DISPLAY_NAME = "Hermes Agent"
+MACOS_APP_WRAPPER_DEFAULT_SIGNING_IDENTITY = "-"
+MACOS_APP_WRAPPER_MAX_NAME_BYTES = 200
 MACOS_APP_WRAPPER_ENV_KEY = "HERMES_LAUNCHD_APP_WRAPPER"
 MACOS_APP_WRAPPER_SOURCE_INFO = "HermesPythonSource.plist"
+
+
+def _launchd_app_wrapper_config() -> dict:
+    """Return raw macOS launchd app-wrapper config, if present."""
+    try:
+        config = read_raw_config()
+    except Exception:
+        return {}
+    gateway_config = config.get("gateway") if isinstance(config, dict) else None
+    if not isinstance(gateway_config, dict):
+        return {}
+    wrapper_config = gateway_config.get("macos_app_wrapper")
+    return wrapper_config if isinstance(wrapper_config, dict) else {}
+
+
+def _launchd_app_wrapper_display_name() -> str:
+    """Return the display/executable name for the optional launchd wrapper."""
+    raw = _launchd_app_wrapper_config().get("display_name")
+    name = str(raw).strip() if raw is not None else ""
+    if not name:
+        return MACOS_APP_WRAPPER_DEFAULT_DISPLAY_NAME
+    try:
+        name_bytes = len(name.encode("utf-8"))
+    except UnicodeEncodeError:
+        return MACOS_APP_WRAPPER_DEFAULT_DISPLAY_NAME
+    if (
+        "/" in name
+        or "\\" in name
+        or ":" in name
+        or any(ord(char) < 32 for char in name)
+        or len(name) > 128
+        or name_bytes > MACOS_APP_WRAPPER_MAX_NAME_BYTES
+        or name in {".", ".."}
+    ):
+        return MACOS_APP_WRAPPER_DEFAULT_DISPLAY_NAME
+    return name
+
+
+def _launchd_app_wrapper_signing_identity() -> str:
+    """Return the codesign identity used for the optional launchd wrapper."""
+    raw = _launchd_app_wrapper_config().get("signing_identity")
+    identity = str(raw).strip() if raw is not None else ""
+    return identity or MACOS_APP_WRAPPER_DEFAULT_SIGNING_IDENTITY
 
 
 def get_launchd_bundle_identifier() -> str:
@@ -2171,10 +2216,11 @@ def get_launchd_bundle_identifier() -> str:
 def get_launchd_app_wrapper_path() -> Path:
     """Return the macOS app bundle path used for the optional launchd wrapper."""
     suffix = _profile_suffix()
+    display_name = _launchd_app_wrapper_display_name()
     bundle_name = (
-        f"{MACOS_APP_WRAPPER_DISPLAY_NAME} ({suffix}).app"
+        f"{display_name} ({suffix}).app"
         if suffix
-        else f"{MACOS_APP_WRAPPER_DISPLAY_NAME}.app"
+        else f"{display_name}.app"
     )
     return get_hermes_home() / "macos" / bundle_name
 
@@ -2185,7 +2231,7 @@ def get_launchd_app_wrapper_executable_path() -> Path:
         get_launchd_app_wrapper_path()
         / "Contents"
         / "MacOS"
-        / MACOS_APP_WRAPPER_DISPLAY_NAME
+        / _launchd_app_wrapper_display_name()
     )
 
 
@@ -2240,11 +2286,12 @@ def _launchd_app_wrapper_info() -> dict:
     """Return Info.plist metadata for the optional macOS launchd app wrapper."""
     from hermes_cli import __version__ as hermes_version
 
+    display_name = _launchd_app_wrapper_display_name()
     return {
         "CFBundleIdentifier": get_launchd_bundle_identifier(),
-        "CFBundleName": MACOS_APP_WRAPPER_DISPLAY_NAME,
-        "CFBundleDisplayName": MACOS_APP_WRAPPER_DISPLAY_NAME,
-        "CFBundleExecutable": MACOS_APP_WRAPPER_DISPLAY_NAME,
+        "CFBundleName": display_name,
+        "CFBundleDisplayName": display_name,
+        "CFBundleExecutable": display_name,
         "CFBundlePackageType": "APPL",
         "CFBundleVersion": hermes_version,
         "CFBundleShortVersionString": hermes_version,
@@ -2262,6 +2309,8 @@ def _launchd_app_wrapper_source_info(source_python: Path | None = None) -> dict:
         "SourcePython": str(source),
         "SourceSize": stat.st_size,
         "SourceMTimeNs": stat.st_mtime_ns,
+        "DisplayName": _launchd_app_wrapper_display_name(),
+        "SigningIdentity": _launchd_app_wrapper_signing_identity(),
     }
 
 
@@ -2311,10 +2360,11 @@ def launchd_app_wrapper_is_current() -> bool:
 def install_launchd_app_wrapper(force: bool = False) -> Path:
     """Install/update the optional macOS app bundle used as launchd executable.
 
-    The bundle contains a *copy* of the active Python executable named
-    ``Hermes Agent``. launchd then starts that bundle executable instead of the
-    generic ``python3.13`` binary, giving macOS/TCC a Hermes-specific path and
-    bundle identity while still running Hermes through the existing venv.
+    The bundle contains a *copy* of the active Python executable named after
+    the configured app-wrapper display name (default: ``Hermes Agent``).
+    launchd then starts that bundle executable instead of the generic
+    ``python3.13`` binary, giving macOS/TCC a Hermes-specific path and bundle
+    identity while still running Hermes through the existing venv.
     """
     app_path = get_launchd_app_wrapper_path()
     if app_path.exists() and not force and launchd_app_wrapper_is_current():
@@ -2345,8 +2395,16 @@ def install_launchd_app_wrapper(force: bool = False) -> Path:
             plistlib.dumps(_launchd_app_wrapper_source_info(source_python), sort_keys=False)
         )
 
+        signing_identity = _launchd_app_wrapper_signing_identity()
         subprocess.run(
-            ["codesign", "--force", "--deep", "--sign", "-", str(staging_app_path)],
+            [
+                "codesign",
+                "--force",
+                "--deep",
+                "--sign",
+                signing_identity,
+                str(staging_app_path),
+            ],
             check=True,
             timeout=30,
         )

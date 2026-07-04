@@ -1,11 +1,92 @@
 # Amy's Patches - Changelog (Branch: amy/patches)
 
 **Current base:** Hermes Agent v2026.6.19
-**Current patch stack:** 24 local Amy patches on Hermes Agent v2026.6.19 after v0.17.0 rebase, gateway self-management hardening, restart-script detector comment fix, Raft optional-platform log quieting, auxiliary vision fallback parity, and generic provider-profile/provider-scoped-header plumbing
+**Current patch stack:** 25 local Amy patches on Hermes Agent v2026.6.19 after the v0.17.0 rebase, gateway self-management hardening, restart-script detector comment fix, Raft optional-platform log quieting, auxiliary vision fallback parity, generic provider-profile/provider-scoped-header plumbing, and configurable macOS app-wrapper identity for Amy/TCC
 **Current reconciliation reviewed through:** v0.17.0 rebase/verification on 2026-06-21 plus post-restart stack classification on 2026-06-22; upstream-absorbed patches dropped, Amy-private patches retained
 **Author:** Amy Ravenwolf <amy@ravenwolf.de>
 
 > Current goal: keep only Amy/private patches local, and submit every generally useful feature/fix upstream as an open PR so future upgrades have less custom patch baggage.
+
+---
+
+## 2026-07-07 - WhatsApp Bridge Audio Patch Cleanup
+
+**Problem:** The local bridge-audio patch left two identical `send_voice()`
+methods in `gateway/platforms/whatsapp.py`, while its commit subject also
+claimed npm and lockfile changes that were not present. Python kept only the
+later method, so runtime behavior was unaffected, but the patch history was
+misleading and contained dead code.
+
+**Solution:** Folded the dead-method removal into the original patch before the
+next public stack revision and renamed that patch to describe its real net
+behavior. The final code delta is limited to bridge-side audio download
+handling: it reads the native audio message after media download, maps known
+MIME types to stable extensions, and uses an explicit `audio_` filename prefix.
+Wrapper-aware bounded unwrapping preserves audio metadata for ephemeral,
+view-once, and nested messages, and the bridge health hash now covers the helper
+module so a helper update invalidates stale long-running bridge processes. The
+already-effective Python `send_voice()` implementation remains unchanged.
+
+**Affected files:**
+
+- `scripts/whatsapp-bridge/bridge.js`
+- `scripts/whatsapp-bridge/media-utils.js`
+- `scripts/whatsapp-bridge/media-utils.test.js`
+- `scripts/whatsapp-bridge/package.json`
+- `RELEASE_amy-patches.md`
+
+**Verification:**
+
+- `ruff check gateway/platforms/whatsapp.py`
+- `scripts/run_tests.sh` across the two WhatsApp CLI test files and seven WhatsApp gateway test files -> `244 passed`
+- `node --check scripts/whatsapp-bridge/bridge.js`
+- `npm test` in `scripts/whatsapp-bridge` -> `4 passed`
+
+**Session reference:** 2026-07-07 Mattermost follow-up after closing stale
+fork-internal `WolframRavenwolf/hermes-agent` PRs exposed the duplicate
+`send_voice()` method in the active `amy/patches` stack.
+
+---
+
+## 2026-07-04 - Configurable macOS App Wrapper Identity for Amy/TCC
+
+**Problem:** The macOS gateway launchd service still started the uv-managed
+CPython executable directly, so Privacy & Security / TCC prompts appeared as
+generic `python3.13`. The wrapper needs a stable, recognizable app identity,
+and routine rebuilds must not unnecessarily invalidate TCC grants.
+
+**Solution:** The optional macOS launchd app-wrapper now reads
+`gateway.macos_app_wrapper.display_name` and
+`gateway.macos_app_wrapper.signing_identity` from `config.yaml`. The configured
+display name controls the app bundle name, executable name, and Info.plist
+display fields, while the configured signing identity replaces the previous
+hardcoded ad-hoc `codesign -s -` identity. Wrapper source metadata records the
+display name and signing identity so config changes force a wrapper rebuild.
+Invalid display names containing path separators, control characters, legacy
+colon separators, excessive character count, or more than 200 UTF-8 bytes safely
+fall back to the default `Hermes Agent` name. The byte bound leaves room for the
+`.app` and staging-directory suffixes under macOS' per-component limit.
+Restart-ordering tests explicitly pin app-wrapper mode so the machine's
+installed launchd configuration cannot trigger signing side effects inside
+otherwise unrelated unit tests.
+
+**Affected files:**
+
+- `hermes_cli/gateway.py`
+- `hermes_cli/subcommands/gateway.py`
+- `tests/hermes_cli/test_gateway_service.py`
+- `RELEASE_amy-patches.md`
+
+**Verification:**
+
+- `ruff check hermes_cli/gateway.py hermes_cli/subcommands/gateway.py tests/hermes_cli/test_gateway_service.py`
+- `scripts/run_tests.sh tests/hermes_cli/test_gateway_service.py -- -q` -> `198 passed`
+- Combined app-wrapper and WhatsApp Python regression matrix -> `442 passed`, `0 failed`
+- Combined Python and Node targeted evidence -> `446 passed`, `0 failed`
+- Full canonical suite attempted in a detached worktree; every reproducible failure in the 18-file problem set also occurred on the isolated `origin/amy/patches` baseline, with no new final-branch failure
+
+**Session reference:** 2026-07-04 macOS app-identity and TCC configuration
+review.
 
 ---
 
@@ -14,10 +95,10 @@
 Counted from the release base, not by diffing against a moving upstream branch or an unsynced fork branch. Fork `main` is supposed to match the release version that `amy/patches` is based on; it may intentionally lag current `upstream/main` between upgrades.
 
 - Current base: `v2026.6.19`
-- Current stack: `24` patches on `amy/patches`
+- Current stack: `25` patches on `amy/patches`
 - Pre-v0.17 backup for comparison: `amy/patches-backup-v2026.6.19-20260621-140428`
 - Pre-v0.17 stack: `32` patches on `v2026.6.5`
-- Exact patch-id absorption check against current `upstream/main`: all 24 current patches show `+`, so none are exact patch-id matches on upstream `main`; semantic absorption still has to be judged by workflow/code inspection.
+- Exact patch-id absorption check against current `upstream/main`: all 24 pre-2026-07-04 patches showed `+`; the new configurable macOS app-wrapper identity patch still needs a future upstream-overlap check before any PR/rebase decision. Semantic absorption still has to be judged by workflow/code inspection.
 
 ### Dropped During the v0.17 Rebase
 
@@ -45,44 +126,46 @@ These old local patches are no longer carried in the current stack because Herme
 
 | Current commit | Subject | Classification |
 |---|---|---|
-| `9286c41c8` | `feat(status): restore model and context in gateway status` | Re-spun local delta on top of upstream's refactored status command. |
-| `505373d78` | `docs(patches): update upstream PR reconciliation` | Re-spun private patch-stack documentation. |
-| `8927afe69` | `feat(tools): keep send_message in explicit messaging toolset` | New Amy-local policy patch after upstream removed agent-callable `send_message` from default surfaces. |
-| `2e4db11d1` | `test(auxiliary): make codex timeout check deterministic` | New upstream-worthy test flake fix. |
-| `f1abee591` | `fix(gateway): harden self-management guard` | New upstream-worthy gateway safety fix, including restart-helper detector follow-up. |
-| `ee2c36ff3` | `fix(raft): quiet optional dependency checks` | New upstream-worthy optional-plugin noise fix; likely droppable after a release containing upstream's equivalent Raft quieting. |
-| `this commit` | `fix(auxiliary): preserve auto fallback policy for vision calls` | New upstream-worthy auxiliary fallback parity fix; keeps image analysis on `fallback_providers` when the auto-selected main provider is exhausted. |
-| `new` | `fix(providers): resolve ProviderProfile plugins in CLI identity` | New upstream-worthy generic provider identity fix extracted while reviewing CoreWeave PR #44250. |
-| `new` | `feat(providers): support provider-scoped model headers` | New upstream-worthy provider-scoped header plumbing; prevents project/billing/proxy headers from leaking across OpenAI-compatible providers. |
+| `c017d9811` | `feat(status): restore model and context in gateway status` | Re-spun local delta on top of upstream's refactored status command. |
+| `17be30994` | `docs(patches): update upstream PR reconciliation` | Re-spun private patch-stack documentation. |
+| `852d51d86` | `feat(tools): keep send_message in explicit messaging toolset` | New Amy-local policy patch after upstream removed agent-callable `send_message` from default surfaces. |
+| `24225b186` | `test(auxiliary): make codex timeout check deterministic` | New upstream-worthy test flake fix. |
+| `12b3b445a` | `fix(gateway): harden self-management guard` | New upstream-worthy gateway safety fix, including restart-helper detector follow-up. |
+| `e2aa31a4a` | `fix(raft): quiet optional dependency checks` | New upstream-worthy optional-plugin noise fix; likely droppable after a release containing upstream's equivalent Raft quieting. |
+| `198b4d3b9` | `fix(auxiliary): preserve auto fallback policy for vision calls` | New upstream-worthy auxiliary fallback parity fix; keeps image analysis on `fallback_providers` when the auto-selected main provider is exhausted. |
+| `180b27597` | `fix(providers): resolve ProviderProfile plugins in CLI identity` | New upstream-worthy generic provider identity fix extracted while reviewing CoreWeave PR #44250. |
+| `bc8b031e9` | `feat(providers): support provider-scoped model headers` | New upstream-worthy provider-scoped header plumbing; prevents project/billing/proxy headers from leaking across OpenAI-compatible providers. |
+| `this commit` | `feat(gateway): configure macOS app-wrapper identity` | New mostly upstream-worthy launchd/TCC improvement; local config sets the wrapper display/signing identity to Amy for the Mac mini. |
 
-### Current 24-Patch Stack
+### Current 25-Patch Stack
 
 | Commit | Subject | Current classification |
 |---|---|---|
-| `c2bc868aa` | `fix: WhatsApp voice messages + bridge audio download + npm deps` | Upstream-worthy and still locally needed against `v2026.6.19`; original PR #41616 closed unmerged. |
-| `ab38f124c` | `feat(tool_progress): add 'full' mode - unlimited tool args in gateway chat` | Upstream-worthy and still locally needed; original PR #41617 closed unmerged. |
-| `3534f1cc7` | `feat(prompt): add Amy platform hints and Mattermost Private Assistant default` | Private Amy/persona patch - do not upstream. |
-| `985992a36` | `docs: add Amy's patches changelog for v0.6.0 fork` | Private fork documentation - do not upstream. |
-| `33fad8f85` | `fix: suppress pkg_resources deprecation warning from lark_oapi` | Upstream-worthy and still locally needed; original PR #41621 closed unmerged. |
-| `35b9fa2e0` | `fix(addon): make dashboard assets work behind HA ingress` | Upstream-worthy and still locally needed; original PR #41629 closed unmerged. |
-| `73d6a66c3` | `feat(vision): add provider-safe inject_image tool` | Upstream-worthy and still locally needed; original PR #41632 closed unmerged. |
-| `4761ff163` | `feat(moa): route experts through provider-aware clients` | Partially superseded by upstream MoA/virtual-provider redesign; keep locally against `v2026.6.19`, re-evaluate on next release. |
-| `9fc7aa5ca` | `feat(gateway): add macOS app-wrapper launchd identity` | Upstream-worthy/local Mac runtime patch; original PR #41635 was closed as too broad, but Amy still needs the app-wrapper/TCC workflow. |
-| `835926beb` | `fix: enable GPT-5.5 priority processing fast mode` | Likely partially superseded by broader upstream fast-routing work; keep as local regression coverage until next release comparison proves redundant. |
-| `a798832f7` | `fix(gateway): keep macOS launchd runtime paths logical` | Upstream-worthy/local launchd hardening; partially related upstream fixes exist, but this exact logical-path/app-wrapper workflow remains local. |
-| `850e92d6f` | `fix(deps): restore CVE-fixed pyproject pins` | Partially upstream-covered; keep until upstream fully covers the direct dependency-pin/lock consistency Amy needs. |
-| `9286c41c8` | `feat(status): restore model and context in gateway status` | Partially upstream-covered; local provider/context delta remains needed for Amy's `/status` workflow. |
-| `c741830f0` | `feat(resume): restore cross-platform full session listing` | Upstream has `/sessions`, but not the exact `/resume --all/--full` compatibility workflow; keep locally, possible compatibility PR. |
-| `505373d78` | `docs(patches): update upstream PR reconciliation` | Private fork documentation - do not upstream. |
-| `f7bcf08bd` | `fix(mattermost): caption file-only media posts` | Upstream-worthy and still locally needed; upstream PR #48014 open. |
-| `538fd6ec6` | `fix(mattermost): make post length configurable` | Upstream-worthy and still locally needed; upstream PR #48015 open. |
-| `8927afe69` | `feat(tools): keep send_message in explicit messaging toolset` | Amy-local trusted-runtime policy patch; upstream deliberately removed broad agent-callable `send_message`. |
-| `2e4db11d1` | `test(auxiliary): make codex timeout check deterministic` | Upstream-worthy test flake fix; no upstream PR yet. |
-| `f1abee591` | `fix(gateway): harden self-management guard` | Upstream-worthy safety fix; no upstream PR yet. |
-| `ee2c36ff3` | `fix(raft): quiet optional dependency checks` | Semantically likely superseded on upstream `main`, but locally needed against `v2026.6.19`; probably droppable next release. |
-| `this commit` | `fix(auxiliary): preserve auto fallback policy for vision calls` | New upstream-worthy auxiliary fallback parity fix; keeps image analysis on `fallback_providers` when the auto-selected main provider is exhausted. |
-| `new` | `fix(providers): resolve ProviderProfile plugins in CLI identity` | New upstream-worthy generic provider identity fix extracted while reviewing CoreWeave PR #44250. |
-| `new` | `feat(providers): support provider-scoped model headers` | New upstream-worthy provider-scoped header plumbing; prevents project/billing/proxy headers from leaking across OpenAI-compatible providers. |
+| `84db61d73` | `fix(whatsapp): preserve native bridge audio metadata` | Upstream-worthy and still locally needed against `v2026.6.19`; original PR #41616 closed unmerged. |
+| `b6d479d9d` | `feat(tool_progress): add 'full' mode — unlimited tool args in gateway chat` | Upstream-worthy and still locally needed; original PR #41617 closed unmerged. |
+| `06c9e12a1` | `feat(prompt): add Amy platform hints and Mattermost Private Assistant default` | Private Amy/persona patch - do not upstream. |
+| `1a8006368` | `docs: add Amy's patches changelog for v0.6.0 fork` | Private fork documentation - do not upstream. |
+| `d4710f4b6` | `fix: suppress pkg_resources deprecation warning from lark_oapi` | Upstream-worthy and still locally needed; original PR #41621 closed unmerged. |
+| `e6faede1e` | `fix(addon): make dashboard assets work behind HA ingress` | Upstream-worthy and still locally needed; original PR #41629 closed unmerged. |
+| `f4c001c69` | `feat(vision): add provider-safe inject_image tool` | Upstream-worthy and still locally needed; original PR #41632 closed unmerged. |
+| `0790976ef` | `feat(moa): route experts through provider-aware clients` | Partially superseded by upstream MoA/virtual-provider redesign; keep locally against `v2026.6.19`, re-evaluate on next release. |
+| `53c4a77ad` | `feat(gateway): add macOS app-wrapper launchd identity` | Upstream-worthy/local Mac runtime patch; original PR #41635 was closed as too broad, but Amy still needs the app-wrapper/TCC workflow. |
+| `00ebca5a3` | `fix: enable GPT-5.5 priority processing fast mode` | Likely partially superseded by broader upstream fast-routing work; keep as local regression coverage until next release comparison proves redundant. |
+| `68a16944f` | `fix(gateway): keep macOS launchd runtime paths logical` | Upstream-worthy/local launchd hardening; partially related upstream fixes exist, but this exact logical-path/app-wrapper workflow remains local. |
+| `4e945ba21` | `fix(deps): restore CVE-fixed pyproject pins` | Partially upstream-covered; keep until upstream fully covers the direct dependency-pin/lock consistency Amy needs. |
+| `c017d9811` | `feat(status): restore model and context in gateway status` | Partially upstream-covered; local provider/context delta remains needed for Amy's `/status` workflow. |
+| `68b454c57` | `feat(resume): restore cross-platform full session listing` | Upstream has `/sessions`, but not the exact `/resume --all/--full` compatibility workflow; keep locally, possible compatibility PR. |
+| `17be30994` | `docs(patches): update upstream PR reconciliation` | Private fork documentation - do not upstream. |
+| `3e67d698b` | `fix(mattermost): caption file-only media posts` | Upstream-worthy and still locally needed; upstream PR #48014 open. |
+| `7ef1ea78b` | `fix(mattermost): make post length configurable` | Upstream-worthy and still locally needed; upstream PR #48015 open. |
+| `852d51d86` | `feat(tools): keep send_message in explicit messaging toolset` | Amy-local trusted-runtime policy patch; upstream deliberately removed broad agent-callable `send_message`. |
+| `24225b186` | `test(auxiliary): make codex timeout check deterministic` | Upstream-worthy test flake fix; no upstream PR yet. |
+| `12b3b445a` | `fix(gateway): harden self-management guard` | Upstream-worthy safety fix; no upstream PR yet. |
+| `e2aa31a4a` | `fix(raft): quiet optional dependency checks` | Semantically likely superseded on upstream `main`, but locally needed against `v2026.6.19`; probably droppable next release. |
+| `198b4d3b9` | `fix(auxiliary): preserve auto fallback policy for vision calls` | New upstream-worthy auxiliary fallback parity fix; keeps image analysis on `fallback_providers` when the auto-selected main provider is exhausted. |
+| `180b27597` | `fix(providers): resolve ProviderProfile plugins in CLI identity` | New upstream-worthy generic provider identity fix extracted while reviewing CoreWeave PR #44250. |
+| `bc8b031e9` | `feat(providers): support provider-scoped model headers` | New upstream-worthy provider-scoped header plumbing; prevents project/billing/proxy headers from leaking across OpenAI-compatible providers. |
+| `this commit` | `feat(gateway): configure macOS app-wrapper identity` | Mostly upstream-worthy launchd/TCC improvement; local config sets the wrapper display/signing identity to Amy for the Mac mini. |
 
 ### Push/Upgrade Implications
 
