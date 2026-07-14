@@ -1015,18 +1015,15 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
                     "arguments": tool_call.function.arguments
                 },
             }
-            # Defence-in-depth: redact credentials from tool call arguments
-            # before they enter conversation history. Tool execution uses the
-            # raw API response object, not this dict, so redacting the
-            # persisted shape is safe and only affects storage. Catches the
-            # case where a model accidentally inlines a secret into a tool
-            # call (e.g. `terminal(command="curl -H 'Authorization: Bearer
-            # sk-...'")`). (#19798)
-            if isinstance(tc_dict["function"]["arguments"], str):
-                from agent.redact import redact_sensitive_text
-                tc_dict["function"]["arguments"] = redact_sensitive_text(
-                    tc_dict["function"]["arguments"]
-                )
+            # Keep tool-call arguments byte-exact in replayable conversation
+            # history. Redacting this copy poisons the next model turn: it sees
+            # masked placeholders as its own prior arguments and may reuse them
+            # in subsequent calls. This same canonical dict is deliberately
+            # persisted to state.db/session snapshots and replayed on resume;
+            # at-rest protection must come from file permissions/encryption,
+            # not destructive placeholder substitution. Output/display
+            # boundaries continue to redact actual leaks (upstream #43083 /
+            # PR #54136).
             # Preserve extra_content (e.g. Gemini thought_signature) so it
             # is sent back on subsequent API calls.  Without this, Gemini 3
             # thinking models reject the request with a 400 error.

@@ -107,11 +107,24 @@ _PREFIX_PATTERNS = [
     r"ntn_[A-Za-z0-9]{10,}",            # Notion internal integration token
 ]
 
-# ENV assignment patterns: KEY=value where KEY contains a secret-like name
+# ENV assignment patterns: KEY=value where KEY contains a secret-like name.
 _SECRET_ENV_NAMES = r"(?:API_?KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)"
 _ENV_ASSIGN_RE = re.compile(
     rf"([A-Z0-9_]{{0,50}}{_SECRET_ENV_NAMES}[A-Z0-9_]{{0,50}})\s*=\s*(['\"]?)(\S+)\2",
 )
+
+# Exact operational metadata names that contain a secret-like substring but
+# never hold the secret itself.  Keep the broad matcher for compound credential
+# fields such as AUTH_KEY, ACCESS_TOKEN_VALUE, and CREDENTIAL_VALUE; a narrow
+# allowlist avoids turning that security coverage into a substring free-for-all.
+_SAFE_ENV_ASSIGNMENT_NAMES = frozenset({
+    "AUTH_BEFORE",
+    "AUTH_AFTER",
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_AUTHOR_DATE",
+    "SSH_AUTH_SOCK",
+})
 
 # JSON field patterns: "apiKey": "value", "token": "value", etc.
 _JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|access_token|refresh_token|auth_token|bearer|secret_value|raw_secret|secret_input|key_material)"
@@ -122,7 +135,7 @@ _JSON_FIELD_RE = re.compile(
 
 # Authorization headers
 _AUTH_HEADER_RE = re.compile(
-    r"(Authorization:\s*Bearer\s+)(\S+)",
+    r"(Authorization:\s*Bearer\s+)([^\s\\\"']+)",
     re.IGNORECASE,
 )
 
@@ -137,10 +150,11 @@ _PRIVATE_KEY_RE = re.compile(
     r"-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----"
 )
 
-# Database connection strings: protocol://user:PASSWORD@host
-# Catches postgres, mysql, mongodb, redis, amqp URLs and redacts the password
+# Database connection strings: protocol://user:PASSWORD@host.  Whitespace is
+# forbidden in the userinfo groups so a missing @ cannot consume later source
+# lines and corrupt displayed code (upstream #33801 / PR #54061).
 _DB_CONNSTR_RE = re.compile(
-    r"((?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://[^:]+:)([^@]+)(@)",
+    r"((?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://[^:\s]+:)([^@\s]+)(@)",
     re.IGNORECASE,
 )
 
@@ -364,6 +378,8 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
         if "=" in text:
             def _redact_env(m):
                 name, quote, value = m.group(1), m.group(2), m.group(3)
+                if name in _SAFE_ENV_ASSIGNMENT_NAMES:
+                    return m.group(0)
                 return f"{name}={quote}{_mask_token(value)}{quote}"
             text = _ENV_ASSIGN_RE.sub(_redact_env, text)
 
@@ -395,9 +411,22 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
     if "BEGIN" in text and "-----" in text:
         text = _PRIVATE_KEY_RE.sub("[REDACTED PRIVATE KEY]", text)
 
-    # Database connection string passwords
+    # Database connection string passwords.  In code-file mode, a pure brace
+    # expression is an f-string template reference rather than a credential;
+    # preserve that while still masking literal passwords (upstream #33801).
     if "://" in text:
-        text = _DB_CONNSTR_RE.sub(lambda m: f"{m.group(1)}***{m.group(3)}", text)
+        if code_file:
+            def _redact_db(m):
+                password = m.group(2)
+                if password.startswith("{") and password.endswith("}"):
+                    return m.group(0)
+                return f"{m.group(1)}***{m.group(3)}"
+            text = _DB_CONNSTR_RE.sub(_redact_db, text)
+        else:
+            text = _DB_CONNSTR_RE.sub(
+                lambda m: f"{m.group(1)}***{m.group(3)}",
+                text,
+            )
 
     # JWT tokens (eyJ... — base64-encoded JSON headers)
     if "eyJ" in text:

@@ -1,11 +1,62 @@
 # Amy's Patches - Changelog (Branch: amy/patches)
 
 **Current base:** Hermes Agent v2026.6.19
-**Current patch stack:** 25 local Amy patches on Hermes Agent v2026.6.19 after the v0.17.0 rebase, gateway self-management hardening, restart-script detector comment fix, Raft optional-platform log quieting, auxiliary vision fallback parity, generic provider-profile/provider-scoped-header plumbing, and configurable macOS app-wrapper identity for Amy/TCC
-**Current reconciliation reviewed through:** v0.17.0 rebase/verification on 2026-06-21 plus post-restart stack classification on 2026-06-22; upstream-absorbed patches dropped, Amy-private patches retained
+**Current patch stack:** 26 local Amy patches on Hermes Agent v2026.6.19 after the v0.17.0 rebase, gateway self-management hardening, restart-script detector comment fix, Raft optional-platform log quieting, auxiliary vision fallback parity, generic provider-profile/provider-scoped-header plumbing, configurable macOS app-wrapper identity for Amy/TCC, and non-destructive secret-redactor replay handling
+**Current reconciliation reviewed through:** v0.17.0 rebase/verification on 2026-06-21 plus post-restart stack classification on 2026-06-22; upstream-absorbed patches dropped, Amy-private patches retained; redactor upstream overlap rechecked 2026-07-14
 **Author:** Amy Ravenwolf <amy@ravenwolf.de>
 
 > Current goal: keep only Amy/private patches local, and submit every generally useful feature/fix upstream as an open PR so future upgrades have less custom patch baggage.
+
+---
+
+## 2026-07-14 - Non-Destructive Secret Redaction and Replay
+
+**Problem:** The generic redactor modified replayable tool-call arguments before
+they were stored in assistant history. Masked placeholders then looked like the
+model's own prior arguments on the next turn and could be copied into later tool
+calls, turning a display/privacy feature into broken executable input. The same
+matcher also treated operational metadata names such as Git author fields,
+auth-state before/after snapshots, and the SSH agent socket as credentials.
+Short quoted bearer values and escaped closing quotes could lose syntax, while a
+database-connection matcher could cross line boundaries in source snippets.
+
+**Solution:** Replayable tool arguments now remain byte-exact in the canonical
+assistant message, matching merged upstream PR #54136. The same canonical values
+are intentionally persisted in session state and replayed after resume; at-rest
+protection therefore belongs to state-file permissions and encryption rather
+than destructive placeholder substitution. Anthropic interleaved replay uses
+that same canonical map instead of maintaining a contradictory redacted-copy
+invariant. The redactor retains its broad credential-name matcher but exempts a
+small exact allowlist of operational metadata names, an approach inspired by but
+narrower than open upstream PR #47348. Bearer matching now stops before quote and
+escape syntax, and the database matcher preserves line and f-string-template
+boundaries, adapted from merged upstream PR #54061.
+
+**Affected files:**
+
+- `agent/redact.py`
+- `agent/chat_completion_helpers.py`
+- `agent/anthropic_adapter.py`
+- `tests/agent/test_redactor_replay_and_syntax.py`
+- `tests/agent/test_anthropic_thinking_block_order.py`
+- `RELEASE_amy-patches.md`
+
+**Verification:**
+
+- RED: the new regression suite failed on the release base for operational
+  metadata false positives, replay argument mutation, and escaped-quote syntax
+  corruption.
+- Focused Redactor/replay verification -> `102 passed` before the final
+  Anthropic-invariant update; final Redactor spot-check -> `99 passed`.
+- Combined Redactor, Anthropic, and terminal regression matrix -> `274 passed`.
+- Final Bitchpack review: Redactor GO after escaped-quote AST validation and
+  explicit raw-persistence documentation.
+- `ruff check`, `py_compile`, and `git diff --check` passed for every affected
+  Python file.
+
+**Session reference:** 2026-07-14 Mattermost cleanup follow-up; Wolfram asked for
+an upstream-first Amy patch because redactor workarounds cost time and tokens
+without reliably protecting executable workflows.
 
 ---
 
@@ -95,7 +146,7 @@ review.
 Counted from the release base, not by diffing against a moving upstream branch or an unsynced fork branch. Fork `main` is supposed to match the release version that `amy/patches` is based on; it may intentionally lag current `upstream/main` between upgrades.
 
 - Current base: `v2026.6.19`
-- Current stack: `25` patches on `amy/patches`
+- Current stack: `26` patches on `amy/patches`
 - Pre-v0.17 backup for comparison: `amy/patches-backup-v2026.6.19-20260621-140428`
 - Pre-v0.17 stack: `32` patches on `v2026.6.5`
 - Exact patch-id absorption check against current `upstream/main`: all 24 pre-2026-07-04 patches showed `+`; the new configurable macOS app-wrapper identity patch still needs a future upstream-overlap check before any PR/rebase decision. Semantic absorption still has to be judged by workflow/code inspection.
@@ -135,9 +186,10 @@ These old local patches are no longer carried in the current stack because Herme
 | `198b4d3b9` | `fix(auxiliary): preserve auto fallback policy for vision calls` | New upstream-worthy auxiliary fallback parity fix; keeps image analysis on `fallback_providers` when the auto-selected main provider is exhausted. |
 | `180b27597` | `fix(providers): resolve ProviderProfile plugins in CLI identity` | New upstream-worthy generic provider identity fix extracted while reviewing CoreWeave PR #44250. |
 | `bc8b031e9` | `feat(providers): support provider-scoped model headers` | New upstream-worthy provider-scoped header plumbing; prevents project/billing/proxy headers from leaking across OpenAI-compatible providers. |
-| `this commit` | `feat(gateway): configure macOS app-wrapper identity` | New mostly upstream-worthy launchd/TCC improvement; local config sets the wrapper display/signing identity to Amy for the Mac mini. |
+| `54c14d995` | `feat(gateway): configure macOS app-wrapper identity` | New mostly upstream-worthy launchd/TCC improvement; local config sets the wrapper display/signing identity to Amy for the Mac mini. |
+| `this commit` | `fix(redact): preserve replayable tool arguments` | Upstream-worthy non-destructive replay and false-positive fix; adapted from merged #54061/#54136 plus a narrower version of open #47348. |
 
-### Current 25-Patch Stack
+### Current 26-Patch Stack
 
 | Commit | Subject | Current classification |
 |---|---|---|
@@ -165,7 +217,8 @@ These old local patches are no longer carried in the current stack because Herme
 | `198b4d3b9` | `fix(auxiliary): preserve auto fallback policy for vision calls` | New upstream-worthy auxiliary fallback parity fix; keeps image analysis on `fallback_providers` when the auto-selected main provider is exhausted. |
 | `180b27597` | `fix(providers): resolve ProviderProfile plugins in CLI identity` | New upstream-worthy generic provider identity fix extracted while reviewing CoreWeave PR #44250. |
 | `bc8b031e9` | `feat(providers): support provider-scoped model headers` | New upstream-worthy provider-scoped header plumbing; prevents project/billing/proxy headers from leaking across OpenAI-compatible providers. |
-| `this commit` | `feat(gateway): configure macOS app-wrapper identity` | Mostly upstream-worthy launchd/TCC improvement; local config sets the wrapper display/signing identity to Amy for the Mac mini. |
+| `54c14d995` | `feat(gateway): configure macOS app-wrapper identity` | Mostly upstream-worthy launchd/TCC improvement; local config sets the wrapper display/signing identity to Amy for the Mac mini. |
+| `this commit` | `fix(redact): preserve replayable tool arguments` | Upstream-worthy non-destructive replay and false-positive fix; retain until a release contains equivalent merged fixes. |
 
 ### Push/Upgrade Implications
 
