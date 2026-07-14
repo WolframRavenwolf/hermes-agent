@@ -1,11 +1,48 @@
 # Amy's Patches - Changelog (Branch: amy/patches)
 
 **Current base:** Hermes Agent v2026.6.19
-**Current patch stack:** 27 local Amy patches on Hermes Agent v2026.6.19 after the v0.17.0 rebase, gateway self-management hardening, restart-script detector comment fix, Raft optional-platform log quieting, auxiliary vision fallback parity, generic provider-profile/provider-scoped-header plumbing, configurable macOS app-wrapper identity for Amy/TCC, non-destructive secret-redactor replay handling, and conservative heredoc-aware shell-background detection
-**Current reconciliation reviewed through:** v0.17.0 rebase/verification on 2026-06-21 plus post-restart stack classification on 2026-06-22; upstream-absorbed patches dropped, Amy-private patches retained; redactor and shell-guard upstream overlap rechecked 2026-07-14
+**Current patch stack:** 28 local Amy patches on Hermes Agent v2026.6.19 after the v0.17.0 rebase, gateway self-management hardening, restart-script detector comment fix, Raft optional-platform log quieting, auxiliary vision fallback parity, generic provider-profile/provider-scoped-header plumbing, configurable macOS app-wrapper identity for Amy/TCC, non-destructive secret-redactor replay handling, conservative heredoc-aware shell-background detection, and app-wrapper-preserving missing-plist self-healing
+**Current reconciliation reviewed through:** v0.17.0 rebase/verification on 2026-06-21 plus post-restart stack classification on 2026-06-22; upstream-absorbed patches dropped, Amy-private patches retained; redactor and shell-guard upstream overlap plus Devin review-only PR #9 checked 2026-07-14
 **Author:** Amy Ravenwolf <amy@ravenwolf.de>
 
 > Current goal: keep only Amy/private patches local, and submit every generally useful feature/fix upstream as an open PR so future upgrades have less custom patch baggage.
+
+---
+
+## 2026-07-14 - Preserve App Wrapper During Missing-Plist Self-Heal
+
+**Problem:** Devin review-only PR #9 found that `hermes gateway start` regenerated
+a missing macOS launchd plist with the default raw-Python mode. If the optional
+app wrapper was already installed, deleting or losing only the plist therefore
+silently discarded the configured Hermes/Amy TCC identity and brought privacy
+prompts back under `python3.13`.
+
+**Solution:** Missing-plist recovery now treats an existing configured app bundle
+as the durable wrapper-mode marker. It refreshes that bundle when stale, then
+generates the replacement plist with `app_wrapper=True`. Raw-Python installs
+remain unchanged when no wrapper bundle exists. The recovery path still defers
+launchctl bootstrap when called from inside the gateway process tree.
+
+**Affected files:**
+
+- `hermes_cli/gateway.py`
+- `tests/hermes_cli/test_gateway_service.py`
+- `RELEASE_amy-patches.md`
+
+**Verification:**
+
+- RED: the focused regression observed `generated_modes == [False]` instead of
+  the required `[True]` when the plist was absent but the wrapper existed.
+- GREEN: focused current/stale-wrapper recovery matrix -> `4 passed`.
+- Canonical complete `test_gateway_service.py` suite with isolated runtime home
+  -> `200 passed`.
+- Devin's remaining seven flags were classified independently: six describe
+  deliberate/tested behavior or invalid shell syntax, while the MoA startup
+  observation remains a non-blocking performance watchpoint without an observed
+  failure.
+
+**Session reference:** 2026-07-14 Devin review-only fork PR #9 of the validated
+`amy/patches` stack.
 
 ---
 
@@ -199,7 +236,7 @@ review.
 Counted from the release base, not by diffing against a moving upstream branch or an unsynced fork branch. Fork `main` is supposed to match the release version that `amy/patches` is based on; it may intentionally lag current `upstream/main` between upgrades.
 
 - Current base: `v2026.6.19`
-- Current stack: `27` patches on `amy/patches`
+- Current stack: `28` patches on `amy/patches`
 - Pre-v0.17 backup for comparison: `amy/patches-backup-v2026.6.19-20260621-140428`
 - Pre-v0.17 stack: `32` patches on `v2026.6.5`
 - Exact patch-id absorption check against current `upstream/main`: all 24 pre-2026-07-04 patches showed `+`; the new configurable macOS app-wrapper identity patch still needs a future upstream-overlap check before any PR/rebase decision. Semantic absorption still has to be judged by workflow/code inspection.
@@ -241,9 +278,10 @@ These old local patches are no longer carried in the current stack because Herme
 | `bc8b031e9` | `feat(providers): support provider-scoped model headers` | New upstream-worthy provider-scoped header plumbing; prevents project/billing/proxy headers from leaking across OpenAI-compatible providers. |
 | `54c14d995` | `feat(gateway): configure macOS app-wrapper identity` | New mostly upstream-worthy launchd/TCC improvement; local config sets the wrapper display/signing identity to Amy for the Mac mini. |
 | `8447438c9` | `fix(redact): preserve replayable tool arguments` | Upstream-worthy non-destructive replay and false-positive fix; adapted from merged #54061/#54136 plus a narrower version of open #47348. |
-| `this commit` | `fix(terminal): ignore inert heredoc background markers` | Upstream-worthy conservative replacement for open #63788; removes quoted interpreter-payload false positives without hiding active shell syntax. |
+| `69c7663c6` | `fix(terminal): ignore inert heredoc background markers` | Upstream-worthy conservative replacement for open #63788; removes quoted interpreter-payload false positives without hiding active shell syntax. |
+| `this commit` | `fix(gateway): preserve app wrapper during plist recovery` | Upstream-worthy macOS self-heal fix found by Devin review-only PR #9. |
 
-### Current 27-Patch Stack
+### Current 28-Patch Stack
 
 | Commit | Subject | Current classification |
 |---|---|---|
@@ -273,7 +311,8 @@ These old local patches are no longer carried in the current stack because Herme
 | `bc8b031e9` | `feat(providers): support provider-scoped model headers` | New upstream-worthy provider-scoped header plumbing; prevents project/billing/proxy headers from leaking across OpenAI-compatible providers. |
 | `54c14d995` | `feat(gateway): configure macOS app-wrapper identity` | Mostly upstream-worthy launchd/TCC improvement; local config sets the wrapper display/signing identity to Amy for the Mac mini. |
 | `8447438c9` | `fix(redact): preserve replayable tool arguments` | Upstream-worthy non-destructive replay and false-positive fix; retain until a release contains equivalent merged fixes. |
-| `this commit` | `fix(terminal): ignore inert heredoc background markers` | Upstream-worthy shell-guard fix; retain until #63788 or a hardened equivalent is merged and released. |
+| `69c7663c6` | `fix(terminal): ignore inert heredoc background markers` | Upstream-worthy shell-guard fix; retain until #63788 or a hardened equivalent is merged and released. |
+| `this commit` | `fix(gateway): preserve app wrapper during plist recovery` | Upstream-worthy missing-plist self-heal fix; retain with the app-wrapper patch until absorbed upstream. |
 
 ### Push/Upgrade Implications
 

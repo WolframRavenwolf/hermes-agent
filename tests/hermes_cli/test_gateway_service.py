@@ -1324,10 +1324,18 @@ class TestLaunchdServiceRecovery:
 
     def test_launchd_start_defers_missing_plist_bootstrap_inside_gateway_tree(self, tmp_path, monkeypatch):
         plist_path = tmp_path / "ai.hermes.gateway.plist"
+        wrapper_path = tmp_path / "missing.app"
+        generated_modes = []
         expected = plistlib.dumps({"Label": "ai.hermes.gateway", "ProgramArguments": ["python"]}).decode("utf-8")
 
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
-        monkeypatch.setattr(gateway_cli, "generate_launchd_plist", lambda app_wrapper=False: expected)
+        monkeypatch.setattr(gateway_cli, "get_launchd_app_wrapper_path", lambda: wrapper_path)
+
+        def fake_generate(app_wrapper=False):
+            generated_modes.append(app_wrapper)
+            return expected
+
+        monkeypatch.setattr(gateway_cli, "generate_launchd_plist", fake_generate)
         monkeypatch.setattr(gateway_cli, "_is_running_inside_gateway_process_tree", lambda: True, raising=False)
         calls = []
 
@@ -1339,8 +1347,84 @@ class TestLaunchdServiceRecovery:
 
         gateway_cli.launchd_start()
 
+        assert generated_modes == [False]
         assert plist_path.read_text(encoding="utf-8") == expected
         assert calls == []
+
+    def test_launchd_start_missing_plist_preserves_existing_app_wrapper(self, tmp_path, monkeypatch):
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        wrapper_path = tmp_path / "Amy.app"
+        wrapper_path.mkdir()
+        install_calls = []
+        generated_modes = []
+        expected = plistlib.dumps({"Label": "ai.hermes.gateway", "ProgramArguments": ["Amy"]}).decode("utf-8")
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "get_launchd_app_wrapper_path", lambda: wrapper_path)
+        monkeypatch.setattr(gateway_cli, "launchd_app_wrapper_is_current", lambda: True)
+        monkeypatch.setattr(
+            gateway_cli,
+            "install_launchd_app_wrapper",
+            lambda force=False: install_calls.append(force) or wrapper_path,
+        )
+        monkeypatch.setattr(gateway_cli, "_is_running_inside_gateway_process_tree", lambda: True, raising=False)
+
+        def fake_generate(app_wrapper=False):
+            generated_modes.append(app_wrapper)
+            return expected
+
+        monkeypatch.setattr(gateway_cli, "generate_launchd_plist", fake_generate)
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda cmd, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )
+
+        gateway_cli.launchd_start()
+
+        assert install_calls == []
+        assert generated_modes == [True]
+        assert plist_path.read_text(encoding="utf-8") == expected
+
+    def test_launchd_start_missing_plist_refreshes_stale_app_wrapper(self, tmp_path, monkeypatch):
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        wrapper_path = tmp_path / "Amy.app"
+        wrapper_path.mkdir()
+        events = []
+        install_calls = []
+        generated_modes = []
+        expected = plistlib.dumps({"Label": "ai.hermes.gateway", "ProgramArguments": ["Amy"]}).decode("utf-8")
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "get_launchd_app_wrapper_path", lambda: wrapper_path)
+        monkeypatch.setattr(gateway_cli, "launchd_app_wrapper_is_current", lambda: False)
+
+        def fake_install(force=False):
+            events.append("install")
+            install_calls.append(force)
+            return wrapper_path
+
+        monkeypatch.setattr(gateway_cli, "install_launchd_app_wrapper", fake_install)
+        monkeypatch.setattr(gateway_cli, "_is_running_inside_gateway_process_tree", lambda: True, raising=False)
+
+        def fake_generate(app_wrapper=False):
+            events.append("generate")
+            generated_modes.append(app_wrapper)
+            return expected
+
+        monkeypatch.setattr(gateway_cli, "generate_launchd_plist", fake_generate)
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda cmd, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )
+
+        gateway_cli.launchd_start()
+
+        assert events == ["install", "generate"]
+        assert install_calls == [True]
+        assert generated_modes == [True]
+        assert plist_path.read_text(encoding="utf-8") == expected
 
     def test_running_inside_gateway_process_tree_requires_matching_launchd_job_pid(self, monkeypatch):
         monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)

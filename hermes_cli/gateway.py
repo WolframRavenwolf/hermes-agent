@@ -4040,7 +4040,13 @@ def launchd_start():
 
     # Self-heal if the plist is missing entirely (e.g., manual cleanup, failed upgrade)
     if not plist_path.exists():
-        new_plist = generate_launchd_plist()
+        # The plist normally records whether launchd uses the optional app
+        # wrapper. If the plist itself vanished, preserve that mode from the
+        # installed bundle instead of silently falling back to raw Python.
+        target_app_wrapper = get_launchd_app_wrapper_path().exists()
+        if target_app_wrapper and not launchd_app_wrapper_is_current():
+            install_launchd_app_wrapper(force=True)
+        new_plist = generate_launchd_plist(app_wrapper=target_app_wrapper)
         if _refuse_temp_home_service_write(new_plist, "launchd plist"):
             sys.exit(1)
         print("↻ launchd plist missing; regenerating service definition")
