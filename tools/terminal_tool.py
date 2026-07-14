@@ -1707,26 +1707,387 @@ def _command_requires_pipe_stdin(command: str) -> bool:
 
 
 _SHELL_LEVEL_BACKGROUND_RE = re.compile(
-    r"(?:^|[;&|]\s*|&&\s*|\|\|\s*|\$\(\s*)(?:nohup|disown|setsid)\b", re.IGNORECASE | re.MULTILINE
+    r"(?:^|[;&|]\s*|&&\s*|\|\|\s*|\$\(\s*|`\s*)(?:nohup|disown|setsid)\b", re.IGNORECASE | re.MULTILINE
 )
-_INLINE_BACKGROUND_AMP_RE = re.compile(r"\s&\s")
-_TRAILING_BACKGROUND_AMP_RE = re.compile(r"\s&\s*(?:#.*)?$")
+_INERT_HEREDOC_CONSUMER_RE = re.compile(
+    r"^\s*"
+    r"(?:[A-Z_][A-Z0-9_]*=\S+\s+)*"
+    r"(?:env\s+)?"
+    r"(?:[A-Za-z0-9_./-]+/)?"
+    r"(?:python(?:3(?:\.\d+)*)?|osascript)(?=\s|$)",
+    re.IGNORECASE,
+)
+
+
+def _strip_simple_quotes(command: str) -> str:
+    """Remove inert quotes without erasing shell-active substitutions."""
+    result = []
+    cursor = 0
+    while cursor < len(command):
+        char = command[cursor]
+        if char == "'":
+            closing = command.find("'", cursor + 1)
+            if closing == -1:
+                result.append(command[cursor:])
+                break
+            result.append("''")
+            cursor = closing + 1
+            continue
+        if char == '"':
+            end = cursor + 1
+            while end < len(command):
+                if command[end] == "\\" and end + 1 < len(command):
+                    end += 2
+                    continue
+                if command[end] == '"':
+                    end += 1
+                    break
+                end += 1
+            if end > len(command) or not command[cursor:end].endswith('"'):
+                result.append(command[cursor:])
+                break
+            segment = command[cursor:end]
+            result.append(segment if "$(" in segment or "`" in segment else '""')
+            cursor = end
+            continue
+        if char == "`":
+            end = cursor + 1
+            while end < len(command):
+                if command[end] == "\\" and end + 1 < len(command):
+                    end += 2
+                    continue
+                if command[end] == "`":
+                    end += 1
+                    break
+                end += 1
+            result.append(command[cursor:end])
+            cursor = end
+            continue
+        result.append(char)
+        cursor += 1
+    return "".join(result)
+
+
+def _contains_nested_shell_scope(command: str) -> bool:
+    """Return whether an opener contains nested executable shell syntax."""
+    visible = _strip_simple_quotes(command)
+    return any(marker in visible for marker in ("$(", "`", "<(", ">("))
+
+
+def _skip_shell_arithmetic(command: str, start: int) -> int:
+    """Return the position after a balanced shell arithmetic expression."""
+    cursor = start + (3 if command.startswith("$((", start) else 2)
+    depth = 1
+    while cursor < len(command):
+        if command.startswith("((", cursor):
+            depth += 1
+            cursor += 2
+            continue
+        if command.startswith("))", cursor):
+            depth -= 1
+            cursor += 2
+            if depth == 0:
+                return cursor
+            continue
+        if command[cursor] == "\\" and cursor + 1 < len(command):
+            cursor += 2
+            continue
+        cursor += 1
+    return len(command)
+
+
+def _contains_background_ampersand(command: str) -> bool:
+    """Detect a shell background operator outside comments/arithmetic."""
+    cursor = 0
+    comment = False
+    while cursor < len(command):
+        char = command[cursor]
+        if comment:
+            if char == "\n":
+                comment = False
+            cursor += 1
+            continue
+        if char == "\\" and cursor + 1 < len(command):
+            cursor += 2
+            continue
+        if char == "#":
+            previous = command[cursor - 1] if cursor else ""
+            if cursor == 0 or previous.isspace() or previous in ";&|()":
+                comment = True
+                cursor += 1
+                continue
+        if command.startswith("$((", cursor) or command.startswith("((", cursor):
+            end = _skip_shell_arithmetic(command, cursor)
+            prefix_len = 3 if command.startswith("$((", cursor) else 2
+            arithmetic = command[cursor + prefix_len:end]
+            if "$(" in arithmetic or "`" in arithmetic:
+                # Nested command substitutions remain executable. Continue
+                # scanning their body; pure arithmetic bitwise '&' stays inert.
+                cursor += prefix_len
+                continue
+            cursor = end
+            continue
+        if char != "&":
+            cursor += 1
+            continue
+
+        previous = command[cursor - 1] if cursor else ""
+        following = command[cursor + 1] if cursor + 1 < len(command) else ""
+        if previous == "&" or following == "&":
+            cursor += 1
+            continue
+        if previous in "<>" or following == ">":
+            cursor += 1
+            continue
+        return True
+    return False
+
+
+def _contains_active_list_or_pipeline_operator(command: str) -> bool:
+    """Return whether an opener composes multiple shell commands."""
+    cursor = 0
+    quote = None
+    comment = False
+    while cursor < len(command):
+        char = command[cursor]
+        if comment:
+            if char == "\n":
+                comment = False
+            cursor += 1
+            continue
+        if quote is not None:
+            if quote in {'"', '`'} and char == "\\" and cursor + 1 < len(command):
+                cursor += 2
+                continue
+            if char == quote:
+                quote = None
+            cursor += 1
+            continue
+        if char == "\\" and cursor + 1 < len(command):
+            cursor += 2
+            continue
+        if char in "'\"`":
+            quote = char
+            cursor += 1
+            continue
+        if char == "#":
+            previous = command[cursor - 1] if cursor else ""
+            if cursor == 0 or previous.isspace() or previous in ";&|()":
+                comment = True
+                cursor += 1
+                continue
+        if char in ";|&":
+            return True
+        cursor += 1
+    return False
+
+
+def _parse_heredoc_operator(command: str, index: int):
+    """Parse one active ``<<`` redirection and return its shell delimiter."""
+    if not command.startswith("<<", index) or command.startswith("<<<", index):
+        return None
+
+    cursor = index + 2
+    strip_tabs = False
+    if cursor < len(command) and command[cursor] == "-":
+        strip_tabs = True
+        cursor += 1
+    while cursor < len(command) and command[cursor] in " \t":
+        cursor += 1
+    if cursor >= len(command) or command[cursor] in "\r\n":
+        return None
+
+    delimiter = []
+    quoted = False
+    while cursor < len(command):
+        char = command[cursor]
+        if char.isspace() or char in ";&|<>()":
+            break
+        if char == "\\":
+            if cursor + 1 >= len(command) or command[cursor + 1] in "\r\n":
+                return None
+            quoted = True
+            delimiter.append(command[cursor + 1])
+            cursor += 2
+            continue
+        if char in "'\"":
+            quoted = True
+            quote = char
+            cursor += 1
+            while cursor < len(command) and command[cursor] != quote:
+                if quote == '"' and command[cursor] == "\\":
+                    if cursor + 1 >= len(command):
+                        return None
+                    following = command[cursor + 1]
+                    if following in {'$', '`', '"', "\\", "\n"}:
+                        delimiter.append(following)
+                        cursor += 2
+                        continue
+                    # In double quotes, backslash is literal before all other
+                    # characters. Preserve it so the terminator stays exact.
+                    delimiter.append("\\")
+                    cursor += 1
+                    continue
+                if command[cursor] in "\r\n":
+                    return None
+                delimiter.append(command[cursor])
+                cursor += 1
+            if cursor >= len(command):
+                return None
+            cursor += 1
+            continue
+        delimiter.append(char)
+        cursor += 1
+
+    if not delimiter and not quoted:
+        return None
+    return cursor, "".join(delimiter), strip_tabs, quoted
+
+
+def _scan_heredoc_command_unit(command: str, start: int):
+    """Scan one logical shell command, ignoring markers in quotes/comments."""
+    cursor = start
+    quote = None
+    comment = False
+    specs = []
+    unknown_operator = False
+
+    while cursor < len(command):
+        char = command[cursor]
+        if comment:
+            if char == "\n":
+                return cursor, specs, unknown_operator
+            cursor += 1
+            continue
+
+        if quote is not None:
+            if quote in {'"', '`'} and char == "\\" and cursor + 1 < len(command):
+                cursor += 2
+                continue
+            if char == quote:
+                quote = None
+            cursor += 1
+            continue
+
+        if char == "\\" and cursor + 1 < len(command):
+            cursor += 2
+            continue
+        if char in "'\"`":
+            quote = char
+            cursor += 1
+            continue
+        if char == "#":
+            previous = command[cursor - 1] if cursor > start else ""
+            if cursor == start or previous.isspace() or previous in ";&|()":
+                comment = True
+                cursor += 1
+                continue
+        if char == "\n":
+            return cursor, specs, unknown_operator
+        if command.startswith("<<<", cursor):
+            cursor += 3
+            continue
+        if command.startswith("<<", cursor):
+            parsed = _parse_heredoc_operator(command, cursor)
+            if parsed is None:
+                unknown_operator = True
+                cursor += 2
+                continue
+            cursor, delimiter, strip_tabs, quoted = parsed
+            specs.append((delimiter, strip_tabs, quoted))
+            continue
+        cursor += 1
+
+    return len(command), specs, unknown_operator
+
+
+def _find_heredoc_close(
+    command: str,
+    body_start: int,
+    delimiter: str,
+    strip_tabs: bool,
+) -> int | None:
+    """Return the position after an exact shell heredoc terminator line."""
+    cursor = body_start
+    while cursor <= len(command):
+        newline = command.find("\n", cursor)
+        if newline == -1:
+            line = command[cursor:]
+            after = len(command)
+        else:
+            line = command[cursor:newline]
+            after = newline + 1
+        if line.endswith("\r"):
+            line = line[:-1]
+        candidate = line.lstrip("\t") if strip_tabs else line
+        if candidate == delimiter:
+            return after
+        if newline == -1:
+            return None
+        cursor = after
+    return None
+
+
+def _strip_inert_quoted_heredocs(command: str) -> str:
+    """Strip only quoted heredoc bodies sent to known non-shell interpreters.
+
+    Unquoted bodies can execute shell expansions, shell-interpreter bodies are
+    executable, and unknown syntax must stay visible. Conservative retention
+    may cause a false positive, but can never hide a real background operator.
+    """
+    ranges = []
+    command_start = 0
+
+    while command_start < len(command):
+        command_end, specs, unknown_operator = _scan_heredoc_command_unit(
+            command,
+            command_start,
+        )
+        if unknown_operator:
+            return command
+        if not specs:
+            if command_end >= len(command):
+                break
+            command_start = command_end + 1
+            continue
+        if command_end >= len(command):
+            return command
+
+        body_cursor = command_end + 1
+        body_ranges = []
+        for delimiter, strip_tabs, _quoted in specs:
+            close_end = _find_heredoc_close(
+                command,
+                body_cursor,
+                delimiter,
+                strip_tabs,
+            )
+            if close_end is None:
+                return command
+            body_ranges.append((body_cursor, close_end))
+            body_cursor = close_end
+
+        raw_opener = command[command_start:command_end]
+        opener = _strip_simple_quotes(raw_opener)
+        if (
+            all(quoted for _delimiter, _strip_tabs, quoted in specs)
+            and not _contains_active_list_or_pipeline_operator(raw_opener)
+            and not _contains_nested_shell_scope(raw_opener)
+            and _INERT_HEREDOC_CONSUMER_RE.search(opener)
+        ):
+            ranges.extend(body_ranges)
+        command_start = body_cursor
+
+    result = command
+    for start, end in reversed(ranges):
+        replacement = "\n" * result[start:end].count("\n")
+        result = result[:start] + replacement + result[end:]
+    return result
 
 
 def _strip_quotes(command: str) -> str:
-    """Remove single- and double-quoted content so regex checks don't match inside strings.
-
-    This prevents false positives when keywords like 'nohup' or 'setsid' appear
-    in commit messages, Python -c code, echo arguments, or PR body text.
-    Also strips backtick-quoted content and heredoc-style inline text.
-    """
-    # Remove single-quoted strings (no escaping inside single quotes in shell)
-    result = re.sub(r"'[^']*'", "''", command)
-    # Remove double-quoted strings (handle escaped quotes)
-    result = re.sub(r'"(?:[^"\\]|\\.)*"', '""', result)
-    # Remove backtick-quoted strings
-    result = re.sub(r"`[^`]*`", "``", result)
-    return result
+    """Remove inert quoted content while preserving shell-visible syntax."""
+    return _strip_simple_quotes(_strip_inert_quoted_heredocs(command))
 
 
 _LONG_LIVED_FOREGROUND_PATTERNS = (
@@ -1758,9 +2119,6 @@ def _foreground_background_guidance(command: str) -> str | None:
     Prevents workflows that start a server/watch process and then stall before
     follow-up checks or test commands run.
     """
-    if _looks_like_help_or_version_command(command):
-        return None
-
     # Strip quoted content so keywords inside strings/arguments don't trigger
     # false positives (e.g., git commit -m "... setsid ...", python3 -c "os.setsid").
     unquoted = _strip_quotes(command)
@@ -1772,11 +2130,17 @@ def _foreground_background_guidance(command: str) -> str | None:
             "readiness checks and tests in separate commands."
         )
 
-    if _INLINE_BACKGROUND_AMP_RE.search(unquoted) or _TRAILING_BACKGROUND_AMP_RE.search(unquoted):
+    if _contains_background_ampersand(unquoted):
         return (
             "Foreground command uses '&' backgrounding. Use terminal(background=true) for long-lived "
             "processes, then run health checks and tests in follow-up terminal calls."
         )
+
+    # Help/version flags suppress only long-lived-command heuristics. They must
+    # never bypass explicit shell wrappers or background operators elsewhere in
+    # a compound command.
+    if _looks_like_help_or_version_command(command):
+        return None
 
     for pattern in _LONG_LIVED_FOREGROUND_PATTERNS:
         if pattern.search(unquoted):

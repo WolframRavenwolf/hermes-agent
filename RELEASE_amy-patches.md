@@ -1,8 +1,8 @@
 # Amy's Patches - Changelog (Branch: amy/patches)
 
 **Current base:** Hermes Agent v2026.6.19
-**Current patch stack:** 26 local Amy patches on Hermes Agent v2026.6.19 after the v0.17.0 rebase, gateway self-management hardening, restart-script detector comment fix, Raft optional-platform log quieting, auxiliary vision fallback parity, generic provider-profile/provider-scoped-header plumbing, configurable macOS app-wrapper identity for Amy/TCC, and non-destructive secret-redactor replay handling
-**Current reconciliation reviewed through:** v0.17.0 rebase/verification on 2026-06-21 plus post-restart stack classification on 2026-06-22; upstream-absorbed patches dropped, Amy-private patches retained; redactor upstream overlap rechecked 2026-07-14
+**Current patch stack:** 27 local Amy patches on Hermes Agent v2026.6.19 after the v0.17.0 rebase, gateway self-management hardening, restart-script detector comment fix, Raft optional-platform log quieting, auxiliary vision fallback parity, generic provider-profile/provider-scoped-header plumbing, configurable macOS app-wrapper identity for Amy/TCC, non-destructive secret-redactor replay handling, and conservative heredoc-aware shell-background detection
+**Current reconciliation reviewed through:** v0.17.0 rebase/verification on 2026-06-21 plus post-restart stack classification on 2026-06-22; upstream-absorbed patches dropped, Amy-private patches retained; redactor and shell-guard upstream overlap rechecked 2026-07-14
 **Author:** Amy Ravenwolf <amy@ravenwolf.de>
 
 > Current goal: keep only Amy/private patches local, and submit every generally useful feature/fix upstream as an open PR so future upgrades have less custom patch baggage.
@@ -57,6 +57,59 @@ boundaries, adapted from merged upstream PR #54061.
 **Session reference:** 2026-07-14 Mattermost cleanup follow-up; Wolfram asked for
 an upstream-first Amy patch because redactor workarounds cost time and tokens
 without reliably protecting executable workflows.
+
+---
+
+## 2026-07-14 - Conservative Heredoc-Aware Shell Background Guard
+
+**Problem:** The foreground terminal guard scanned quoted heredoc payload as if
+it were shell syntax. Python bitwise operators and AppleScript concatenation
+therefore triggered fake shell-background warnings and forced pointless command
+rewrites. Open upstream PR #63788 addressed the basic false positive by removing
+all heredoc bodies, but review found that broad stripping could hide real
+background commands through fake markers in quotes/comments/here-strings,
+unquoted expansion, shell-interpreter consumers, mismatched delimiters,
+compound commands, nested substitutions, and inaccurate quote/backslash rules.
+The existing guard also missed unspaced background operators and let help flags
+short-circuit explicit background detection.
+
+**Solution:** The guard now uses a conservative shell-state scanner rather than
+blind regular-expression deletion. It strips a body only when every heredoc
+delimiter is quoted, exact, terminated, attached to a single uncomplicated
+Python/Python3/osascript command, and outside nested shell scopes. Unquoted,
+unknown, compound, piped, shell-consumed, nested, or unterminated bodies remain
+visible. Ampersand detection now distinguishes real background operators from
+escapes, comments, redirections, logical AND, and pure arithmetic while keeping
+nested command substitutions and backticks executable to the scanner. Help and
+version flags suppress only long-lived-command heuristics, never explicit
+background operators. This is a security-hardened adaptation of open upstream
+PR #63788 rather than a direct backport.
+
+**Affected files:**
+
+- `tools/terminal_tool.py`
+- `tests/tools/test_terminal_heredoc_background_guard.py`
+- `RELEASE_amy-patches.md`
+
+**Verification:**
+
+- RED: successive regression gates reproduced `13`, `10`, and `4` failures for
+  naive stripping, consumer misassociation, unspaced operators, escaped
+  literals, comments/arithmetic, and nested shell scopes.
+- GREEN: heredoc/background suite plus existing foreground timeout-cap tests ->
+  `48 passed`.
+- Combined Redactor, Anthropic, and terminal matrix -> `274 passed`.
+- Canonical full suite in a detached clean-env worktree reported `15` failing
+  files / `29` failing tests plus `4` no-run files; rerunning that exact
+  19-file problem set on the pre-patch `54c14d995` baseline produced the same
+  `15` / `29` / `4` outcome, so the two patches introduced no new full-suite
+  failure.
+- Final Bitchpack spot-check: Shell Guard GO on all previously blocking nested
+  substitution, quoting, arithmetic, and backtick cases.
+- `ruff check`, `py_compile`, and `git diff --check` passed.
+
+**Session reference:** 2026-07-14 Mattermost cleanup follow-up after a legitimate
+Python heredoc containing a bitwise ampersand was rejected as shell backgrounding.
 
 ---
 
@@ -146,7 +199,7 @@ review.
 Counted from the release base, not by diffing against a moving upstream branch or an unsynced fork branch. Fork `main` is supposed to match the release version that `amy/patches` is based on; it may intentionally lag current `upstream/main` between upgrades.
 
 - Current base: `v2026.6.19`
-- Current stack: `26` patches on `amy/patches`
+- Current stack: `27` patches on `amy/patches`
 - Pre-v0.17 backup for comparison: `amy/patches-backup-v2026.6.19-20260621-140428`
 - Pre-v0.17 stack: `32` patches on `v2026.6.5`
 - Exact patch-id absorption check against current `upstream/main`: all 24 pre-2026-07-04 patches showed `+`; the new configurable macOS app-wrapper identity patch still needs a future upstream-overlap check before any PR/rebase decision. Semantic absorption still has to be judged by workflow/code inspection.
@@ -187,9 +240,10 @@ These old local patches are no longer carried in the current stack because Herme
 | `180b27597` | `fix(providers): resolve ProviderProfile plugins in CLI identity` | New upstream-worthy generic provider identity fix extracted while reviewing CoreWeave PR #44250. |
 | `bc8b031e9` | `feat(providers): support provider-scoped model headers` | New upstream-worthy provider-scoped header plumbing; prevents project/billing/proxy headers from leaking across OpenAI-compatible providers. |
 | `54c14d995` | `feat(gateway): configure macOS app-wrapper identity` | New mostly upstream-worthy launchd/TCC improvement; local config sets the wrapper display/signing identity to Amy for the Mac mini. |
-| `this commit` | `fix(redact): preserve replayable tool arguments` | Upstream-worthy non-destructive replay and false-positive fix; adapted from merged #54061/#54136 plus a narrower version of open #47348. |
+| `8447438c9` | `fix(redact): preserve replayable tool arguments` | Upstream-worthy non-destructive replay and false-positive fix; adapted from merged #54061/#54136 plus a narrower version of open #47348. |
+| `this commit` | `fix(terminal): ignore inert heredoc background markers` | Upstream-worthy conservative replacement for open #63788; removes quoted interpreter-payload false positives without hiding active shell syntax. |
 
-### Current 26-Patch Stack
+### Current 27-Patch Stack
 
 | Commit | Subject | Current classification |
 |---|---|---|
@@ -218,7 +272,8 @@ These old local patches are no longer carried in the current stack because Herme
 | `180b27597` | `fix(providers): resolve ProviderProfile plugins in CLI identity` | New upstream-worthy generic provider identity fix extracted while reviewing CoreWeave PR #44250. |
 | `bc8b031e9` | `feat(providers): support provider-scoped model headers` | New upstream-worthy provider-scoped header plumbing; prevents project/billing/proxy headers from leaking across OpenAI-compatible providers. |
 | `54c14d995` | `feat(gateway): configure macOS app-wrapper identity` | Mostly upstream-worthy launchd/TCC improvement; local config sets the wrapper display/signing identity to Amy for the Mac mini. |
-| `this commit` | `fix(redact): preserve replayable tool arguments` | Upstream-worthy non-destructive replay and false-positive fix; retain until a release contains equivalent merged fixes. |
+| `8447438c9` | `fix(redact): preserve replayable tool arguments` | Upstream-worthy non-destructive replay and false-positive fix; retain until a release contains equivalent merged fixes. |
+| `this commit` | `fix(terminal): ignore inert heredoc background markers` | Upstream-worthy shell-guard fix; retain until #63788 or a hardened equivalent is merged and released. |
 
 ### Push/Upgrade Implications
 
