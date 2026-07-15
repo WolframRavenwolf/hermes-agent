@@ -700,6 +700,61 @@ class TestTerminalOutputRedaction:
 
 
 
+    def test_printenv_preserves_exact_safe_operational_metadata(self):
+        from agent.redact import redact_terminal_output
+
+        out = (
+            "GIT_AUTHOR_NAME=Amy Ravenwolf\n"
+            "GIT_AUTHOR_EMAIL=amy@example.test\n"
+            "GIT_AUTHOR_DATE=Thu Jul 16 12:34:56 2026 +0200\n"
+            "SSH_AUTH_SOCK=/private/tmp/com.apple.launchd.ABCD/Listeners"
+        )
+
+        assert redact_terminal_output(out, "printenv", force=True) == out
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "AUTH_KEY",
+            "AUTH_TOKEN",
+            "ACCESS_TOKEN_VALUE",
+            "CREDENTIAL_VALUE",
+            "GIT_AUTHOR_TOKEN",
+            "AUTH_BEFORE",
+            "AUTH_AFTER",
+        ],
+    )
+    def test_printenv_masks_secret_like_nearby_names(self, name):
+        from agent.redact import redact_terminal_output
+
+        secret = "opaque-sensitive-value-1234567890"
+        redacted = redact_terminal_output(
+            f"{name}={secret}", "printenv", force=True
+        )
+
+        assert secret not in redacted
+        assert redacted.startswith(f"{name}=")
+
+    def test_printenv_safe_metadata_still_masks_prefixed_secret_value(self):
+        from agent.redact import redact_terminal_output
+
+        token = "sk-" + "A" * 32
+        out = f"GIT_AUTHOR_NAME={token}"
+        redacted = redact_terminal_output(out, "printenv", force=True)
+
+        assert token not in redacted
+        assert redacted != out
+
+    def test_non_env_command_preserves_source_false_positives(self):
+        from agent.redact import redact_terminal_output
+
+        token = "sk-" + "prod0123456789abcdef0123456789"
+        out = f"MAX_TOKENS=100\nOPENAI_API_KEY={token}"
+        redacted = redact_terminal_output(out, "cat config.py")
+
+        assert "MAX_TOKENS=100" in redacted
+        assert token not in redacted
+
     def test_disabled_passes_through(self, monkeypatch):
         from agent.redact import redact_terminal_output
         monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
