@@ -4,6 +4,15 @@
   "description": "WhatsApp bridge for Hermes Agent using Baileys",
   "private": true,
   "type": "module",
+  "hermesRuntimeFiles": [
+    "bridge.js",
+    "bridge_helpers.js",
+    "allowlist.js",
+    "outbound_ids.js",
+    "owner_message_gate.js",
+    "package.json",
+    "package-lock.json"
+  ],
   "scripts": {
     "start": "node bridge.js"
   },

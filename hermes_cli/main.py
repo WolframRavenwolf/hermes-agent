@@ -2860,48 +2860,10 @@ def cmd_whatsapp(args):
         else:
             print("  ⚠ No allowlist — the agent will respond to ALL incoming messages")
 
-    # ── Step 4: Install bridge dependencies ──────────────────────────────
-    from gateway.platforms.whatsapp_common import resolve_whatsapp_bridge_dir
-    bridge_dir = resolve_whatsapp_bridge_dir()
-    bridge_script = bridge_dir / "bridge.js"
-
-    if not bridge_script.exists():
-        print(f"\n✗ Bridge script not found at {bridge_script}")
-        return
-
-    if not (bridge_dir / "node_modules").exists():
-        print(
-            "\n→ Installing WhatsApp bridge dependencies (this can take a few minutes)..."
-        )
-        npm = find_node_executable("npm")
-        if not npm:
-            print("  ✗ npm not found on PATH — install Node.js first")
-            return
-        try:
-            result = subprocess.run(
-                [npm, "install", "--no-fund", "--no-audit", "--progress=false"],
-                cwd=str(bridge_dir),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                env=with_hermes_node_path(),
-            )
-        except KeyboardInterrupt:
-            print("\n  ✗ Install cancelled")
-            return
-        if result.returncode != 0:
-            err = (result.stderr or "").strip()
-            preview = "\n".join(err.splitlines()[-30:]) if err else "(no output)"
-            print("  ✗ npm install failed:")
-            print(preview)
-            return
-        print("  ✓ Dependencies installed")
-    else:
-        print("✓ Bridge dependencies already installed")
-
-    # ── Step 5: Check for existing session ───────────────────────────────
+    # ── Step 4: Reuse or clear an existing session ────────────────────────
+    # A user who keeps an already-paired session can return immediately;
+    # adapter startup will run the same shared dependency transaction. This
+    # avoids making re-enablement depend on registry availability.
     session_dir = get_hermes_home() / "whatsapp" / "session"
     session_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2918,15 +2880,37 @@ def cmd_whatsapp(args):
             session_dir.mkdir(parents=True, exist_ok=True)
             print("  ✓ Session cleared")
         else:
-            # Existing pairing — ensure WHATSAPP_ENABLED reflects that.
-            # (Older installs may have lost the env var; covers re-runs
-            # where the user picked "no, keep my session" but the var
-            # was never set or got removed.)
             if (get_env_value("WHATSAPP_ENABLED") or "").lower() != "true":
                 save_env_value("WHATSAPP_ENABLED", "true")
             print("\n✓ WhatsApp is configured and paired!")
             print("  Start the gateway with: hermes gateway")
             return
+
+    # ── Step 5: Install bridge dependencies ──────────────────────────────
+    from gateway.platforms.whatsapp_common import (
+        WhatsAppBridgeDependencyError,
+        ensure_whatsapp_bridge_dependencies,
+        resolve_whatsapp_bridge_dir,
+    )
+
+    try:
+        bridge_dir = resolve_whatsapp_bridge_dir()
+        bridge_script = bridge_dir / "bridge.js"
+        if not bridge_script.exists():
+            print(f"\n✗ Bridge script not found at {bridge_script}")
+            return
+        installed_dependencies = ensure_whatsapp_bridge_dependencies(bridge_dir)
+    except KeyboardInterrupt:
+        print("\n  ✗ Install cancelled")
+        return
+    except WhatsAppBridgeDependencyError as exc:
+        print(f"\n  ✗ WhatsApp bridge dependency install failed: {exc}")
+        return
+
+    if installed_dependencies:
+        print("  ✓ Dependencies installed")
+    else:
+        print("✓ Bridge dependencies already installed")
 
     # ── Step 6: QR code pairing ──────────────────────────────────────────
     print()

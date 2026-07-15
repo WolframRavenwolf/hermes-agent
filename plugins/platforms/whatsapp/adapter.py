@@ -284,7 +284,14 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.whatsapp_common import WhatsAppBehaviorMixin
+from gateway.platforms.whatsapp_common import (
+    WhatsAppBridgeDependencyError,
+    WhatsAppBehaviorMixin,
+    _file_content_hash as _shared_file_content_hash,
+    ensure_whatsapp_bridge_dependencies,
+    resolve_whatsapp_bridge_dir,
+    whatsapp_bridge_source_hash,
+)
 from gateway.whatsapp_identity import to_whatsapp_jid
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -295,7 +302,7 @@ from gateway.platforms.base import (
     cache_image_from_url,
     cache_audio_from_url,
 )
-from utils import env_int
+
 
 
 def _is_allowed_bridge_path(url: str) -> bool:
@@ -340,19 +347,13 @@ def _is_allowed_bridge_path(url: str) -> bool:
 
 
 def _file_content_hash(path: Path) -> str:
-    """Return the first 16 hex chars of the SHA-256 of *path*'s contents.
+    """Compatibility alias for the shared single-file hash helper."""
+    return _shared_file_content_hash(Path(path))
 
-    Used for the bridge staleness handshake: bridge.js reports its own
-    source hash in ``/health`` (``scriptHash``), and the adapter compares
-    it against the hash of bridge.js currently on disk.  A mismatch means
-    a long-lived bridge process is serving code from before an update.
-    Returns ``""`` when the file can't be read.
-    """
-    import hashlib
-    try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
-    except OSError:
-        return ""
+
+def _bridge_source_hash(path: Path) -> str:
+    """Compatibility alias for the shared complete-runtime source hash."""
+    return whatsapp_bridge_source_hash(Path(path))
 
 
 def check_whatsapp_requirements() -> bool:
@@ -407,21 +408,31 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     share it. Only transport-specific code lives here.
     """
 
-    # Default bridge location resolved via shared helper
+    # Default bridge location resolved via the transactional mirror updater.
     _DEFAULT_BRIDGE_DIR = None  # resolved in __init__
     splits_long_messages = True  # send() chunks via truncate_message()
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.WHATSAPP)
-        # Use shared helper for bridge directory resolution (handles read-only install tree)
-        if WhatsAppAdapter._DEFAULT_BRIDGE_DIR is None:
-            from gateway.platforms.whatsapp_common import resolve_whatsapp_bridge_dir
-            WhatsAppAdapter._DEFAULT_BRIDGE_DIR = resolve_whatsapp_bridge_dir()
+        # Resolve through the transactional mirror updater. Lock contention or
+        # an unavailable npm executable is a typed, retryable startup state — it
+        # must never escape the adapter constructor and crash platform loading.
+        self._bridge_resolution_error: Optional[WhatsAppBridgeDependencyError] = None
+        configured_bridge = config.extra.get("bridge_script")
+        if configured_bridge is None and WhatsAppAdapter._DEFAULT_BRIDGE_DIR is None:
+            try:
+                WhatsAppAdapter._DEFAULT_BRIDGE_DIR = resolve_whatsapp_bridge_dir()
+            except WhatsAppBridgeDependencyError as exc:
+                self._bridge_resolution_error = exc
         self._bridge_process: Optional[subprocess.Popen] = None
         self._bridge_port: int = config.extra.get("bridge_port", 3000)
-        self._bridge_script: Optional[str] = config.extra.get(
-            "bridge_script",
-            str(self._DEFAULT_BRIDGE_DIR / "bridge.js"),
+        default_bridge = (
+            str(self._DEFAULT_BRIDGE_DIR / "bridge.js")
+            if self._DEFAULT_BRIDGE_DIR is not None
+            else None
+        )
+        self._bridge_script: Optional[str] = (
+            str(configured_bridge) if configured_bridge is not None else default_bridge
         )
         self._session_path: Path = Path(config.extra.get(
             "session_path",
@@ -512,6 +523,25 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         
         This launches the Node.js bridge process and waits for it to be ready.
         """
+        if self._bridge_script is None:
+            try:
+                resolved_bridge = resolve_whatsapp_bridge_dir()
+            except WhatsAppBridgeDependencyError as exc:
+                logger.warning(
+                    "[%s] WhatsApp bridge runtime is busy or unavailable: %s",
+                    self.name,
+                    exc,
+                )
+                self._set_fatal_error(
+                    "whatsapp_bridge_runtime_unavailable",
+                    str(exc),
+                    retryable=True,
+                )
+                return False
+            WhatsAppAdapter._DEFAULT_BRIDGE_DIR = resolved_bridge
+            self._bridge_script = str(resolved_bridge / "bridge.js")
+            self._bridge_resolution_error = None
+
         if not check_whatsapp_requirements():
             logger.warning("[%s] Node.js not found. WhatsApp requires Node.js.", self.name)
             self._set_fatal_error(
@@ -565,51 +595,22 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             logger.warning("[%s] Could not acquire session lock (non-fatal): %s", self.name, e)
 
         try:
-            # Auto-install npm dependencies when node_modules is missing OR
-            # package.json changed since the last install (e.g. after
-            # `hermes update` bumps the Baileys pin).  The stamp file records
-            # the package.json hash of the last successful install.
             bridge_dir = bridge_path.parent
-            _pkg_json = bridge_dir / "package.json"
-            _dep_stamp = bridge_dir / "node_modules" / ".hermes-pkg-hash"
-            _pkg_hash = _file_content_hash(_pkg_json)
-            _deps_fresh = False
-            if (bridge_dir / "node_modules").exists():
-                try:
-                    _deps_fresh = (
-                        _dep_stamp.read_text(encoding="utf-8").strip() == _pkg_hash
-                    ) and bool(_pkg_hash)
-                except OSError:
-                    _deps_fresh = False
-            if not _deps_fresh:
-                print(f"[{self.name}] Installing WhatsApp bridge dependencies...")
-                # Resolve npm path so Windows uses npm.cmd from the
-                # Hermes-managed portable Node before falling back to PATH.
-                _npm_bin = find_node_executable("npm") or "npm"
-                try:
-                    # Read timeout from environment variable, default to 300 seconds (5 minutes)
-                    # to accommodate slower systems like Unraid NAS
-                    npm_install_timeout = env_int("WHATSAPP_NPM_INSTALL_TIMEOUT", 300)
-                    install_result = subprocess.run(
-                        [_npm_bin, "install", "--silent"],
-                        cwd=str(bridge_dir),
-                        capture_output=True,
-                        text=True, encoding='utf-8', errors='replace',
-                        timeout=npm_install_timeout,
-                        env=with_hermes_node_path(),
-                    )
-                    if install_result.returncode != 0:
-                        print(f"[{self.name}] npm install failed: {install_result.stderr}")
-                        return False
-                    print(f"[{self.name}] Dependencies installed")
-                    if _pkg_hash:
-                        try:
-                            _dep_stamp.write_text(_pkg_hash, encoding="utf-8")
-                        except OSError:
-                            pass  # Stamp is an optimization; install still succeeded
-                except Exception as e:
-                    print(f"[{self.name}] Failed to install dependencies: {e}")
-                    return False
+            try:
+                installed_dependencies = ensure_whatsapp_bridge_dependencies(
+                    bridge_dir
+                )
+            except WhatsAppBridgeDependencyError as exc:
+                print(f"[{self.name}] WhatsApp dependencies are unavailable: {exc}")
+                self._set_fatal_error(
+                    "whatsapp_dependencies_unavailable",
+                    str(exc),
+                    retryable=True,
+                )
+                return False
+            if installed_dependencies:
+                print(f"[{self.name}] Dependencies installed")
+
 
             # Ensure session directory exists
             self._session_path.mkdir(parents=True, exist_ok=True)
@@ -627,18 +628,22 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                             bridge_status = data.get("status", "unknown")
                             if bridge_status == "connected":
                                 # Staleness handshake: only reuse a running
-                                # bridge if it is serving the same bridge.js
-                                # that is on disk right now.  A long-lived
-                                # bridge survives gateway restarts AND
-                                # `hermes update`, so without this check it
-                                # keeps serving pre-update code forever
-                                # (e.g. no inbound media download).  Old
-                                # bridges that don't report scriptHash are
+                                # bridge if it is serving the same complete,
+                                # manifest-owned runtime bytes that are on disk
+                                # right now. A long-lived bridge survives
+                                # gateway restarts AND `hermes update`, so
+                                # without this check it keeps serving pre-update
+                                # code forever (e.g. no inbound media download).
+                                # Old bridges that don't report scriptHash are
                                 # treated as stale by definition.
                                 running_hash = data.get("scriptHash", "")
-                                disk_hash = _file_content_hash(bridge_path)
-                                running_read_receipts = bool(data.get("sendReadReceipts", False))
-                                config_matches = running_read_receipts == self._send_read_receipts
+                                disk_hash = _bridge_source_hash(bridge_path)
+                                running_read_receipts = bool(
+                                    data.get("sendReadReceipts", False)
+                                )
+                                config_matches = (
+                                    running_read_receipts == self._send_read_receipts
+                                )
                                 if (
                                     running_hash
                                     and disk_hash

@@ -8491,61 +8491,36 @@ def _whatsapp_linked_account_from_session(session_path: Path) -> tuple[str | Non
 
 
 def _ensure_whatsapp_bridge_dependencies(bridge_dir: Path) -> None:
-    """Install bridge dependencies when the dashboard is the setup surface."""
-    if (bridge_dir / "node_modules").exists():
-        return
+    """Translate the shared dependency error into dashboard HTTP semantics."""
+    from gateway.platforms.whatsapp_common import (
+        WhatsAppBridgeBusyError,
+        WhatsAppBridgeDependencyError,
+        ensure_whatsapp_bridge_dependencies,
+    )
 
-    from hermes_constants import find_node_executable, with_hermes_node_path
-    from utils import env_int
-
-    npm = find_node_executable("npm")
-    if not npm:
-        raise HTTPException(
-            status_code=500,
-            detail="npm was not found. WhatsApp setup needs Node.js and npm.",
-        )
-
-    timeout = env_int("WHATSAPP_NPM_INSTALL_TIMEOUT", 300)
     try:
-        result = subprocess.run(
-            [npm, "install", "--silent"],
-            cwd=str(bridge_dir),
-            capture_output=True,
-            text=True,
-            # npm output is UTF-8; guard the Windows ANSI-code-page default
-            # against undefined bytes crashing the reader thread (#52649).
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            env=with_hermes_node_path(),
-            creationflags=windows_hide_flags(),
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise HTTPException(
-            status_code=500,
-            detail="Installing WhatsApp bridge dependencies timed out.",
-        ) from exc
-    except OSError as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to install WhatsApp bridge dependencies: {exc}",
-        ) from exc
+        ensure_whatsapp_bridge_dependencies(bridge_dir)
+    except WhatsAppBridgeBusyError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except WhatsAppBridgeDependencyError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()
-        if detail:
-            detail = "\n".join(detail.splitlines()[-10:])
-        raise HTTPException(
-            status_code=500,
-            detail=f"npm install failed for WhatsApp bridge: {detail or 'no output'}",
-        )
 
 
 def _spawn_whatsapp_pairing_process(session_path: Path, mode: str) -> subprocess.Popen:
-    from gateway.platforms.whatsapp_common import resolve_whatsapp_bridge_dir
+    from gateway.platforms.whatsapp_common import (
+        WhatsAppBridgeBusyError,
+        WhatsAppBridgeDependencyError,
+        resolve_whatsapp_bridge_dir,
+    )
     from hermes_constants import find_node_executable, with_hermes_node_path
 
-    bridge_dir = resolve_whatsapp_bridge_dir()
+    try:
+        bridge_dir = resolve_whatsapp_bridge_dir()
+    except WhatsAppBridgeBusyError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except WhatsAppBridgeDependencyError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     bridge_script = bridge_dir / "bridge.js"
     if not bridge_script.exists():
         raise HTTPException(
