@@ -53,6 +53,114 @@ from utils import env_var_enabled
 
 logger = logging.getLogger(__name__)
 
+_CANONICAL_RESTART_HELPER_SHA256 = (
+    "2b701ed6fd77970df01ef2a8eb7cebab1bc3e8cda76fbe31abae0d17b3602236"
+)
+_RESTART_BROKER_FIXED_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+_RESTART_BROKER_HANDOFF_ENV = ("HOME", "HERMES_HOME", "_HERMES_GATEWAY")
+
+
+def _build_fd_bound_restart_helper_command(
+    script_path: Path,
+    arguments: list[str],
+    expected_sha256: str,
+    *,
+    hermes_home: Optional[Path] = None,
+) -> tuple[list[str], dict[str, str]]:
+    """Build a direct isolated-Python invocation for one already-open file.
+
+    The lifecycle guard's path check is useful for authorization, but executing
+    that path later would leave a read-then-execute race.  This broker opens the
+    regular file with ``O_NOFOLLOW``, verifies owner/mode/size and SHA-256 from
+    that descriptor, rewinds it, then asks Bash to execute ``/dev/fd/N``.
+
+    Both interpreter hops use fixed argv and a small allowlist environment.
+    Isolated Python excludes ``PYTHONPATH``, ``sitecustomize`` from user paths,
+    and CWD imports; direct spawning prevents an inherited ``BASH_ENV`` from
+    running in an outer command shell before the broker can sanitize it.
+    """
+    broker = """
+import hashlib
+import hmac
+import os
+import stat
+import sys
+
+path, expected, *arguments = sys.argv[1:]
+fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+metadata = os.fstat(fd)
+if not stat.S_ISREG(metadata.st_mode):
+    raise SystemExit("restart helper is not a regular file")
+if metadata.st_uid != os.getuid() or metadata.st_mode & 0o022:
+    raise SystemExit("restart helper ownership/mode changed")
+if metadata.st_size > 1024 * 1024:
+    raise SystemExit("restart helper exceeds size limit")
+digest = hashlib.sha256()
+while True:
+    chunk = os.read(fd, 65536)
+    if not chunk:
+        break
+    digest.update(chunk)
+if not hmac.compare_digest(digest.hexdigest(), expected.casefold()):
+    raise SystemExit("restart helper SHA-256 changed")
+os.lseek(fd, 0, os.SEEK_SET)
+os.set_inheritable(fd, True)
+environment = {
+    name: os.environ[name]
+    for name in ("PATH", "HOME", "HERMES_HOME", "_HERMES_GATEWAY")
+    if name in os.environ
+}
+environment["HERMES_VERIFIED_RESTART_SOURCE"] = path
+environment["HERMES_VERIFIED_RESTART_SHA256"] = expected
+os.execve(
+    "/bin/bash",
+    ["/bin/bash", f"/dev/fd/{fd}", *arguments],
+    environment,
+)
+""".strip()
+    environment = {"PATH": _RESTART_BROKER_FIXED_PATH}
+    for name in _RESTART_BROKER_HANDOFF_ENV:
+        value = os.environ.get(name)
+        if value is not None:
+            environment[name] = value
+    if hermes_home is not None:
+        environment["HERMES_HOME"] = str(hermes_home)
+    argv = [
+        "/usr/bin/python3",
+        "-I",
+        "-c",
+        broker,
+        str(script_path),
+        expected_sha256,
+        *arguments,
+    ]
+    return argv, environment
+
+
+def _run_fd_bound_restart_helper(
+    invocation: tuple[list[str], dict[str, str]],
+    *,
+    cwd: str,
+    timeout: int,
+) -> dict[str, Any]:
+    """Execute the verified helper without any intervening command shell."""
+    argv, environment = invocation
+    completed = subprocess.run(
+        argv,
+        cwd=cwd,
+        env=environment,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        timeout=timeout,
+        check=False,
+        start_new_session=True,
+    )
+    return {"output": completed.stdout, "returncode": completed.returncode}
+
 
 # ---------------------------------------------------------------------------
 # Global interrupt event: set by the agent when a user interrupt arrives.
@@ -2501,6 +2609,9 @@ def terminal_tool(
         # never restart. This mirrors the `hermes gateway restart` guard in
         # hermes_cli/gateway.py and the cron-path guard in hermes_cli/cron.py,
         # but applies unconditionally (force=True cannot help here).
+        fd_bound_restart_helper_invocation: Optional[
+            tuple[list[str], dict[str, str]]
+        ] = None
         if os.environ.get("_HERMES_GATEWAY") == "1":
             from cron.lifecycle_guard import (
                 contains_gateway_lifecycle_command_or_referenced_script,
@@ -2532,11 +2643,25 @@ def terminal_tool(
             if env_type == "local":
                 from hermes_constants import get_hermes_home
 
+                canonical_helper_path = (
+                    get_hermes_home() / "scripts" / "restart-gateway.sh"
+                )
                 canonical_restart_helper = is_direct_canonical_restart_helper_command(
                     command,
-                    script_path=get_hermes_home() / "scripts" / "restart-gateway.sh",
+                    script_path=canonical_helper_path,
                     cwd=guard_cwd,
+                    expected_sha256=_CANONICAL_RESTART_HELPER_SHA256,
                 )
+                if canonical_restart_helper:
+                    direct_tokens = shlex.split(command, comments=True, posix=True)
+                    fd_bound_restart_helper_invocation = (
+                        _build_fd_bound_restart_helper_command(
+                            canonical_helper_path,
+                            direct_tokens[1:],
+                            _CANONICAL_RESTART_HELPER_SHA256,
+                            hermes_home=get_hermes_home(),
+                        )
+                    )
 
             def _read_script_in_env(script_path: str) -> Optional[str]:
                 """Best-effort script read; uses env.execute only when local read fails.
@@ -2556,6 +2681,10 @@ def terminal_tool(
                         if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 1024 * 1024:
                             data = local_path.read_bytes()
                             if len(data) <= 1024 * 1024:
+                                if b"\x00" in data:
+                                    # A binary is not shell source. This empty authoritative
+                                    # read prevents a second pass through the remote fallback.
+                                    return ""
                                 return data.decode("utf-8", errors="replace")
                 except Exception:
                     pass
@@ -2652,7 +2781,21 @@ def terminal_tool(
                     "status": "blocked"
                 }, ensure_ascii=False)
 
-        # Prepare command for execution
+        # Prepare command for execution. The process registry only accepts a
+        # shell command string, so background mode would reopen both startup-file
+        # and path-swap injection. The canonical helper already schedules its own
+        # detached worker and must cross this boundary synchronously.
+        if fd_bound_restart_helper_invocation is not None and background:
+            return json.dumps({
+                "output": "",
+                "exit_code": 1,
+                "error": (
+                    "The canonical restart helper must run in foreground mode "
+                    "so Hermes can preserve its direct-argv security boundary. "
+                    "The helper schedules its own detached worker when needed."
+                ),
+                "status": "error",
+            }, ensure_ascii=False)
         pty_disabled_reason = None
         effective_pty = pty
         if pty and _command_requires_pipe_stdin(command):
@@ -2946,7 +3089,14 @@ def terminal_tool(
                         # reads, RPC reads) intentionally stay unbounded.
                         "bounded_capture": True,
                     }
-                    result = env.execute(command, **execute_kwargs)
+                    if fd_bound_restart_helper_invocation is not None:
+                        result = _run_fd_bound_restart_helper(
+                            fd_bound_restart_helper_invocation,
+                            cwd=command_cwd,
+                            timeout=effective_timeout,
+                        )
+                    else:
+                        result = env.execute(command, **execute_kwargs)
                 except Exception as e:
                     error_str = str(e).lower()
                     if "timeout" in error_str:

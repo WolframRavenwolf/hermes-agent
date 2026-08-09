@@ -557,9 +557,17 @@ class TestTerminalToolGatewayLifecycleGuard:
         helper = tmp_path / "scripts" / "restart-gateway.sh"
         helper.parent.mkdir()
         helper.write_text(
-            "#!/bin/bash\nlaunchctl submit -l ai.hermes.restart -- /bin/true\n"
+            "#!/bin/bash\n"
+            "if false; then launchctl submit -l ai.hermes.restart -- /bin/true; fi\n"
+            "printf 'restart scheduled:%s\\n' \"${1:-none}\"\n"
         )
         helper.chmod(0o700)
+        import hashlib
+        monkeypatch.setattr(
+            tt,
+            "_CANONICAL_RESTART_HELPER_SHA256",
+            hashlib.sha256(helper.read_bytes()).hexdigest(),
+        )
         monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
 
         calls = []
@@ -581,7 +589,262 @@ class TestTerminalToolGatewayLifecycleGuard:
         result = json.loads(tt.terminal_tool(command=command))
 
         assert result["exit_code"] == 0
-        assert calls == [command]
+        assert result["output"] == f"restart scheduled:{arg.strip() or 'none'}"
+        assert calls == []
+
+    def test_direct_canonical_restart_helper_rejects_background_shell_path(
+        self, monkeypatch, tmp_path
+    ):
+        import hashlib
+
+        import hermes_constants
+        import tools.terminal_tool as tt
+        from tools.process_registry import process_registry
+
+        helper = tmp_path / "scripts" / "restart-gateway.sh"
+        helper.parent.mkdir()
+        helper.write_text("#!/bin/bash\nprintf 'scheduled\\n'\n")
+        helper.chmod(0o700)
+        monkeypatch.setattr(
+            tt,
+            "_CANONICAL_RESTART_HELPER_SHA256",
+            hashlib.sha256(helper.read_bytes()).hexdigest(),
+        )
+        monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
+
+        class _FakeEnv:
+            env = {}
+            cwd = str(tmp_path)
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda command, env, **kwargs: {"approved": True}
+        )
+
+        def _must_not_spawn_shell(*args, **kwargs):
+            raise AssertionError("shell-backed background spawn must not be reached")
+
+        monkeypatch.setattr(process_registry, "spawn_local", _must_not_spawn_shell)
+
+        result = json.loads(tt.terminal_tool(command=str(helper), background=True))
+
+        assert result["exit_code"] == 1
+        assert "foreground" in result["error"]
+        assert "direct-argv security boundary" in result["error"]
+
+    def test_direct_restart_helper_ignores_inherited_bash_env_and_keeps_handoff(
+        self, monkeypatch, tmp_path
+    ):
+        import hashlib
+        import subprocess
+
+        import hermes_constants
+        import tools.terminal_tool as tt
+
+        helper = tmp_path / "scripts" / "restart-gateway.sh"
+        helper.parent.mkdir()
+        helper.write_text(
+            "#!/bin/bash\n"
+            "if false; then launchctl submit -l ai.hermes.restart -- /bin/true; fi\n"
+            "printf 'home=%s gateway=%s source=%s digest=%s\\n' "
+            '"${HERMES_HOME:-unset}" "${_HERMES_GATEWAY:-unset}" '
+            '"${HERMES_VERIFIED_RESTART_SOURCE:-unset}" '
+            '"${HERMES_VERIFIED_RESTART_SHA256:-unset}"\n'
+            "printf 'startup=%s:%s:%s:%s\\n' "
+            '"${BASH_ENV:-unset}" "${ENV:-unset}" '
+            '"${PYTHONHOME:-unset}" "${PYTHONPATH:-unset}"\n'
+        )
+        helper.chmod(0o700)
+        digest = hashlib.sha256(helper.read_bytes()).hexdigest()
+        monkeypatch.setattr(tt, "_CANONICAL_RESTART_HELPER_SHA256", digest)
+        monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
+
+        injected = tmp_path / "bash-env-ran"
+        bash_env = tmp_path / "bash-env.sh"
+        bash_env.write_text(f"printf injected > {injected}\n")
+        monkeypatch.setenv("BASH_ENV", str(bash_env))
+        monkeypatch.setenv("ENV", str(bash_env))
+        monkeypatch.setenv("PYTHONHOME", str(tmp_path / "python-home"))
+        monkeypatch.setenv("PYTHONPATH", str(tmp_path / "python-path"))
+        monkeypatch.setenv("LD_PRELOAD", str(tmp_path / "loader.so"))
+        monkeypatch.setenv("DYLD_INSERT_LIBRARIES", str(tmp_path / "loader.dylib"))
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        class _ShellExecutingEnv:
+            env = {}
+            cwd = str(tmp_path)
+
+            def execute(self, command, **kwargs):
+                completed = subprocess.run(
+                    ["/bin/bash", "-c", command],
+                    cwd=kwargs.get("cwd"),
+                    env=os.environ.copy(),
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    check=False,
+                )
+                return {
+                    "output": completed.stdout,
+                    "returncode": completed.returncode,
+                }
+
+        self._patch_env(monkeypatch, _ShellExecutingEnv(), inside_gateway=True)
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda command, env, **kwargs: {"approved": True}
+        )
+
+        result = json.loads(tt.terminal_tool(command=str(helper)))
+
+        assert result["exit_code"] == 0
+        assert not injected.exists()
+        assert (
+            result["output"]
+            == f"home={tmp_path} gateway=1 source={helper} digest={digest}\n"
+            "startup=unset:unset:unset:unset"
+        )
+
+    def test_fd_bound_restart_broker_rejects_path_swap(self, tmp_path):
+        import hashlib
+        import subprocess
+
+        import tools.terminal_tool as tt
+
+        helper = tmp_path / "restart-gateway.sh"
+        helper.write_text("#!/bin/bash\nprintf 'trusted:%s\\n' \"${1:-none}\"\n")
+        helper.chmod(0o700)
+        digest = hashlib.sha256(helper.read_bytes()).hexdigest()
+        broker_argv, broker_environment = tt._build_fd_bound_restart_helper_command(
+            helper, ["--dry-run"], digest
+        )
+
+        trusted = subprocess.run(
+            broker_argv,
+            env=broker_environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert trusted.returncode == 0
+        assert trusted.stdout == "trusted:--dry-run\n"
+
+        helper.write_text("#!/bin/bash\nprintf 'replaced\\n'\n")
+        helper.chmod(0o700)
+        replaced = subprocess.run(
+            broker_argv,
+            env=broker_environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert replaced.returncode != 0
+        assert "replaced" not in replaced.stdout
+        assert "SHA-256 changed" in replaced.stderr
+
+    def test_fd_bound_restart_broker_uses_isolated_fixed_argv(
+        self, monkeypatch, tmp_path
+    ):
+        import hashlib
+
+        import tools.terminal_tool as tt
+
+        helper = tmp_path / "restart-gateway.sh"
+        helper.write_text("#!/bin/bash\nprintf 'trusted\\n'\n")
+        helper.chmod(0o700)
+        digest = hashlib.sha256(helper.read_bytes()).hexdigest()
+        injection_vars = {
+            "BASH_ENV",
+            "ENV",
+            "SHELLOPTS",
+            "BASHOPTS",
+            "PS4",
+            "PYTHONHOME",
+            "PYTHONPATH",
+            "PYTHONSTARTUP",
+            "PYTHONINSPECT",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "LD_AUDIT",
+            "GCONV_PATH",
+            "LOCPATH",
+            "NLSPATH",
+            "DYLD_INSERT_LIBRARIES",
+            "DYLD_LIBRARY_PATH",
+            "DYLD_FRAMEWORK_PATH",
+            "DYLD_FALLBACK_LIBRARY_PATH",
+            "DYLD_FALLBACK_FRAMEWORK_PATH",
+        }
+        for name in injection_vars:
+            monkeypatch.setenv(name, "attacker-controlled")
+
+        invocation = tt._build_fd_bound_restart_helper_command(
+            helper, [], digest
+        )
+
+        assert isinstance(invocation, tuple)
+        argv, environment = invocation
+        assert argv[:3] == ["/usr/bin/python3", "-I", "-c"]
+        assert argv[-2:] == [str(helper), digest]
+        assert environment["PATH"] == "/usr/bin:/bin:/usr/sbin:/sbin"
+        assert environment.keys() <= {
+            "PATH",
+            "HOME",
+            "HERMES_HOME",
+            "_HERMES_GATEWAY",
+        }
+        assert not injection_vars & environment.keys()
+
+    def test_fd_bound_restart_broker_ignores_python_import_injection(
+        self, monkeypatch, tmp_path
+    ):
+        import hashlib
+        import shlex
+        import subprocess
+
+        import tools.terminal_tool as tt
+
+        helper = tmp_path / "restart-gateway.sh"
+        helper.write_text("#!/bin/bash\nprintf 'trusted\\n'\n")
+        helper.chmod(0o700)
+        digest = hashlib.sha256(helper.read_bytes()).hexdigest()
+
+        cwd_injected = tmp_path / "cwd-import-ran"
+        (tmp_path / "hashlib.py").write_text(
+            f"from pathlib import Path\nPath({str(cwd_injected)!r}).write_text('injected')\n"
+        )
+        python_path = tmp_path / "python-path"
+        python_path.mkdir()
+        site_injected = tmp_path / "sitecustomize-ran"
+        (python_path / "sitecustomize.py").write_text(
+            f"from pathlib import Path\nPath({str(site_injected)!r}).write_text('injected')\n"
+        )
+        monkeypatch.setenv("PYTHONPATH", str(python_path))
+
+        invocation = tt._build_fd_bound_restart_helper_command(
+            helper, [], digest
+        )
+        if isinstance(invocation, str):
+            # Current vulnerable contract: preserve a real execution of it so
+            # this regression goes RED on both PYTHONPATH/sitecustomize and a
+            # stdlib-shadowing module in the effective cwd.
+            argv = shlex.split(invocation)
+            environment = os.environ.copy()
+        else:
+            argv, environment = invocation
+
+        completed = subprocess.run(
+            argv,
+            cwd=tmp_path,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        assert completed.returncode == 0
+        assert completed.stdout == "trusted\n"
+        assert not cwd_injected.exists()
+        assert not site_injected.exists()
 
     @pytest.mark.parametrize(
         "command_factory",
@@ -607,6 +870,125 @@ class TestTerminalToolGatewayLifecycleGuard:
             script_path=helper,
             cwd=tmp_path,
         )
+
+    def test_canonical_restart_exception_allows_complete_hash_bound_maintenance(
+        self, tmp_path
+    ):
+        from cron.lifecycle_guard import is_direct_canonical_restart_helper_command
+
+        helper = tmp_path / "restart-gateway.sh"
+        helper.write_text("#!/bin/bash\n")
+        helper.chmod(0o700)
+        maintenance = tmp_path / "cutover.sh"
+        command = (
+            f"{helper} --delay 0 --stability 30 "
+            f"--maintenance-script {maintenance} "
+            f"--maintenance-sha256 {'a' * 64} "
+            "--expected-version 0.20.0 "
+            f"--expected-head {'b' * 40} "
+            "--require-platform mattermost"
+        )
+
+        assert is_direct_canonical_restart_helper_command(
+            command,
+            script_path=helper,
+            cwd=tmp_path,
+        )
+
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            "--maintenance-script /safe/cutover.sh",
+            f"--maintenance-script relative.sh --maintenance-sha256 {'a' * 64} "
+            f"--expected-version 0.20.0 --expected-head {'b' * 40}",
+            f"--maintenance-script /safe/cutover.sh --maintenance-sha256 {'a' * 64}",
+            "--delay soon",
+            "--dry-run --dry-run",
+            "--require-platform mattermost",
+            "--require-platform mattermost --require-platform mattermost",
+            f"--maintenance-script /safe/cutover.sh --maintenance-sha256 {'a' * 64} "
+            f"--expected-version 0.20.0 --expected-head {'b' * 40} "
+            "--require-platform 'mattermost;rm'",
+            "--worker-label ai.amy.gateway-restart.injected",
+        ],
+    )
+    def test_canonical_restart_exception_rejects_incomplete_or_internal_handoff(
+        self, tmp_path, arguments
+    ):
+        from cron.lifecycle_guard import is_direct_canonical_restart_helper_command
+
+        helper = tmp_path / "restart-gateway.sh"
+        helper.write_text("#!/bin/bash\n")
+        helper.chmod(0o700)
+
+        assert not is_direct_canonical_restart_helper_command(
+            f"{helper} {arguments}",
+            script_path=helper,
+            cwd=tmp_path,
+        )
+
+    def test_canonical_restart_exception_binds_content_owner_mode_and_regular_file(
+        self, tmp_path
+    ):
+        import hashlib
+        from cron.lifecycle_guard import is_direct_canonical_restart_helper_command
+
+        helper = tmp_path / "restart-gateway.sh"
+        helper.write_text("#!/bin/bash\nprintf 'scheduled\\n'\n")
+        helper.chmod(0o700)
+        digest = hashlib.sha256(helper.read_bytes()).hexdigest()
+
+        assert is_direct_canonical_restart_helper_command(
+            str(helper), script_path=helper, expected_sha256=digest
+        )
+
+        helper.chmod(0o722)
+        assert not is_direct_canonical_restart_helper_command(
+            str(helper), script_path=helper, expected_sha256=digest
+        )
+        helper.chmod(0o700)
+        helper.write_text("#!/bin/bash\nprintf 'exchanged\\n'\n")
+        assert not is_direct_canonical_restart_helper_command(
+            str(helper), script_path=helper, expected_sha256=digest
+        )
+
+        alias = tmp_path / "restart-alias.sh"
+        alias.symlink_to(helper)
+        assert not is_direct_canonical_restart_helper_command(
+            str(alias),
+            script_path=helper,
+            expected_sha256=hashlib.sha256(helper.read_bytes()).hexdigest(),
+        )
+
+    def test_local_binary_does_not_redecode_as_remote_script(
+        self, monkeypatch, tmp_path
+    ):
+        """The terminal guard must skip a local binary instead of rescanning it."""
+        import tools.terminal_tool as tt
+
+        binary = tmp_path / "python3"
+        binary.write_bytes(b"\xcf\xfa\xed\xfe\x00/tmp/child.sh")
+        binary.chmod(0o700)
+        calls = []
+
+        class _FakeEnv:
+            env = {}
+            cwd = str(tmp_path)
+
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                return {"output": "executed", "returncode": 0}
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda command, env, **kwargs: {"approved": True}
+        )
+
+        result = json.loads(tt.terminal_tool(command=str(binary)))
+
+        assert result["exit_code"] == 0
+        assert result["output"] == "executed"
+        assert calls == [str(binary)]
 
     @pytest.mark.parametrize(
         "cmd",
@@ -776,6 +1158,30 @@ class TestLifecycleGuardModule:
         result = contains_gateway_lifecycle_command_or_referenced_script(
             '/usr/bin/python3 -c "print(1)"'
         )
+        assert result is False
+
+    def test_read_referenced_script_tolerates_nul_in_path(self):
+        from pathlib import Path
+
+        from cron.lifecycle_guard import _read_referenced_script
+
+        assert _read_referenced_script(Path("/tmp/hermes\x00binary")) == (
+            None,
+            False,
+        )
+
+    def test_remote_binary_fallback_does_not_crash_guard(self, tmp_path):
+        """A remote/backend binary payload with NUL bytes is not shell source."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        remote_binary = tmp_path / "remote-python"
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            str(remote_binary),
+            read_remote_script=lambda _path: "\x00/tmp/child.sh",
+        )
+
         assert result is False
 
     def test_shell_script_reference_walk_still_works(self, tmp_path):

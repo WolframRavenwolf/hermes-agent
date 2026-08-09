@@ -35,6 +35,8 @@ informative rejection instead of scheduling a job that will only fail
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import os
 import re
 import shlex
@@ -263,13 +265,14 @@ def is_direct_canonical_restart_helper_command(
     *,
     script_path: str | Path,
     cwd: Optional[str] = None,
+    expected_sha256: Optional[str] = None,
 ) -> bool:
     """Allow only one direct invocation of the trusted restart entrypoint.
 
     The command may contain inert leading call-shot comments, but no environment
     assignments, shell wrapper, control operator, redirection, or internal
-    worker arguments. Only the normal restart and read-only ``--dry-run`` modes
-    are part of this narrow gateway exception.
+    worker arguments. Normal restart options and a complete hash-bound
+    maintenance handoff use a strict option grammar.
     """
     segments = list(_iter_command_segments(command))
     if len(segments) != 1:
@@ -279,17 +282,89 @@ def is_direct_canonical_restart_helper_command(
     if index != 0:
         return False
     arguments = segment[1:]
-    if arguments not in ([], ["--dry-run"]):
+    values: dict[str, str] = {}
+    flags: set[str] = set()
+    value_options = {
+        "--delay",
+        "--stability",
+        "--maintenance-script",
+        "--maintenance-sha256",
+        "--expected-version",
+        "--expected-head",
+        "--require-platform",
+    }
+    arg_index = 0
+    while arg_index < len(arguments):
+        option = arguments[arg_index]
+        if option == "--dry-run":
+            if option in flags:
+                return False
+            flags.add(option)
+            arg_index += 1
+            continue
+        if option not in value_options or option in values:
+            return False
+        if arg_index + 1 >= len(arguments):
+            return False
+        values[option] = arguments[arg_index + 1]
+        arg_index += 2
+
+    if any(
+        not value.isdigit()
+        for option, value in values.items()
+        if option in {"--delay", "--stability"}
+    ):
         return False
+    maintenance_path = values.get("--maintenance-script")
+    maintenance_sha256 = values.get("--maintenance-sha256")
+    if bool(maintenance_path) != bool(maintenance_sha256):
+        return False
+    if maintenance_path and not Path(maintenance_path).is_absolute():
+        return False
+    if maintenance_sha256 and not re.fullmatch(
+        r"[0-9a-fA-F]{64}", maintenance_sha256
+    ):
+        return False
+    expected_head = values.get("--expected-head")
+    if expected_head and not re.fullmatch(r"[0-9a-fA-F]{40}", expected_head):
+        return False
+    expected_version = values.get("--expected-version")
+    if expected_version is not None and not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._+-]*", expected_version
+    ):
+        return False
+    if maintenance_path and not (expected_version and expected_head):
+        return False
+    required_platform = values.get("--require-platform")
+    if required_platform is not None:
+        if not maintenance_path:
+            return False
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", required_platform):
+            return False
 
     candidate = _resolve_terminal_script_path(segment[0], cwd)
     canonical = Path(script_path).expanduser()
     try:
-        return (
-            candidate.is_file()
-            and canonical.is_file()
-            and candidate.resolve(strict=True) == canonical.resolve(strict=True)
-        )
+        candidate_lstat = candidate.lstat()
+        canonical_lstat = canonical.lstat()
+        if not stat.S_ISREG(candidate_lstat.st_mode) or not stat.S_ISREG(
+            canonical_lstat.st_mode
+        ):
+            return False
+        if candidate.resolve(strict=True) != canonical.resolve(strict=True):
+            return False
+        metadata = candidate.stat()
+        if metadata.st_uid != os.getuid() or metadata.st_mode & 0o022:
+            return False
+        if expected_sha256 is not None:
+            if not re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha256):
+                return False
+            if metadata.st_size > _MAX_REFERENCED_SCRIPT_BYTES:
+                return False
+            digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+            if not hmac.compare_digest(digest, expected_sha256.casefold()):
+                return False
+        return True
     except OSError:
         return False
 
@@ -403,7 +478,7 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError):
         return None, False
     try:
         metadata = os.fstat(descriptor)
@@ -475,6 +550,8 @@ def _contains_unsafe_gateway_action(
         if script_text is None and read_remote_script is not None:
             # Local path missing; try the remote backend if one is available.
             script_text = read_remote_script(str(script_path))
+        if script_text and "\x00" in script_text:
+            script_text = None
         if not script_text:
             continue
         # Relative references inside a script resolve against that script's
