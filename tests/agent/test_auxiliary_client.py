@@ -1752,12 +1752,216 @@ class TestAuxiliaryFallbackLayering:
         exc.status_code = 402
         return exc
 
+    def _make_codex_usage_limit_err(self):
+        exc = Exception("Error code: 429 - {'code': 'usage_limit_reached'}")
+        setattr(exc, "status_code", 429)
+        return exc
 
+    def _make_vision_capability_err(self):
+        exc = Exception(
+            "This model does not support image input; choose a vision model"
+        )
+        setattr(exc, "status_code", 400)
+        return exc
 
+    def test_primary_vision_capability_error_reaches_main_fallback_chain(self):
+        """A text-only primary selected by auto must not strand a vision call."""
+        primary_client = MagicMock(name="text_only_primary")
+        primary_client.chat.completions.create.side_effect = (
+            self._make_vision_capability_err()
+        )
 
+        fallback_client = MagicMock(name="vision_fallback")
+        fallback_client.chat.completions.create.return_value = _DummyResponse(
+            "vision fallback succeeded"
+        )
+        reasoning_config = {"enabled": True, "effort": "low"}
 
+        with patch(
+            "agent.auxiliary_client.resolve_vision_provider_client",
+            return_value=("custom", primary_client, "text-only-primary"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("auto", None, None, None, None),
+        ), patch(
+            "agent.auxiliary_client._recoverable_pool_provider", return_value=None
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            return_value=(None, None, ""),
+        ), patch(
+            "agent.auxiliary_client._try_main_fallback_chain",
+            return_value=(fallback_client, "vision-model", "fallback-provider"),
+        ) as main_chain, patch(
+            "agent.auxiliary_client._try_payment_fallback"
+        ) as builtin_chain:
+            result = call_llm(
+                task="vision",
+                messages=[{"role": "user", "content": "describe image"}],
+                reasoning_config=reasoning_config,
+            )
 
+        assert result.choices[0].message.content == "vision fallback succeeded"
+        main_chain.assert_called_once_with(
+            "vision",
+            "custom",
+            reason="vision capability mismatch",
+            failed_model="text-only-primary",
+        )
+        assert fallback_client.chat.completions.create.call_args.kwargs[
+            "extra_body"
+        ]["reasoning"] == reasoning_config
+        builtin_chain.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_async_primary_vision_capability_error_reaches_main_fallback_chain(self):
+        primary_client = MagicMock(name="async_text_only_primary")
+        primary_client.chat.completions.create = AsyncMock(
+            side_effect=self._make_vision_capability_err()
+        )
+
+        sync_fallback_client = MagicMock(name="sync_vision_fallback")
+        async_fallback_client = MagicMock(name="async_vision_fallback")
+        async_fallback_client.chat.completions.create = AsyncMock(
+            return_value=_DummyResponse("async vision fallback succeeded")
+        )
+        reasoning_config = {"enabled": True, "effort": "low"}
+
+        with patch(
+            "agent.auxiliary_client.resolve_vision_provider_client",
+            return_value=("custom", primary_client, "text-only-primary"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("auto", None, None, None, None),
+        ), patch(
+            "agent.auxiliary_client._recoverable_pool_provider", return_value=None
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            return_value=(None, None, ""),
+        ), patch(
+            "agent.auxiliary_client._try_main_fallback_chain",
+            return_value=(sync_fallback_client, "vision-model", "fallback-provider"),
+        ) as main_chain, patch(
+            "agent.auxiliary_client._try_payment_fallback"
+        ) as builtin_chain, patch(
+            "agent.auxiliary_client._to_async_client",
+            return_value=(async_fallback_client, "vision-model"),
+        ):
+            result = await async_call_llm(
+                task="vision",
+                messages=[{"role": "user", "content": "describe image"}],
+                reasoning_config=reasoning_config,
+            )
+
+        assert result.choices[0].message.content == "async vision fallback succeeded"
+        main_chain.assert_called_once_with(
+            "vision",
+            "custom",
+            reason="vision capability mismatch",
+            failed_model="text-only-primary",
+        )
+        async_kwargs = async_fallback_client.chat.completions.create.call_args.kwargs
+        assert async_kwargs["extra_body"]["reasoning"] == reasoning_config
+        builtin_chain.assert_not_called()
+
+    def test_auto_vision_failure_uses_top_level_main_fallback_chain(self):
+        primary_client = MagicMock()
+        primary_client.chat.completions.create.side_effect = (
+            self._make_codex_usage_limit_err()
+        )
+
+        main_chain_client = MagicMock()
+        main_chain_client.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(content="from main fallback"))]
+        )
+
+        with patch(
+            "agent.auxiliary_client.resolve_vision_provider_client",
+            return_value=("openai-codex", primary_client, "gpt-5.5"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("auto", None, None, None, None),
+        ), patch(
+            "agent.auxiliary_client._recoverable_pool_provider", return_value=None
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            return_value=(None, None, ""),
+        ) as task_chain, patch(
+            "agent.auxiliary_client._try_main_fallback_chain",
+            return_value=(main_chain_client, "gpt-5.5", "openai-api"),
+        ) as main_chain, patch(
+            "agent.auxiliary_client._try_payment_fallback"
+        ) as builtin_chain:
+            result = call_llm(
+                task="vision",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert result.choices[0].message.content == "from main fallback"
+        task_chain.assert_called_once_with(
+            "vision",
+            "openai-codex",
+            reason="rate limit",
+            failed_model="gpt-5.5",
+        )
+        main_chain.assert_called_once_with(
+            "vision", "openai-codex", reason="rate limit",
+            failed_model="gpt-5.5",
+        )
+        builtin_chain.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_async_auto_vision_failure_uses_top_level_main_fallback_chain(self):
+        primary_client = MagicMock()
+        primary_client.chat.completions.create = AsyncMock(
+            side_effect=self._make_codex_usage_limit_err()
+        )
+
+        sync_fallback_client = MagicMock()
+        async_fallback_client = MagicMock()
+        async_fallback_client.chat.completions.create = AsyncMock(
+            return_value=MagicMock(
+                choices=[MagicMock(message=MagicMock(content="from async fallback"))]
+            )
+        )
+
+        with patch(
+            "agent.auxiliary_client.resolve_vision_provider_client",
+            return_value=("openai-codex", primary_client, "gpt-5.5"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("auto", None, None, None, None),
+        ), patch(
+            "agent.auxiliary_client._recoverable_pool_provider", return_value=None
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            return_value=(None, None, ""),
+        ) as task_chain, patch(
+            "agent.auxiliary_client._try_main_fallback_chain",
+            return_value=(sync_fallback_client, "gpt-5.5", "openai-api"),
+        ) as main_chain, patch(
+            "agent.auxiliary_client._try_payment_fallback"
+        ) as builtin_chain, patch(
+            "agent.auxiliary_client._to_async_client",
+            return_value=(async_fallback_client, "gpt-5.5"),
+        ):
+            result = await async_call_llm(
+                task="vision",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert result.choices[0].message.content == "from async fallback"
+        async_fallback_client.chat.completions.create.assert_awaited_once()
+        task_chain.assert_called_once_with(
+            "vision",
+            "openai-codex",
+            reason="rate limit",
+            failed_model="gpt-5.5",
+        )
+        main_chain.assert_called_once_with(
+            "vision", "openai-codex", reason="rate limit",
+            failed_model="gpt-5.5",
+        )
+        builtin_chain.assert_not_called()
 
     def test_explicit_provider_rate_limit_triggers_fallback(self, monkeypatch):
         """429 rate-limit on an explicit provider must trigger fallback (not be ignored).
@@ -1878,6 +2082,313 @@ class TestAuxiliaryFallbackLayering:
         assert model == "gpt-5.4-mini"
         mock_openai.assert_called_once()
         assert mock_openai.call_args.kwargs["api_key"] == "codex-oauth-token"
+
+    def test_global_vision_fallback_skips_known_text_only_candidate(self):
+        """A known text-only global fallback must never receive image content."""
+        from agent.auxiliary_client import _try_main_fallback_chain
+
+        text_only_client = MagicMock(name="text_only")
+        vision_client = MagicMock(name="vision")
+        chain = [
+            {"provider": "deepseek", "model": "deepseek-chat"},
+            {"provider": "openrouter", "model": "google/gemini-3-flash-preview"},
+        ]
+
+        def supports_vision(provider, _model):
+            return provider == "openrouter"
+
+        def resolve_entry(entry):
+            if entry is chain[0]:
+                return text_only_client, entry["model"]
+            return vision_client, entry["model"]
+
+        with patch("hermes_cli.config.load_config", return_value={}), \
+             patch("hermes_cli.fallback_config.get_fallback_chain", return_value=chain), \
+             patch("agent.auxiliary_client._read_main_provider", return_value="primary"), \
+             patch("agent.auxiliary_client._is_provider_unhealthy", return_value=False), \
+             patch("agent.auxiliary_client._main_model_supports_vision",
+                   side_effect=supports_vision), \
+             patch("agent.auxiliary_client._resolve_fallback_entry",
+                   side_effect=resolve_entry) as mock_resolve:
+            client, model, label = _try_main_fallback_chain(
+                task="vision", failed_provider="primary")
+
+        assert client is vision_client
+        assert model == "google/gemini-3-flash-preview"
+        assert label == "openrouter"
+        assert mock_resolve.call_args_list == [((chain[1],), {})]
+        text_only_client.chat.completions.create.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("first_provider", "configured_model", "resolved_model", "excluded_key"),
+        [
+            ("codex", "gpt-vision", "gpt-vision", ("openai-codex", "gpt-vision")),
+            ("custom:foo", "model-alias", "resolved-model", ("foo", "resolved-model")),
+        ],
+    )
+    def test_global_vision_exclusion_uses_stable_candidate_identity(
+        self, first_provider, configured_model, resolved_model, excluded_key
+    ):
+        """Alias/custom labels cannot cause an excluded candidate to be retried."""
+        from agent.auxiliary_client import _try_main_fallback_chain
+
+        first_client = MagicMock(name="excluded_first")
+        second_client = MagicMock(name="allowed_second")
+        chain = [
+            {"provider": first_provider, "model": configured_model},
+            {"provider": "openrouter", "model": "google/gemini-3-flash-preview"},
+        ]
+
+        def resolve_entry(entry):
+            if entry is chain[0]:
+                return first_client, resolved_model
+            return second_client, entry["model"]
+
+        with patch("hermes_cli.config.load_config", return_value={}), \
+             patch("hermes_cli.fallback_config.get_fallback_chain", return_value=chain), \
+             patch("agent.auxiliary_client._read_main_provider", return_value="primary"), \
+             patch("agent.auxiliary_client._is_provider_unhealthy", return_value=False), \
+             patch("agent.auxiliary_client._main_model_supports_vision", return_value=True), \
+             patch("agent.auxiliary_client._resolve_fallback_entry",
+                   side_effect=resolve_entry):
+            client, model, label = _try_main_fallback_chain(
+                task="vision",
+                failed_provider="primary",
+                excluded_candidates={excluded_key},
+            )
+
+        assert client is second_client
+        assert model == "google/gemini-3-flash-preview"
+        assert label == "openrouter"
+        first_client.chat.completions.create.assert_not_called()
+
+    def test_global_text_fallback_keeps_first_candidate(self):
+        """Vision screening must not alter the global chain for generic text tasks."""
+        from agent.auxiliary_client import _try_main_fallback_chain
+
+        first_client = MagicMock(name="first_text_candidate")
+        chain = [{"provider": "deepseek", "model": "deepseek-chat"}]
+        with patch("hermes_cli.config.load_config", return_value={}), \
+             patch("hermes_cli.fallback_config.get_fallback_chain", return_value=chain), \
+             patch("agent.auxiliary_client._read_main_provider", return_value="primary"), \
+             patch("agent.auxiliary_client._is_provider_unhealthy", return_value=False), \
+             patch("agent.auxiliary_client._main_model_supports_vision") as mock_capability, \
+             patch("agent.auxiliary_client._resolve_fallback_entry",
+                   return_value=(first_client, "deepseek-chat")):
+            client, model, _ = _try_main_fallback_chain(
+                task="title_generation", failed_provider="primary")
+
+        assert client is first_client
+        assert model == "deepseek-chat"
+        mock_capability.assert_not_called()
+
+    def test_global_fallback_allows_same_provider_sibling_after_model_failure(self):
+        """Model-scoped failures skip one deployment, not the provider label."""
+        from agent.auxiliary_client import _try_main_fallback_chain
+
+        healthy_sibling = MagicMock(name="healthy_sibling")
+        chain = [
+            {"provider": "custom", "model": "failed-model"},
+            {"provider": "custom", "model": "healthy-sibling"},
+        ]
+
+        with patch("hermes_cli.config.load_config_readonly", return_value={}), \
+             patch("hermes_cli.fallback_config.get_fallback_chain", return_value=chain), \
+             patch("agent.auxiliary_client._read_main_provider", return_value="custom"), \
+             patch("agent.auxiliary_client._is_provider_unhealthy", return_value=False), \
+             patch("agent.auxiliary_client._resolve_fallback_entry",
+                   return_value=(healthy_sibling, "healthy-sibling")) as mock_resolve:
+            client, model, label = _try_main_fallback_chain(
+                task="title_generation",
+                failed_provider="custom",
+                failed_model="failed-model",
+                reason="model incompatible with route",
+            )
+
+        assert client is healthy_sibling
+        assert model == "healthy-sibling"
+        assert label == "custom"
+        mock_resolve.assert_called_once_with(chain[1])
+
+    @pytest.mark.parametrize("reason", ["auth error", "payment error"])
+    def test_global_fallback_keeps_auth_and_payment_provider_wide(self, reason):
+        """Credential-scoped failures still reject every same-provider model."""
+        from agent.auxiliary_client import _try_main_fallback_chain
+
+        chain = [{"provider": "custom", "model": "healthy-sibling"}]
+        with patch("hermes_cli.config.load_config_readonly", return_value={}), \
+             patch("hermes_cli.fallback_config.get_fallback_chain", return_value=chain), \
+             patch("agent.auxiliary_client._read_main_provider", return_value="custom"), \
+             patch("agent.auxiliary_client._resolve_fallback_entry") as mock_resolve:
+            client, model, label = _try_main_fallback_chain(
+                task="title_generation",
+                failed_provider="custom",
+                failed_model="failed-model",
+                reason=reason,
+            )
+
+        assert (client, model, label) == (None, None, "")
+        mock_resolve.assert_not_called()
+
+    def test_global_vision_fallback_continues_after_capability_error(self):
+        """A runtime image incompatibility advances to the next global fallback."""
+        primary_client = MagicMock(name="primary")
+        primary_client.chat.completions.create.side_effect = self._make_codex_usage_limit_err()
+
+        capability_error = Exception(
+            "This model does not support image input; choose a vision model"
+        )
+        setattr(capability_error, "status_code", 400)
+        first_fallback = MagicMock(name="first_fallback")
+        first_fallback.chat.completions.create.side_effect = capability_error
+        second_fallback = MagicMock(name="second_fallback")
+        second_fallback.chat.completions.create.return_value = _DummyResponse(
+            "vision fallback succeeded"
+        )
+
+        def main_chain(*_args, **kwargs):
+            excluded = kwargs.get("excluded_candidates")
+            if not excluded:
+                return first_fallback, "gpt-4o-mini", "openai"
+            assert excluded == {("openai", "gpt-4o-mini")}
+            return second_fallback, "gemini-2.5-flash", "gemini"
+
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+            ],
+        }]
+        with patch("agent.auxiliary_client.resolve_vision_provider_client",
+                   return_value=("openai-codex", primary_client, "gpt-5.5")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("auto", None, None, None, None)), \
+             patch("agent.auxiliary_client._recoverable_pool_provider",
+                   return_value=None), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(None, None, "")), \
+             patch("agent.auxiliary_client._try_main_fallback_chain",
+                   side_effect=main_chain) as mock_main_chain, \
+             patch("agent.auxiliary_client._try_payment_fallback") as mock_builtin:
+            result = call_llm(task="vision", messages=messages)
+
+        assert result.choices[0].message.content == "vision fallback succeeded"
+        assert mock_main_chain.call_count == 2
+        assert first_fallback.chat.completions.create.call_count == 1
+        assert second_fallback.chat.completions.create.call_count == 1
+        assert first_fallback.chat.completions.create.call_args.kwargs["messages"] == messages
+        assert second_fallback.chat.completions.create.call_args.kwargs["messages"] == messages
+        mock_builtin.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_async_global_vision_fallback_continues_with_normalized_alias_key(self):
+        primary_client = MagicMock(name="primary")
+        primary_client.chat.completions.create = AsyncMock(
+            side_effect=self._make_codex_usage_limit_err()
+        )
+        first_sync = MagicMock(name="first_sync")
+        second_sync = MagicMock(name="second_sync")
+        first_async = MagicMock(name="first_async")
+        capability_error = Exception(
+            "This model does not support image input; choose a vision model"
+        )
+        setattr(capability_error, "status_code", 400)
+        first_async.chat.completions.create = AsyncMock(side_effect=capability_error)
+        second_async = MagicMock(name="second_async")
+        second_async.chat.completions.create = AsyncMock(
+            return_value=_DummyResponse("async vision fallback succeeded")
+        )
+
+        def main_chain(*_args, **kwargs):
+            excluded = kwargs.get("excluded_candidates")
+            if not excluded:
+                return first_sync, "gpt-vision", "codex"
+            assert excluded == {("openai-codex", "gpt-vision")}
+            return second_sync, "gemini-2.5-flash", "google"
+
+        def to_async(client, model, **_kwargs):
+            if client is first_sync:
+                return first_async, model
+            assert client is second_sync
+            return second_async, model
+
+        with patch("agent.auxiliary_client.resolve_vision_provider_client",
+                   return_value=("openai-codex", primary_client, "gpt-5.5")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("auto", None, None, None, None)), \
+             patch("agent.auxiliary_client._recoverable_pool_provider",
+                   return_value=None), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(None, None, "")), \
+             patch("agent.auxiliary_client._try_main_fallback_chain",
+                   side_effect=main_chain) as mock_main_chain, \
+             patch("agent.auxiliary_client._try_payment_fallback") as mock_builtin, \
+             patch("agent.auxiliary_client._to_async_client",
+                   side_effect=to_async):
+            result = await async_call_llm(
+                task="vision",
+                messages=[{"role": "user", "content": "describe image"}],
+            )
+
+        assert result.choices[0].message.content == "async vision fallback succeeded"
+        assert mock_main_chain.call_count == 2
+        first_async.chat.completions.create.assert_awaited_once()
+        second_async.chat.completions.create.assert_awaited_once()
+        mock_builtin.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "fallback_error",
+        [
+            pytest.param(
+                type("FallbackAuthError", (Exception,), {"status_code": 401})(
+                    "fallback auth failed"
+                ),
+                id="auth",
+            ),
+            pytest.param(
+                type("FallbackBillingError", (Exception,), {"status_code": 402})(
+                    "fallback billing failed"
+                ),
+                id="billing",
+            ),
+            pytest.param(ValueError("fallback response malformed"), id="unknown"),
+        ],
+    )
+    def test_global_vision_fallback_does_not_swallow_non_capability_error(
+        self, fallback_error
+    ):
+        primary_client = MagicMock(name="primary")
+        primary_client.chat.completions.create.side_effect = self._make_codex_usage_limit_err()
+        first_fallback = MagicMock(name="first_fallback")
+        first_fallback.chat.completions.create.side_effect = fallback_error
+        second_fallback = MagicMock(name="must_not_run")
+
+        with patch("agent.auxiliary_client.resolve_vision_provider_client",
+                   return_value=("openai-codex", primary_client, "gpt-5.5")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("auto", None, None, None, None)), \
+             patch("agent.auxiliary_client._recoverable_pool_provider",
+                   return_value=None), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(None, None, "")), \
+             patch("agent.auxiliary_client._try_main_fallback_chain",
+                   side_effect=[
+                       (first_fallback, "candidate-one", "candidate-provider"),
+                       (second_fallback, "candidate-two", "second-provider"),
+                   ]) as mock_main_chain, \
+             patch("agent.auxiliary_client._try_payment_fallback") as mock_builtin, \
+             patch("agent.auxiliary_client._refresh_provider_credentials") as mock_refresh:
+            with pytest.raises(type(fallback_error), match=str(fallback_error)):
+                call_llm(
+                    task="vision",
+                    messages=[{"role": "user", "content": "describe image"}],
+                )
+
+        assert mock_main_chain.call_count == 1
+        second_fallback.chat.completions.create.assert_not_called()
+        mock_builtin.assert_not_called()
+        mock_refresh.assert_not_called()
 
 
 class TestTryMainAgentModelFallback:
