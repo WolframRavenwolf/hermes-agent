@@ -5409,6 +5409,33 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             row = cursor.fetchone()
         return self._session_row_dict(row) if row else None
 
+    def list_session_title_candidates(self, title: str) -> List[Dict[str, Any]]:
+        """Return every exact/numbered title candidate in deterministic order.
+
+        Numbered variants remain preferred by newest ``started_at`` exactly like
+        ``resolve_session_by_title``; all exact-title rows follow newest-first.
+        Returning every exact row matters for authorization-aware callers:
+        historical databases can contain duplicate titles from before the unique
+        index was restored, and a foreign duplicate must not shadow an allowed
+        candidate behind a ``fetchone()`` result.
+        """
+        escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        with self._read_ctx() as conn:
+            if conn is None:
+                return []
+            cursor = conn.execute(
+                "SELECT s.*, "
+                "COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved "
+                "FROM sessions s "
+                "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
+                "WHERE s.title = ? OR s.title LIKE ? ESCAPE '\\' "
+                "ORDER BY CASE WHEN s.title = ? THEN 1 ELSE 0 END, "
+                "s.started_at DESC, s.id DESC",
+                (title, f"{escaped} #%", title),
+            )
+            rows = cursor.fetchall()
+        return [self._session_row_dict(row) for row in rows]
+
     def resolve_session_by_title(self, title: str) -> Optional[str]:
         """Resolve a title to a session ID, preferring the latest in a lineage.
 

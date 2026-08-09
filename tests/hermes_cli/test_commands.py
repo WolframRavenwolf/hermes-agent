@@ -65,6 +65,17 @@ class TestCommandRegistry:
 
 
 
+    def test_resume_documents_session_listing_compatibility_flags(self):
+        resume = next(cmd for cmd in COMMAND_REGISTRY if cmd.name == "resume")
+        assert "--all" in resume.args_hint
+        assert "--full" in resume.args_hint
+        assert "session" in resume.description.lower()
+
+    def test_cli_only_and_gateway_only_are_mutually_exclusive(self):
+        for cmd in COMMAND_REGISTRY:
+            assert not (cmd.cli_only and cmd.gateway_only), \
+                f"{cmd.name} cannot be both cli_only and gateway_only"
+
 
 
 # ---------------------------------------------------------------------------

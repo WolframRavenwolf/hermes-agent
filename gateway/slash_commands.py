@@ -19,6 +19,7 @@ import asyncio
 import dataclasses
 import hashlib
 import inspect
+import json
 import logging
 import os
 import re
@@ -38,7 +39,6 @@ from gateway.session import (
     AsyncSessionStore,
     SessionSource,
     build_session_key,
-    is_shared_multi_user_session,
 )
 from hermes_cli.config import atomic_config_write, cfg_get, clear_model_endpoint_credentials
 from utils import (
@@ -938,89 +938,97 @@ class GatewaySlashCommandsMixin:
                 return getattr(entry, "origin", None)
         return None
 
-    @staticmethod
-    def _same_matrix_room(current: SessionSource, origin: Optional[SessionSource]) -> bool:
-        return (
-            origin is not None
-            and origin.platform == Platform.MATRIX
-            and current.platform == Platform.MATRIX
-            and origin.chat_id == current.chat_id
-            # thread_id is part of the session key (build_session_key appends it
-            # for every chat type when present), and Matrix scopes the model's
-            # turn to the current room/thread. A live session in another thread
-            # of the SAME room is a DIFFERENT session, so a caller in thread A
-            # must not resume/enumerate a target whose origin is in thread B.
-            # Non-threaded rooms have empty thread_id on both sides ("" == ""),
-            # so room-level sharing is preserved unchanged.
-            and str(getattr(current, "thread_id", "") or "")
-            == str(getattr(origin, "thread_id", "") or "")
-        )
+    def _decorate_matrix_session_row(self, row: dict) -> dict:
+        """Copy a cross-origin listing row and append its safe room label.
+
+        Prefer current in-memory routing metadata. Historical sessions may no
+        longer exist in ``session_store``, so fall back to the persisted
+        ``origin_json`` and finally the dedicated display/chat columns returned
+        by ``list_sessions_rich``. Only the selected room label is rendered;
+        the raw persisted origin is never copied into display text.
+        """
+        decorated = dict(row)
+        title = decorated.get("title")
+        if not isinstance(title, str) or not title:
+            return decorated
+
+        origin = None
+        try:
+            live_origin = self._gateway_session_origin_for_id(
+                str(decorated.get("id") or "")
+            )
+            if isinstance(live_origin, SessionSource):
+                origin = live_origin
+        except Exception:
+            pass
+
+        if origin is None:
+            persisted = decorated.get("origin_json")
+            try:
+                if isinstance(persisted, str):
+                    persisted = json.loads(persisted)
+                if isinstance(persisted, dict):
+                    origin = SessionSource.from_dict(persisted)
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                origin = None
+
+        room = ""
+        if isinstance(origin, SessionSource):
+            candidate = origin.chat_name or origin.chat_id
+            if isinstance(candidate, str):
+                room = candidate.strip()
+        if not room:
+            for key in ("display_name", "chat_id"):
+                candidate = decorated.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    room = candidate.strip()
+                    break
+        if room:
+            decorated["title"] = f"{title} — {room}"
+        return decorated
+
+    def _same_matrix_room(
+        self, current: SessionSource, origin: Optional[SessionSource]
+    ) -> bool:
+        """Compatibility wrapper around the unified origin-sharing policy."""
+        if (
+            origin is None
+            or current.platform != Platform.MATRIX
+            or origin.platform != Platform.MATRIX
+        ):
+            return False
+        return self._same_origin_chat(current, origin)
 
     def _same_origin_chat(self, current: SessionSource, origin: Optional[SessionSource]) -> bool:
-        """Platform-agnostic counterpart to ``_same_matrix_room``.
+        """Return whether two origins resolve to the same canonical session key.
 
-        True when *origin* shares *current*'s platform and chat, and the same
-        participant whenever the session key for this source is per-user. Group
-        and thread sessions that ``build_session_key`` isolates per participant
-        (the default ``group_sessions_per_user=True``) must also be scoped by
-        participant here — otherwise a co-member could resume another member's
-        live per-user group session (IDOR). Only an explicitly shared
-        group/thread (``group_sessions_per_user=False`` /
-        ``thread_sessions_per_user``) lets co-members share, mirroring the key
-        contract via ``is_shared_multi_user_session``.
+        Authorization must use the exact routing contract instead of maintaining
+        a second approximation. ``_session_key_for_source`` already incorporates
+        platform, profile namespace, chat type, room, thread, alternate user id,
+        and the configured group/thread participant-sharing policy.
         """
         if origin is None or current is None:
             return False
-        if origin.platform != current.platform:
-            return False
-        if origin.chat_id != current.chat_id:
-            return False
-        # thread_id is part of the session key for every chat type when present
-        # (build_session_key appends it unconditionally), so a session in one
-        # thread is a DIFFERENT session from another thread of the same parent
-        # chat. is_shared_multi_user_session only decides participant sharing
-        # WITHIN a thread, never across threads — require thread equality before
-        # any sharing logic so a live origin in thread A cannot match a caller in
-        # thread B of the same parent chat.
-        if str(getattr(current, "thread_id", "") or "") != str(
-            getattr(origin, "thread_id", "") or ""
+        current_chat_type = str(getattr(current, "chat_type", "") or "").lower()
+        origin_chat_type = str(getattr(origin, "chat_type", "") or "").lower()
+        if (
+            current_chat_type in {"", "dm", "direct", "private"}
+            and origin_chat_type in {"", "dm", "direct", "private"}
+            and not str(getattr(current, "chat_id", "") or "")
+            and not str(getattr(origin, "chat_id", "") or "")
+            and not str(current.user_id_alt or current.user_id or "")
+            and not str(origin.user_id_alt or origin.user_id or "")
         ):
             return False
-        chat_type = (getattr(current, "chat_type", "") or "").lower()
-        # DM-like chats are always per-user.
-        if chat_type in {"dm", "direct", "private", ""}:
-            # chat_id was already required equal above and, when present, IS the
-            # DM session key — so an equal non-empty chat_id is sufficient.
-            # build_session_key only falls back to the participant id
-            # (``user_id_alt or user_id`` — Signal/Feishu key on user_id_alt)
-            # when there is NO chat_id; mirror that and fail closed on a
-            # missing/different participant so two no-chat_id DM origins are
-            # never conflated (was: compared user_id only and allowed when
-            # either side was missing).
-            if str(getattr(current, "chat_id", "") or ""):
-                return True
-            cur_pid = str(current.user_id_alt or current.user_id or "")
-            org_pid = str(origin.user_id_alt or origin.user_id or "")
-            return bool(cur_pid) and cur_pid == org_pid
-        # Non-DM: scope by participant whenever the session key for this source
-        # is per-user. is_shared_multi_user_session mirrors build_session_key's
-        # isolation rules exactly, so the guard stays in lock-step with the key.
-        shared = is_shared_multi_user_session(
-            current,
-            group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
-            thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
-        )
-        if shared:
-            return True
-        # Per-user key: compare the participant id the key is actually built
-        # from (user_id_alt or user_id — Signal/Feishu key on user_id_alt).
-        cur_pid = current.user_id_alt or current.user_id
-        org_pid = origin.user_id_alt or origin.user_id
-        if cur_pid and org_pid:
-            return cur_pid == org_pid
-        # Per-user key but a participant id is missing on one side: cannot prove
-        # the same owner — fail closed.
-        return False
+        try:
+            key_for_source = getattr(self, "_session_key_for_source", None)
+            if not callable(key_for_source):
+                return False
+            current_key = str(key_for_source(current) or "")
+            origin_key = str(key_for_source(origin) or "")
+        except Exception:
+            return False
+        return bool(current_key) and current_key == origin_key
 
     def _resume_caller_is_admin(self, source: SessionSource) -> bool:
         """Whether *source* is an EXPLICITLY-configured admin allowed to make a
@@ -1041,172 +1049,240 @@ class GatewaySlashCommandsMixin:
         except Exception:
             return False
 
-    async def _resume_target_allowed(
-        self, source: SessionSource, target_id: str, allow_override: bool = False
-    ) -> bool:
-        """Whether *source* may resume the persisted session *target_id*.
+    @staticmethod
+    def _decode_persisted_session_source(
+        persisted: Any,
+    ) -> tuple[dict[str, Any], SessionSource] | None:
+        """Decode durable origin metadata with historical null compatibility."""
+        try:
+            if isinstance(persisted, str):
+                if not persisted.strip():
+                    return None
+                persisted = json.loads(persisted)
+            if not isinstance(persisted, dict):
+                return None
+            payload = dict(persisted)
+            required = {"platform", "user_id", "chat_id", "chat_type", "thread_id"}
+            if not required.issubset(payload):
+                return None
+            if not isinstance(payload.get("platform"), str) or not payload["platform"]:
+                return None
+            if not isinstance(payload.get("chat_type"), str) or not payload["chat_type"]:
+                return None
+            for key in ("user_id", "chat_id", "thread_id"):
+                if payload.get(key) is not None and not isinstance(payload[key], str):
+                    return None
+            for key in ("chat_id", "thread_id", "user_id_alt", "profile"):
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip().lower() in {"none", "null"}:
+                    payload[key] = None
+            source = SessionSource.from_dict(payload)
+            for key in ("chat_id", "thread_id", "user_id_alt", "profile"):
+                if key in payload and payload[key] is None and hasattr(source, key):
+                    setattr(source, key, None)
+            return payload, source
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            return None
 
-        Generalizes the Matrix-only room guard to every adapter so a caller
-        cannot bind their gateway session to another user's/room's persisted
-        session id (IDOR). Uses the live origin when the target is active;
-        otherwise falls back to the DB row's source + user_id (the sessions
-        table has no chat_id). An identity-bearing caller is allowed only when
-        the row PROVES the same owner; a row that lacks enough ownership data
-        fails closed. An explicit admin ``--all`` override bypasses scoping.
+    def _persisted_matrix_origin_matches(
+        self, current: SessionSource, row: dict[str, Any]
+    ) -> bool:
+        """Validate a historical Matrix row against the exact caller origin.
+
+        The dedicated session columns and ``origin_json`` jointly form the durable
+        authorization provenance. Platform, room, thread, and owner must exactly
+        match the caller in both representations; missing, malformed, partial, or
+        contradictory data remains fail-closed. Explicit admin bypass is handled
+        by ``_resume_target_allowed`` before this helper runs.
+        """
+        if not isinstance(row, dict) or current.platform != Platform.MATRIX:
+            return False
+
+        row_chat = row.get("chat_id")
+        row_thread = row.get("thread_id")
+        row_user = row.get("user_id")
+        row_chat_type = row.get("chat_type")
+
+        # Require complete, well-typed dedicated provenance. Caller-to-row
+        # equality was already proven by the canonical session-key check.
+        if row_thread is not None and not isinstance(row_thread, str):
+            return False
+        if (
+            str(row.get("source") or "") != Platform.MATRIX.value
+            or not isinstance(row_chat, str)
+            or not row_chat
+            or "thread_id" not in row
+            or not isinstance(row_user, str)
+            or not row_user
+            or not isinstance(row_chat_type, str)
+            or not row_chat_type
+        ):
+            return False
+
+        decoded = self._decode_persisted_session_source(row.get("origin_json"))
+        if decoded is None:
+            return False
+        persisted, origin = decoded
+        if "thread_id" not in persisted:
+            return False
+        persisted_chat = persisted.get("chat_id")
+        persisted_thread = persisted.get("thread_id")
+        persisted_user = persisted.get("user_id")
+        if persisted_thread is not None and not isinstance(persisted_thread, str):
+            return False
+        if (
+            persisted.get("platform") != Platform.MATRIX.value
+            or not isinstance(persisted_chat, str)
+            or not persisted_chat
+            or not isinstance(persisted_user, str)
+            or not persisted_user
+        ):
+            return False
+
+        try:
+            key_for_source = getattr(self, "_session_key_for_source", None)
+            if not callable(key_for_source):
+                return False
+            origin_session_key = str(key_for_source(origin) or "")
+        except Exception:
+            return False
+        persisted_session_key = row.get("session_key")
+
+        # Full origin metadata must corroborate every DB field, and the stored
+        # canonical key must be the key actually produced by that persisted
+        # origin. Caller-to-key equality was already enforced by
+        # ``_resume_target_allowed``.
+        return bool(
+            origin.platform == Platform.MATRIX
+            and origin.chat_id == row_chat
+            and str(origin.thread_id or "") == str(row_thread or "")
+            and origin.user_id == row_user
+            and origin.chat_type == row_chat_type
+            and isinstance(persisted_session_key, str)
+            and origin_session_key == persisted_session_key
+        )
+
+    async def _resume_target_allowed(
+        self,
+        source: SessionSource,
+        target_id: str,
+        allow_override: bool = False,
+        persisted_row: Optional[dict[str, Any]] = None,
+    ) -> bool:
+        """Whether *source* may see or resume persisted session *target_id*.
+
+        This is the single authorization policy for direct ``/resume`` and every
+        listing surface (including ``/resume --full``). It prefers a live routing
+        origin, then validates durable provenance for historical sessions. Missing
+        or malformed provenance fails closed. Only an explicitly configured admin
+        using an override-capable command form may bypass origin scoping.
         """
         if allow_override and self._resume_caller_is_admin(source):
             return True
         # Use the live origin only when it resolves to a real SessionSource; a
-        # store that can't resolve it (or an unexpected lookup error) must not
-        # silently allow/deny — fall through to the deterministic DB scoping.
+        # store that can't resolve it (or an unexpected lookup error) falls back
+        # to the durable DB provenance below.
         try:
             origin = self._gateway_session_origin_for_id(target_id)
         except Exception:
             origin = None
         if isinstance(origin, SessionSource):
             return self._same_origin_chat(source, origin)
-        # Inactive/persisted-only: best-effort scope by DB row source + user.
+
+        row = persisted_row
+        if row is None:
+            try:
+                row = await self._session_db.get_session(target_id) or {}
+            except Exception:
+                return False
+        if not isinstance(row, dict):
+            return False
+
         try:
-            row = await self._session_db.get_session(target_id) or {}
+            key_for_source = getattr(self, "_session_key_for_source", None)
+            if not callable(key_for_source):
+                return False
+            caller_session_key = str(key_for_source(source) or "")
         except Exception:
             return False
-        caller_src = source.platform.value if source.platform else None
-        row_src = row.get("source")
-        if row_src and caller_src and str(row_src) != str(caller_src):
-            return False  # different platform / source
-        caller_uid = str(getattr(source, "user_id", "") or "")
-        row_uid = str(row.get("user_id") or "")
-        # Chat/thread origin recorded at session creation (see
-        # SessionDB._insert_session_row). The sessions table historically stored
-        # only source + user_id, so a same-user row could belong to a DIFFERENT
-        # chat; comparing the persisted origin closes that gap. Legacy rows
-        # created before origin capture have NULL here and therefore fail closed
-        # (they cannot prove the caller's chat) — resume them via a live session
-        # or an admin override.
-        caller_chat = str(getattr(source, "chat_id", "") or "")
-        row_chat = str(row.get("chat_id") or "")
-        caller_thread = str(getattr(source, "thread_id", "") or "")
-        row_thread = str(row.get("thread_id") or "")
-        chat_type = (getattr(source, "chat_type", "") or "").lower()
-        caller_is_dm = chat_type in {"dm", "direct", "private", ""}
-        # build_session_key keys the participant on ``user_id_alt or user_id``
-        # (Signal/Feishu carry the canonical participant in user_id_alt), but the
-        # sessions table only ever stored user_id — it has no user_id_alt column.
-        # So when the caller carries a user_id_alt, the row CANNOT prove the
-        # canonical participant that the live session key is built from: two
-        # members sharing one user_id but different user_id_alt map to DIFFERENT
-        # session keys, yet the persisted row's user_id would match both. The
-        # live-origin guard (_same_origin_chat) compares user_id_alt correctly;
-        # the persisted fallback cannot, so any per-user comparison that would
-        # otherwise rely on row_uid == caller_uid must fail closed here to stay
-        # in lock-step with the key boundary (CWE-639). Shared group/thread
-        # sessions are unaffected (they don't scope by participant at all), and
-        # an admin --all override still bypasses this above.
-        caller_keys_on_alt = bool(str(getattr(source, "user_id_alt", "") or ""))
-        if caller_uid:
-            # Identity-bearing caller: allow only when the row PROVES the same
-            # owner AND the same platform/origin AND the same chat/thread. A row
-            # with no/blank user_id cannot be proven to belong to this caller; a
-            # row with no/blank source cannot be proven to share the caller's
-            # platform (the row_src check above only rejects a *mismatching*
-            # non-blank source, so a blank/legacy source would otherwise slip
-            # through on user_id equality alone); and a row whose origin chat
-            # (or thread) differs from the caller's belongs to a different
-            # conversation. Any gap fails closed — an identified user must not
-            # bind to an unowned, other-owned, other-chat, or unproven-origin
-            # persisted session by id/title. (Legacy NULL-owner/blank-source/
-            # NULL-chat rows are intentionally not resumable this way; use a
-            # live session or an explicit admin override.)
-            # Common origin proof for any identity-bearing caller: a non-blank
-            # source that matches the caller's platform, and the same thread. A
-            # blank/legacy source can't prove the platform; a different thread is
-            # a different session (build_session_key appends thread_id).
-            origin_ok = (
-                bool(row_src) and bool(caller_src)
-                and str(row_src) == str(caller_src)
-                and row_thread == caller_thread
-            )
-            if not origin_ok:
-                return False
-            if caller_is_dm:
-                # DMs are keyed on user_id; require the same owner. chat_id is
-                # legitimately absent on both sides for a no-chat_id DM (scoped
-                # by user_id), but a mismatching chat_id (when present) is still
-                # rejected.
-                #
-                # A no-chat_id DM is keyed PURELY on the participant
-                # (``user_id_alt or user_id``). If the caller keys on user_id_alt
-                # the persisted row (user_id only) cannot prove that participant,
-                # so fail closed. When chat_id is present on both sides it is the
-                # DM key and equal chat_id is sufficient, so the alt gap doesn't
-                # apply there.
-                if caller_keys_on_alt and not (bool(row_chat) and bool(caller_chat)):
-                    return False
-                return (
-                    bool(row_uid) and row_uid == caller_uid
-                    and row_chat == caller_chat
-                )
-            # Non-DM (group/channel/forum/thread): build_session_key includes
-            # chat_id, so a row (or caller) with NO chat provenance cannot prove
-            # same-chat. Require both sides non-blank and equal — a legacy
-            # NULL-chat row (or a caller missing its chat_id) fails closed even
-            # when both normalize to "". (CWE-639)
-            if not (bool(row_chat) and bool(caller_chat) and row_chat == caller_chat):
-                return False
-            # Within the same non-DM chat/thread, mirror build_session_key's
-            # participant scoping: a SHARED group/thread session
-            # (group_sessions_per_user=False, or a shared thread) is one session
-            # for every participant, so the same-chat proof above is sufficient —
-            # do NOT also require user-id equality (otherwise a co-member is
-            # wrongly blocked from their own shared session). A per-user session
-            # still requires the same owner.
-            shared = is_shared_multi_user_session(
-                source,
-                group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
-                thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
-            )
-            if shared:
-                return True
-            # Per-user non-DM: the session key includes the participant
-            # (``user_id_alt or user_id``). If the caller keys on user_id_alt,
-            # the persisted row (user_id only) cannot prove the canonical
-            # participant, so fail closed rather than matching on user_id alone.
-            if caller_keys_on_alt:
-                return False
-            return bool(row_uid) and row_uid == caller_uid
-        # No caller identity: the persisted row carries only source + user_id
-        # (the sessions table has no chat_id), so a same-platform row can belong
-        # to a DIFFERENT chat or user. Same-platform alone is therefore NOT
-        # ownership proof — an identity-less caller must not bind to, or
-        # enumerate, a persisted session by id/title. Fail closed. A legitimate
-        # same-chat resume of an ACTIVE session still works through the
-        # live-origin branch above (which compares chat_id), and an operator can
-        # use the admin --all override. (CWE-639: IDOR on session routing.)
-        return False
+        persisted_session_key = row.get("session_key")
+        if (
+            not caller_session_key
+            or not isinstance(persisted_session_key, str)
+            or not persisted_session_key
+            or persisted_session_key != caller_session_key
+        ):
+            return False
+
+        if source.platform == Platform.MATRIX:
+            return self._persisted_matrix_origin_matches(source, row)
+
+        decoded = self._decode_persisted_session_source(row.get("origin_json"))
+        if decoded is None:
+            return False
+        _payload, origin_source = decoded
+        try:
+            origin_session_key = str(key_for_source(origin_source) or "")
+        except Exception:
+            return False
+
+        # The persisted full origin must corroborate the dedicated row fields.
+        # Caller aliases (for example WhatsApp JID/LID flips) are deliberately
+        # not compared as raw strings after the canonical session-key match.
+        row_source = str(row.get("source") or "")
+        origin_platform = (
+            origin_source.platform.value
+            if isinstance(origin_source.platform, Platform)
+            else str(origin_source.platform or "")
+        )
+        if not row_source or origin_platform != row_source:
+            return False
+        if str(row.get("user_id") or "") != str(origin_source.user_id or ""):
+            return False
+        if str(row.get("chat_id") or "") != str(origin_source.chat_id or ""):
+            return False
+        if str(row.get("chat_type") or "") != str(origin_source.chat_type or ""):
+            return False
+        if str(row.get("thread_id") or "") != str(origin_source.thread_id or ""):
+            return False
+        return bool(origin_session_key) and origin_session_key == persisted_session_key
 
     async def _resume_row_visible(
         self, source: SessionSource, row: dict, allow_all: bool
     ) -> bool:
-        """Whether a titled-session listing *row* belongs to the caller's origin.
+        """Whether a listing row belongs to the caller's authorized origin.
 
-        Prevents cross-origin enumeration of session ids/previews via the
-        numbered /resume list. Preserves the existing Matrix room-scoping
-        semantics; scopes every other platform to the caller's own sessions
-        unless an admin passes ``--all``.
+        Delegate to the exact same policy as direct ``/resume`` so full listings,
+        numbered choices, and direct IDs/titles cannot drift into different
+        authorization rules.
         """
         sid = str(row.get("id") or "")
-        if source.platform == Platform.MATRIX:
-            # Cross-room enumeration is cross-ORIGIN data access: gate the
-            # ``--all`` short-circuit behind a real configured admin, exactly
-            # like the non-Matrix branch below. A non-admin Matrix ``--all``
-            # falls back to same-room scoping rather than exposing every Matrix
-            # titled session.
-            if allow_all and self._resume_caller_is_admin(source):
-                return True
-            return self._same_matrix_room(source, self._gateway_session_origin_for_id(sid))
-        if allow_all and self._resume_caller_is_admin(source):
+        lineage_root_id = str(row.get("_lineage_root_id") or "")
+        if lineage_root_id and lineage_root_id != sid:
+            session_db = getattr(self, "_session_db", None)
+            if session_db is None:
+                return False
+            for actual_id in (lineage_root_id, sid):
+                try:
+                    actual_row = await session_db.get_session(actual_id) or {}
+                except Exception:
+                    return False
+                if not isinstance(actual_row, dict) or not actual_row:
+                    return False
+                if not await self._resume_target_allowed(
+                    source,
+                    actual_id,
+                    allow_override=allow_all,
+                    persisted_row=actual_row,
+                ):
+                    return False
             return True
-        return await self._resume_target_allowed(source, sid, allow_override=False)
+        return await self._resume_target_allowed(
+            source,
+            sid,
+            allow_override=allow_all,
+            persisted_row=row,
+        )
 
     async def _handle_agents_command(self, event: MessageEvent) -> str:
         """Handle /agents command - list active agents and running tasks."""
@@ -4364,6 +4440,23 @@ class GatewaySlashCommandsMixin:
             parts = shlex.split(raw_args)
         except ValueError as exc:
             return t("gateway.resume.parse_error", error=exc)
+
+        # Compatibility-only listing flags are a thin alias to /sessions. Keep
+        # all parsing, querying, formatting, and authorization on that existing
+        # path; mixed flag/target calls retain the direct /resume semantics.
+        if parts and all(part in {"--all", "--full"} for part in parts):
+            listing_args = []
+            if "--all" in parts:
+                listing_args.append("all")
+            if "--full" in parts:
+                listing_args.append("full")
+            sessions_event = dataclasses.replace(
+                event, text=f"/sessions {' '.join(listing_args)}"
+            )
+            return await self._handle_sessions_command(
+                sessions_event, include_current=True
+            )
+
         allow_all = "--all" in parts
         allow_cross_room = "--cross-room" in parts
         name = " ".join(p for p in parts if p not in {"--all", "--cross-room"}).strip()
@@ -4378,24 +4471,84 @@ class GatewaySlashCommandsMixin:
         ):
             name = name[1:-1].strip()
 
+        override_requested = (
+            allow_cross_room
+            if source.platform == Platform.MATRIX
+            else (allow_all or allow_cross_room)
+        )
+
         async def _list_titled_sessions() -> list[dict]:
             user_source = source.platform.value if source.platform else None
+            session_db = getattr(self, "_session_db", None)
+            if session_db is None:
+                return []
+            visible: list[dict] = []
+            offset = 0
+            batch_size = 50
             widen = allow_all and self._resume_caller_is_admin(source)
-            sessions = await self._session_db.list_sessions_rich(
-                source=user_source,
-                session_key=None if widen else session_key,
-                limit=10,
-            )
-            return [s for s in sessions if s.get("title")][:10]
+            while len(visible) < 10:
+                sessions = await session_db.list_sessions_rich(
+                    source=user_source,
+                    session_key=None if widen else session_key,
+                    limit=batch_size,
+                    offset=offset,
+                )
+                if not sessions:
+                    break
+                offset += len(sessions)
+                for session_row in sessions:
+                    if not session_row.get("title"):
+                        continue
+                    if await self._resume_row_visible(
+                        source, session_row, allow_all
+                    ):
+                        visible.append(session_row)
+                        if len(visible) >= 10:
+                            break
+                if len(sessions) < batch_size:
+                    break
+            return visible
+
+        async def _resolve_visible_title_target(title: str) -> str | None:
+            session_db = getattr(self, "_session_db", None)
+            if session_db is None:
+                return None
+            candidates = await session_db.list_session_title_candidates(title)
+            override_modes = [False]
+            if override_requested:
+                override_modes.append(True)
+            for allow_override in override_modes:
+                for candidate in candidates:
+                    candidate_id = str(candidate.get("id") or "")
+                    if not candidate_id:
+                        continue
+                    try:
+                        tip_id = await session_db.resolve_resume_session_id(candidate_id)
+                    except Exception:
+                        tip_id = candidate_id
+                    root_allowed = await self._resume_target_allowed(
+                        source,
+                        candidate_id,
+                        allow_override=allow_override,
+                        persisted_row=candidate,
+                    )
+                    if tip_id == candidate_id:
+                        tip_allowed = root_allowed
+                    else:
+                        tip_allowed = await self._resume_target_allowed(
+                            source,
+                            tip_id,
+                            allow_override=allow_override,
+                        )
+                    if root_allowed and tip_allowed:
+                        return candidate_id
+            return None
+
 
         if not name:
             # List recent titled sessions for this user/platform
             try:
                 titled = await _list_titled_sessions()
-                titled = [
-                    s for s in titled
-                    if await self._resume_row_visible(source, s, allow_all)
-                ]
                 if not titled:
                     if source.platform == Platform.MATRIX and not allow_all:
                         return t("gateway.resume.matrix_no_named_sessions")
@@ -4403,10 +4556,12 @@ class GatewaySlashCommandsMixin:
                 lines = [t("gateway.resume.list_header")]
                 for idx, s in enumerate(titled[:10], start=1):
                     title = s["title"]
-                    if source.platform == Platform.MATRIX and allow_all:
-                        origin = self._gateway_session_origin_for_id(str(s.get("id") or ""))
-                        if origin:
-                            title = f"{title} — {origin.chat_name or origin.chat_id}"
+                    if (
+                        source.platform == Platform.MATRIX
+                        and allow_all
+                        and self._resume_caller_is_admin(source)
+                    ):
+                        title = self._decorate_matrix_session_row(s)["title"]
                     preview = s.get("preview", "")[:40]
                     preview_part = t("gateway.resume.list_preview_suffix", preview=preview) if preview else ""
                     lines.append(t("gateway.resume.list_item_numbered", index=idx, title=title, preview_part=preview_part))
@@ -4420,10 +4575,6 @@ class GatewaySlashCommandsMixin:
         if name.isdigit():
             try:
                 titled = await _list_titled_sessions()
-                titled = [
-                    s for s in titled
-                    if await self._resume_row_visible(source, s, allow_all)
-                ]
             except Exception as e:
                 logger.debug("Failed to list titled sessions for numeric resume: %s", e)
                 return t("gateway.resume.list_failed", error=e)
@@ -4440,34 +4591,63 @@ class GatewaySlashCommandsMixin:
             if session:
                 target_id = session["id"]
             else:
-                target_id = await self._session_db.resolve_session_by_title(name)
+                target_id = await _resolve_visible_title_target(name)
         if not target_id:
             return t("gateway.resume.not_found", name=name)
+        requested_target_id = str(target_id)
+        resolved_target_id = requested_target_id
         # Compression creates child continuations that hold the live transcript.
-        # Follow that chain so gateway /resume matches CLI behavior (#15000).
+        # Follow that chain so gateway /resume matches CLI behavior (#15000), but
+        # keep the requested root as an independent authorization boundary.
         try:
-            target_id = await self._session_db.resolve_resume_session_id(target_id)
+            resolved_target_id = await self._session_db.resolve_resume_session_id(
+                requested_target_id
+            )
         except Exception as e:
-            logger.debug("Failed to resolve resume continuation for %s: %s", target_id, e)
+            logger.debug(
+                "Failed to resolve resume continuation for %s: %s",
+                requested_target_id,
+                e,
+            )
 
-        if source.platform == Platform.MATRIX:
-            target_origin = self._gateway_session_origin_for_id(target_id)
-            if not self._same_matrix_room(source, target_origin) and not allow_cross_room:
-                if target_origin is None:
-                    return t("gateway.resume.matrix_blocked_no_origin", name=name)
-                return t(
-                    "gateway.resume.matrix_blocked_other_room",
-                    room=target_origin.chat_name or target_origin.chat_id,
-                    name=name,
+        # Authorize both the user-supplied root and the resolved continuation
+        # before reading title/transcript or switching. Two candidates that each
+        # match the caller's exact origin necessarily preserve provenance across
+        # the chain; a foreign root cannot launder access through an owned tip (or
+        # vice versa). An explicit configured-admin override must authorize both.
+        root_same_origin = await self._resume_target_allowed(
+            source, requested_target_id, allow_override=False
+        )
+        if resolved_target_id == requested_target_id:
+            tip_same_origin = root_same_origin
+        else:
+            tip_same_origin = await self._resume_target_allowed(
+                source, resolved_target_id, allow_override=False
+            )
+        same_origin_allowed = root_same_origin and tip_same_origin
+        target_allowed = same_origin_allowed
+        if not target_allowed and override_requested:
+            root_override = await self._resume_target_allowed(
+                source, requested_target_id, allow_override=True
+            )
+            if resolved_target_id == requested_target_id:
+                tip_override = root_override
+            else:
+                tip_override = await self._resume_target_allowed(
+                    source, resolved_target_id, allow_override=True
                 )
-        elif not await self._resume_target_allowed(
-            source, target_id, allow_override=(allow_all or allow_cross_room)
-        ):
-            # IDOR guard: a session id/title is a routing handle, not authority.
-            # Bind /resume to the caller's own platform/user/chat on every
-            # non-Matrix adapter so one user can't attach to another's
-            # persisted transcript.
-            return t("gateway.resume.blocked_not_owner", name=name)
+            target_allowed = root_override and tip_override
+        if not target_allowed:
+            # Do not disclose whether either candidate exists, which room/chat
+            # owns it, or any persisted origin label.
+            return t("gateway.resume.not_found", name=name)
+        target_id = resolved_target_id
+
+        matrix_cross_room_resume = bool(
+            source.platform == Platform.MATRIX
+            and allow_cross_room
+            and not same_origin_allowed
+        )
 
         # Check if already on that session
         current_entry = await self.async_session_store.get_or_create_session(source)
@@ -4504,7 +4684,7 @@ class GatewaySlashCommandsMixin:
         msg_count = len([m for m in history if m.get("role") == "user"]) if history else 0
         msg_part = f" ({msg_count} message{'s' if msg_count != 1 else ''})" if msg_count else ""
 
-        if source.platform == Platform.MATRIX and allow_cross_room:
+        if matrix_cross_room_resume:
             return t(
                 "gateway.resume.matrix_cross_room_success",
                 title=title,
@@ -4517,7 +4697,9 @@ class GatewaySlashCommandsMixin:
             return t("gateway.resume.resumed_one", title=title, count=msg_count)
         return t("gateway.resume.resumed_many", title=title, count=msg_count)
 
-    async def _handle_sessions_command(self, event: MessageEvent) -> str:
+    async def _handle_sessions_command(
+        self, event: MessageEvent, *, include_current: bool = False
+    ) -> str:
         """Handle /sessions — list previous sessions for gateway chats."""
         if not self._session_db:
             from hermes_state import format_session_db_unavailable
@@ -4556,28 +4738,50 @@ class GatewaySlashCommandsMixin:
         # previews / sources — the enumeration half of the /resume IDOR.
         cross_origin = include_all and self._resume_caller_is_admin(source)
         current_entry = await self.async_session_store.get_or_create_session(source)
-        rows = await asyncio.to_thread(
-            query_session_listing,
-            getattr(self._session_db, "_db", self._session_db),
-            source=source.platform.value if source.platform else None,
-            session_key=None if cross_origin else session_key,
-            current_session_id=current_entry.session_id,
-            include_all_sources=cross_origin,
-            include_unnamed=include_unnamed,
-            search_query=search_query,
-            # Search filters at SQL level, so over-fetch before the visibility
-            # cut: origin-invisible matches would otherwise consume the page.
-            limit=50 if search_query else 10,
-            exclude_sources=["tool"],
-        )
-        if not cross_origin:
-            # Scope the listing to the caller's own origin on every adapter so
-            # session ids/previews from other users/rooms aren't enumerable.
+        session_db = getattr(self, "_session_db", None)
+        if session_db is None:
+            from hermes_state import format_session_db_unavailable
+            return format_session_db_unavailable(
+                prefix=t("gateway.shared.session_db_unavailable_prefix")
+
+            )
+        sync_session_db = getattr(session_db, "_db", session_db)
+        candidate_limit = 50 if search_query else 10
+        rows: list[dict] = []
+        while True:
+            candidates = await asyncio.to_thread(
+                query_session_listing,
+                sync_session_db,
+                source=source.platform.value if source.platform else None,
+                session_key=None if cross_origin else session_key,
+                # `/sessions` excludes the active conversation by design. The
+                # compatibility-only `/resume --all/--full` aliases historically
+                # included it, so they opt in without duplicating this query/auth
+                # path.
+                current_session_id=None if include_current else current_entry.session_id,
+                include_all_sources=cross_origin,
+                include_unnamed=include_unnamed,
+                search_query=search_query,
+                limit=candidate_limit,
+                exclude_sources=["tool"],
+            )
             rows = [
-                row for row in rows
-                if await self._resume_row_visible(source, row, allow_all=False)
+                row for row in candidates
+                if await self._resume_row_visible(
+                    source, row, allow_all=cross_origin
+                )
             ]
+            if len(rows) >= 10 or len(candidates) < candidate_limit:
+                break
+            candidate_limit *= 2
         rows = rows[:10]
+        if cross_origin and source.platform == Platform.MATRIX:
+            # Preserve the legacy `/resume --all` Matrix affordance now that
+            # its compatibility flags delegate to this canonical listing path:
+            # cross-room titles must identify their room. Decorate copies only
+            # after the admin gate and visibility/query path have selected the
+            # rows, so formatting cannot widen what the caller may enumerate.
+            rows = [self._decorate_matrix_session_row(row) for row in rows]
         if search_query:
             title = f"Sessions matching “{search_query}”"
         else:

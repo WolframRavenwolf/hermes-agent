@@ -56,6 +56,22 @@ class TestQuerySessionListingSearch:
         finally:
             db.close()
 
+    def test_plain_listing_paginates_past_unnamed_rows(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "pagination.db")
+        db.create_session("owned_named", "telegram", user_id="1", chat_id="2")
+        db.set_session_title("owned_named", "Owned Named Session")
+        for index in range(50):
+            db.create_session(
+                f"newer_unnamed_{index}", "telegram", user_id="1", chat_id="2"
+            )
+        try:
+            rows = query_session_listing(db, source="telegram", limit=1)
+            assert [row["id"] for row in rows] == ["owned_named"]
+        finally:
+            db.close()
+
 
 class TestQuerySessionListingLaneScope:
     @pytest.fixture
