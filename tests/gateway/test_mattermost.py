@@ -149,6 +149,75 @@ class TestMattermostTruncateMessage:
         for chunk in chunks:
             assert len(chunk) <= 4000
 
+    def test_configured_max_post_length_is_exposed_to_streaming(self, monkeypatch):
+        monkeypatch.delenv("MATTERMOST_MAX_POST_LENGTH", raising=False)
+        adapter = _make_adapter({"max_post_length": 10_000})
+
+        assert adapter.max_post_length == 10_000
+        assert adapter.MAX_MESSAGE_LENGTH == 10_000
+
+    def test_max_post_length_is_clamped_to_server_limit(self, monkeypatch):
+        monkeypatch.delenv("MATTERMOST_MAX_POST_LENGTH", raising=False)
+        adapter = _make_adapter({"max_post_length": 999_999})
+
+        assert adapter.max_post_length == 16_383
+
+    def test_tiny_max_post_length_falls_back_to_default(self, monkeypatch):
+        monkeypatch.delenv("MATTERMOST_MAX_POST_LENGTH", raising=False)
+        adapter = _make_adapter({"max_post_length": 1})
+
+        assert adapter.max_post_length == 4_000
+
+    def test_env_max_post_length_overrides_config(self, monkeypatch):
+        monkeypatch.setenv("MATTERMOST_MAX_POST_LENGTH", "12000")
+        adapter = _make_adapter({"max_post_length": 10_000})
+
+        assert adapter.max_post_length == 12_000
+
+    def test_apply_yaml_config_keeps_profile_values_out_of_process_env(self, monkeypatch):
+        env_names = (
+            "MATTERMOST_MAX_POST_LENGTH",
+            "MATTERMOST_REQUIRE_MENTION",
+            "MATTERMOST_FREE_RESPONSE_CHANNELS",
+            "MATTERMOST_ALLOWED_CHANNELS",
+        )
+        for name in env_names:
+            monkeypatch.delenv(name, raising=False)
+        from plugins.platforms.mattermost.adapter import _apply_yaml_config
+
+        first = _apply_yaml_config(
+            {},
+            {
+                "max_post_length": 500,
+                "require_mention": True,
+                "free_response_channels": ["first-free"],
+                "allowed_channels": ["first-allowed"],
+            },
+        )
+        second = _apply_yaml_config(
+            {},
+            {
+                "max_post_length": 600,
+                "require_mention": False,
+                "free_response_channels": ["second-free"],
+                "allowed_channels": ["second-allowed"],
+            },
+        )
+
+        assert first == {
+            "max_post_length": 500,
+            "require_mention": True,
+            "free_response_channels": ["first-free"],
+            "allowed_channels": ["first-allowed"],
+        }
+        assert second == {
+            "max_post_length": 600,
+            "require_mention": False,
+            "free_response_channels": ["second-free"],
+            "allowed_channels": ["second-allowed"],
+        }
+        assert all(os.getenv(name) is None for name in env_names)
+
 
 # ---------------------------------------------------------------------------
 # Send
@@ -454,6 +523,23 @@ class TestMattermostMentionBehavior:
             os.environ.pop("MATTERMOST_REQUIRE_MENTION", None)
             await self.adapter._handle_ws_event(self._make_event("hello", channel_id="chan_456"))
             assert self.adapter.handle_message.called
+
+    @pytest.mark.asyncio
+    async def test_operator_env_allowed_channels_overrides_yaml_extra(self, monkeypatch):
+        monkeypatch.setenv("MATTERMOST_ALLOWED_CHANNELS", "operator-channel")
+        adapter = _make_adapter({"allowed_channels": ["yaml-channel"]})
+        adapter._bot_user_id = "bot_user_id"
+        adapter._bot_username = "hermes-bot"
+        adapter.handle_message = AsyncMock()
+
+        await adapter._handle_ws_event(
+            self._make_event(
+                "@hermes-bot hello",
+                channel_id="operator-channel",
+            )
+        )
+
+        adapter.handle_message.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

@@ -1036,10 +1036,16 @@ class MattermostAdapter(BasePlatformAdapter):
             # allowed_channels check (whitelist — must pass before other gating).
             # When set, messages from channels NOT in this list are silently
             # ignored, even if @mentioned.  DMs are already excluded above.
-            allowed_raw = self.config.extra.get("allowed_channels") if self.config.extra else None
+            allowed_raw = os.getenv("MATTERMOST_ALLOWED_CHANNELS")
             if allowed_raw is None:
-                allowed_raw = os.getenv("MATTERMOST_ALLOWED_CHANNELS", "")
-            if isinstance(allowed_raw, list):
+                allowed_raw = (
+                    self.config.extra.get("allowed_channels")
+                    if self.config.extra
+                    else None
+                )
+            if allowed_raw is None:
+                allowed_channels = set()
+            elif isinstance(allowed_raw, list):
                 allowed_channels = {str(c).strip() for c in allowed_raw if str(c).strip()}
             else:
                 allowed_channels = {
@@ -1052,12 +1058,34 @@ class MattermostAdapter(BasePlatformAdapter):
                 )
                 return
 
-            require_mention = os.getenv(
-                "MATTERMOST_REQUIRE_MENTION", "true"
-            ).lower() not in {"false", "0", "no"}
+            require_mention_raw = os.getenv("MATTERMOST_REQUIRE_MENTION")
+            if require_mention_raw is None:
+                require_mention_raw = (
+                    self.config.extra.get("require_mention", True)
+                    if self.config.extra
+                    else True
+                )
+            require_mention = str(require_mention_raw).lower() not in {
+                "false", "0", "no"
+            }
 
-            free_channels_raw = os.getenv("MATTERMOST_FREE_RESPONSE_CHANNELS", "")
-            free_channels = {ch.strip() for ch in free_channels_raw.split(",") if ch.strip()}
+            free_channels_raw = os.getenv("MATTERMOST_FREE_RESPONSE_CHANNELS")
+            if free_channels_raw is None:
+                free_channels_raw = (
+                    self.config.extra.get("free_response_channels", "")
+                    if self.config.extra
+                    else ""
+                )
+            if isinstance(free_channels_raw, list):
+                free_channels = {
+                    str(ch).strip() for ch in free_channels_raw if str(ch).strip()
+                }
+            else:
+                free_channels = {
+                    ch.strip()
+                    for ch in str(free_channels_raw).split(",")
+                    if ch.strip()
+                }
             is_free_channel = channel_id in free_channels
 
             mention_patterns = [
@@ -1470,39 +1498,27 @@ def interactive_setup() -> None:
 
 
 def _apply_yaml_config(yaml_cfg: dict, mattermost_cfg: dict) -> dict | None:
-    """Translate ``config.yaml`` ``mattermost:`` keys into env vars.
+    """Seed Mattermost YAML settings into ``PlatformConfig.extra``.
 
-    Implements the ``apply_yaml_config_fn`` contract (#24836 / #25443).
-    Mirrors the legacy ``mattermost_cfg`` block that used to live in
-    ``gateway/config.py::load_gateway_config()`` before this migration.
-
-    The MattermostAdapter reads its runtime configuration via
-    ``os.getenv()`` for ``MATTERMOST_REQUIRE_MENTION``,
-    ``MATTERMOST_FREE_RESPONSE_CHANNELS``, and
-    ``MATTERMOST_ALLOWED_CHANNELS``.  Rather than rewrite those call sites
-    to read from ``PlatformConfig.extra``, this hook keeps the env-driven
-    model and merely owns the YAML→env translation here, next to the
-    adapter that consumes it.
-
-    Env vars take precedence over YAML — every assignment is guarded
-    by ``not os.getenv(...)`` so an explicit env var survives a config.yaml
-    update.  Returns ``None`` because no extras are seeded into
-    ``PlatformConfig.extra`` directly (everything flows through env).
+    ``os.environ`` is process-global, so writing profile YAML values there makes
+    the first multiplexed profile silently win for every later profile. Keep the
+    hook side-effect free and return adapter-local extras instead. Explicit
+    operator environment variables retain precedence at the adapter read sites.
     """
-    if "require_mention" in mattermost_cfg and not os.getenv("MATTERMOST_REQUIRE_MENTION"):
-        os.environ["MATTERMOST_REQUIRE_MENTION"] = str(mattermost_cfg["require_mention"]).lower()
-    frc = mattermost_cfg.get("free_response_channels")
-    if frc is not None and not os.getenv("MATTERMOST_FREE_RESPONSE_CHANNELS"):
-        if isinstance(frc, list):
-            frc = ",".join(str(v) for v in frc)
-        os.environ["MATTERMOST_FREE_RESPONSE_CHANNELS"] = str(frc)
-    # allowed_channels: if set, bot ONLY responds in these channels (whitelist)
-    ac = mattermost_cfg.get("allowed_channels")
-    if ac is not None and not os.getenv("MATTERMOST_ALLOWED_CHANNELS"):
-        if isinstance(ac, list):
-            ac = ",".join(str(v) for v in ac)
-        os.environ["MATTERMOST_ALLOWED_CHANNELS"] = str(ac)
-    return None  # all settings flow through env; nothing to merge into extras
+    seeded: Dict[str, Any] = {}
+
+    if "max_post_length" in mattermost_cfg:
+        seeded["max_post_length"] = _coerce_max_post_length(
+            mattermost_cfg["max_post_length"]
+        )
+    for key in (
+        "require_mention",
+        "free_response_channels",
+        "allowed_channels",
+    ):
+        if key in mattermost_cfg:
+            seeded[key] = mattermost_cfg[key]
+    return seeded or None
 
 
 # ---------------------------------------------------------------------------
@@ -1550,12 +1566,9 @@ def register(ctx) -> None:
         # Interactive setup wizard — replaces the central
         # hermes_cli/setup.py::_setup_mattermost function.
         setup_fn=interactive_setup,
-        # YAML→env config bridge — owns the translation of
-        # ``config.yaml`` ``mattermost:`` keys (require_mention,
-        # free_response_channels, allowed_channels) into ``MATTERMOST_*``
-        # env vars that the adapter reads via ``os.getenv()``.  Replaces
-        # the hardcoded block that used to live in ``gateway/config.py``.
-        # Hook contract: #24836 / #25443.
+        # Profile-local YAML bridge: adapter behavior settings stay in
+        # ``PlatformConfig.extra`` instead of leaking through process-global
+        # ``os.environ``. Explicit operator env vars are resolved at runtime.
         apply_yaml_config_fn=_apply_yaml_config,
         # Auth env vars for _is_user_authorized() integration.
         allowed_users_env="MATTERMOST_ALLOWED_USERS",
