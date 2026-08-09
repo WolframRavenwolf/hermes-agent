@@ -762,17 +762,19 @@ class MattermostAdapter(BasePlatformAdapter):
 
         payload: Dict[str, Any] = _with_mentions_disabled({
             "channel_id": chat_id,
-            "message": caption or "",
+            "message": _file_post_message(caption, [fname]),
             "file_ids": [file_id],
         })
         resolved_root = await self._thread_root_for_send(reply_to, metadata)
         if resolved_root:
             payload["root_id"] = resolved_root
 
-        data = await self._post_preserving_thread(chat_id, payload, metadata)
-        if not data or "id" not in data:
-            return SendResult(success=False, error="Failed to post with file")
-        return SendResult(success=True, message_id=data["id"])
+        return await self._post_chunked_payload(
+            chat_id,
+            payload,
+            metadata,
+            error="Failed to post with file",
+        )
 
     async def _send_local_file(
         self,
@@ -803,17 +805,19 @@ class MattermostAdapter(BasePlatformAdapter):
 
         payload: Dict[str, Any] = _with_mentions_disabled({
             "channel_id": chat_id,
-            "message": caption or "",
+            "message": _file_post_message(caption, [fname]),
             "file_ids": [file_id],
         })
         resolved_root = await self._thread_root_for_send(reply_to, metadata)
         if resolved_root:
             payload["root_id"] = resolved_root
 
-        data = await self._post_preserving_thread(chat_id, payload, metadata)
-        if not data or "id" not in data:
-            return SendResult(success=False, error="Failed to post with file")
-        return SendResult(success=True, message_id=data["id"])
+        return await self._post_chunked_payload(
+            chat_id,
+            payload,
+            metadata,
+            error="Failed to post with file",
+        )
 
     async def send_multiple_images(
         self,
@@ -845,6 +849,7 @@ class MattermostAdapter(BasePlatformAdapter):
                 await asyncio.sleep(human_delay)
 
             file_ids: List[str] = []
+            uploaded_names: List[str] = []
             caption_parts: List[str] = []
             try:
                 for image_url, alt_text in chunk:
@@ -885,13 +890,14 @@ class MattermostAdapter(BasePlatformAdapter):
                     fid = await self._upload_file(chat_id, file_data, fname, ct)
                     if fid:
                         file_ids.append(fid)
+                        uploaded_names.append(fname)
 
                 if not file_ids:
                     continue
 
                 payload: Dict[str, Any] = _with_mentions_disabled({
                     "channel_id": chat_id,
-                    "message": "\n".join(caption_parts),
+                    "message": _file_post_message("\n".join(caption_parts), uploaded_names),
                     "file_ids": file_ids,
                 })
                 resolved_root = await self._thread_root_for_send(None, metadata)
@@ -901,8 +907,13 @@ class MattermostAdapter(BasePlatformAdapter):
                     "Mattermost: sending %d image(s) as single post (chunk %d/%d)",
                     len(file_ids), chunk_idx + 1, len(chunks),
                 )
-                data = await self._post_preserving_thread(chat_id, payload, metadata)
-                if not data or "id" not in data:
+                result = await self._post_chunked_payload(
+                    chat_id,
+                    payload,
+                    metadata,
+                    error="Failed to post image batch",
+                )
+                if not result.success and not result.message_id:
                     logger.warning("Mattermost: multi-image post failed, falling back")
                     await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
             except Exception as e:

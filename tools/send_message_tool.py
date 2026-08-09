@@ -967,22 +967,14 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 )
             }
 
-        last_result = None
-        delivery_chunks = chunks or [message]
-        for i, chunk in enumerate(delivery_chunks):
-            is_last = i == len(delivery_chunks) - 1
-            result = await mattermost_entry.standalone_sender_fn(
-                pconfig,
-                chat_id,
-                chunk,
-                thread_id=thread_id,
-                media_files=media_files if is_last else [],
-                force_document=force_document,
-            )
-            if isinstance(result, dict) and result.get("error"):
-                return result
-            last_result = result
-        return last_result
+        return await mattermost_entry.standalone_sender_fn(
+            pconfig,
+            chat_id,
+            message,
+            thread_id=thread_id,
+            media_files=media_files,
+            force_document=force_document,
+        )
 
     # --- Matrix: route ALL sends through the native adapter so text is
     # encrypted in E2EE rooms too (issue: text-only sends arrived with a red
