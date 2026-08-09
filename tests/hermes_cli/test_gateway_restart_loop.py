@@ -873,7 +873,7 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
         monkeypatch.setattr(tt, "_active_environments", {eid: fake_env})
         monkeypatch.setattr(tt, "_last_activity", {eid: 0.0})
         monkeypatch.setattr(tt, "_task_env_overrides", {})
-        monkeypatch.setattr(tt, "_get_env_config", lambda: {"env_type": "local", "cwd": "/tmp", "timeout": 60, "lifetime_seconds": 3600})
+        monkeypatch.setattr(tt, "_get_env_config", lambda: {"env_type": "ssh", "cwd": "/remote/workspace", "timeout": 60, "lifetime_seconds": 3600})
         if inside_gateway:
             monkeypatch.setenv("_HERMES_GATEWAY", "1")
         else:

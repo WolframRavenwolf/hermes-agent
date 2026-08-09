@@ -97,6 +97,19 @@ def test_systemd_manager_kind_and_registration_unsupported() -> None:
     assert isinstance(mgr, ServiceManager)
 
 
+def test_launchd_manager_stop_propagates_false_result(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr("hermes_cli.gateway.launchd_stop", lambda: False)
+
+    with pytest.raises(RuntimeError, match="did not stop"):
+        LaunchdServiceManager().stop("ignored")
+
+
 # ---------------------------------------------------------------------------
 # Lifecycle delegation — wrappers must call through to module-level fns
 # ---------------------------------------------------------------------------

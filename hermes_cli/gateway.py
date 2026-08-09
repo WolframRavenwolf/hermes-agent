@@ -9,7 +9,6 @@ import json
 import logging
 import os
 import plistlib
-import shlex
 import shutil
 import signal
 import subprocess
@@ -2784,6 +2783,8 @@ def launchd_app_wrapper_is_current(
     try:
         info = plistlib.loads(info_path.read_bytes())
         source_info = plistlib.loads(source_info_path.read_bytes())
+        if not isinstance(info, dict) or not isinstance(source_info, dict):
+            return False
         expected_source_info = _launchd_app_wrapper_source_info(
             source_python, snapshot
         )
@@ -2795,6 +2796,77 @@ def launchd_app_wrapper_is_current(
         and all(source_info.get(key) == value for key, value in expected_source_info.items())
         and _launchd_app_wrapper_signature_is_valid(app_path)
     )
+
+
+def _valid_installed_launchd_app_wrapper(app_path: Path) -> bool:
+    """Return whether *app_path* is a signed wrapper for the active profile.
+
+    This deliberately accepts a legacy display name so a configured rename can
+    rebuild the bundle without downgrading the launchd job to raw Python.  It
+    still fails closed unless the bundle identifier, executable component,
+    source metadata, executable, package type, and code signature all agree.
+    """
+    try:
+        contents = app_path / "Contents"
+        info = plistlib.loads((contents / "Info.plist").read_bytes())
+        source_info = plistlib.loads(
+            (contents / "Resources" / MACOS_APP_WRAPPER_SOURCE_INFO).read_bytes()
+        )
+        if not isinstance(info, dict) or not isinstance(source_info, dict):
+            return False
+        executable_name = info.get("CFBundleExecutable")
+        if (
+            not isinstance(executable_name, str)
+            or not executable_name
+            or Path(executable_name).name != executable_name
+            or any(separator in executable_name for separator in ("/", "\\", ":"))
+            or executable_name in {".", ".."}
+            or any(
+                unicodedata.category(char).startswith("C")
+                for char in executable_name
+            )
+        ):
+            return False
+        source_python = source_info.get("SourcePython")
+        source_size = source_info.get("SourceSize")
+        source_mtime_ns = source_info.get("SourceMTimeNs")
+        signing_identity = source_info.get("SigningIdentity")
+        if (
+            source_info.get("DisplayName") != executable_name
+            or not isinstance(source_python, str)
+            or not source_python
+            or not isinstance(source_size, int)
+            or isinstance(source_size, bool)
+            or source_size < 0
+            or not isinstance(source_mtime_ns, int)
+            or isinstance(source_mtime_ns, bool)
+            or source_mtime_ns < 0
+            or not isinstance(signing_identity, str)
+            or not signing_identity
+        ):
+            return False
+        executable = contents / "MacOS" / executable_name
+        return (
+            info.get("CFBundleIdentifier") == get_launchd_bundle_identifier()
+            and info.get("CFBundlePackageType") == "APPL"
+            and executable.is_file()
+            and _launchd_app_wrapper_signature_is_valid(app_path)
+        )
+    except (OSError, ValueError, TypeError, plistlib.InvalidFileException):
+        return False
+
+
+def _find_installed_launchd_app_wrapper() -> Path | None:
+    """Find a valid installed wrapper independent of its configured name."""
+    wrapper_dir = get_hermes_home() / "macos"
+    try:
+        candidates = sorted(wrapper_dir.glob("*.app"))
+    except OSError:
+        return None
+    for candidate in candidates:
+        if _valid_installed_launchd_app_wrapper(candidate):
+            return candidate
+    return None
 
 
 def install_launchd_app_wrapper(force: bool = False) -> Path:
@@ -2882,56 +2954,96 @@ def install_launchd_app_wrapper(force: bool = False) -> Path:
         )
 
         backup_path = app_parent / f".{app_path.name}.previous"
-        if backup_path.exists():
-            shutil.rmtree(backup_path)
+        rollback_path = backup_path
+        if app_path.exists() and backup_path.exists():
+            # Preserve a prior `.previous` until the staged replacement has
+            # committed.  The current bundle gets a distinct rollback path.
+            rollback_path = Path(
+                tempfile.mkdtemp(prefix=f".{app_path.name}.rollback-", dir=app_parent)
+            )
+            rollback_path.rmdir()
         backup_created = False
         try:
             if app_path.exists():
-                app_path.rename(backup_path)
+                app_path.rename(rollback_path)
                 backup_created = True
             staging_app_path.rename(app_path)
         except Exception:
-            if backup_created and not app_path.exists() and backup_path.exists():
+            if backup_created and not app_path.exists() and rollback_path.exists():
                 try:
-                    backup_path.rename(app_path)
+                    rollback_path.rename(app_path)
                 except Exception as restore_error:
                     raise RuntimeError(
                         "Failed to install the macOS app wrapper and restore the "
-                        f"previous bundle; backup preserved at {backup_path}"
+                        f"previous bundle; backup preserved at {rollback_path}"
                     ) from restore_error
             raise
         else:
+            # Delete recovery bundles only after the staged app is current.
             if backup_path.exists():
                 shutil.rmtree(backup_path)
+            if rollback_path != backup_path and rollback_path.exists():
+                shutil.rmtree(rollback_path)
     return app_path
 
 
-def _installed_launchd_plist_uses_app_wrapper(plist_path: Path | None = None) -> bool:
-    """Return True when an installed launchd plist already targets the app wrapper."""
+def _installed_launchd_plist_app_wrapper_mode(
+    plist_path: Path | None = None,
+) -> bool | None:
+    """Return the authoritative installed wrapper mode, or ``None`` if unknown."""
     path = plist_path or get_launchd_plist_path()
     if not path.exists():
-        return False
+        return None
     try:
         data = plistlib.loads(path.read_bytes())
     except Exception:
-        return False
-    if not isinstance(data, dict):
-        return False
-    env = data.get("EnvironmentVariables") or {}
+        return None
+    if not isinstance(data, dict) or data.get("Label") != get_launchd_label():
+        return None
+
+    env = data.get("EnvironmentVariables", {})
+    if not isinstance(env, dict):
+        return None
+    program = data.get("Program")
+    args = data.get("ProgramArguments", [])
+    if program is not None and not isinstance(program, str):
+        return None
+    if not isinstance(args, list) or any(not isinstance(arg, str) for arg in args):
+        return None
+    if not program and not args:
+        return None
+
     if env.get(MACOS_APP_WRAPPER_ENV_KEY) == "1":
         return True
-    program = data.get("Program")
-    args = data.get("ProgramArguments") or []
     first_arg = args[0] if args else None
     app_exe = str(get_launchd_app_wrapper_executable_path())
-    return program == app_exe or first_arg == app_exe
+    if program == app_exe or first_arg == app_exe:
+        return True
+    launch_executable = program or first_arg or ""
+    if ".app/Contents/MacOS/" in launch_executable:
+        # A legacy/config-renamed bundle is neither authoritative raw nor
+        # trusted wrapper mode.  Force the strict profile/bundle/metadata/
+        # executable/codesign discovery path before preserving it.
+        return None
+    return False
+
+
+def _installed_launchd_plist_uses_app_wrapper(plist_path: Path | None = None) -> bool:
+    """Return True when an authoritative installed plist targets the wrapper."""
+    return _installed_launchd_plist_app_wrapper_mode(plist_path) is True
 
 
 def _resolve_launchd_app_wrapper_mode(app_wrapper: bool | None = None) -> bool:
-    """Resolve target app-wrapper mode, preserving existing wrapper installs."""
+    """Resolve wrapper mode without treating missing/pending metadata as raw."""
     if app_wrapper is not None:
         return app_wrapper
-    return _installed_launchd_plist_uses_app_wrapper()
+    plist_path = get_launchd_plist_path()
+    installed_mode = _installed_launchd_plist_app_wrapper_mode(plist_path)
+    if installed_mode is True:
+        return True
+    if installed_mode is False and not _launchd_reload_is_pending(plist_path):
+        return False
+    return _find_installed_launchd_app_wrapper() is not None
 
 
 def _drop_launchd_app_wrapper_python_env() -> None:
@@ -4232,52 +4344,57 @@ def _launchctl_domain_unsupported(returncode: int) -> bool:
 
 
 # `launchctl bootstrap` returns this when the target label is *already*
-# registered in the domain — a stale load left by an interrupted restart or a
-# bootout that didn't fully settle. EIO here means "already loaded", which is
-# recoverable, NOT that the domain is unmanageable; only when a bootout + retry
-# also fails is the domain genuinely unsupported.
+# registered in the domain — a stale load left by an interrupted restart.
 _LAUNCHCTL_BOOTSTRAP_EIO = 5
 
 
+class LaunchdReloadError(RuntimeError):
+    """Raised when launchd never verifies a mutated plist registration."""
+
+
+class LaunchdStopError(RuntimeError):
+    """Raised when a launchd-managed gateway cannot be confirmed stopped."""
+
+
+def _launchd_remaining_timeout(deadline: float, maximum: float) -> float:
+    """Return a subprocess timeout capped by the shared monotonic deadline."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise subprocess.TimeoutExpired(["launchctl"], 0)
+    return min(float(maximum), remaining)
+
+
 def _launchctl_bootstrap(
-    domain: str, plist_path, label: str, *, timeout: int = 30
+    domain: str,
+    plist_path,
+    label: str,
+    *,
+    timeout: float = 30,
+    deadline: float | None = None,
 ) -> None:
-    """Bootstrap a launchd job, recovering from a stale already-loaded label.
+    """Bootstrap a launchd job, recovering one stale EIO registration.
 
-    On modern macOS, ``launchctl bootstrap`` of a label that is still
-    registered in ``domain`` fails with ``5: Input/output error`` (EIO). That
-    is the *already loaded* case — distinct from the domain being unmanageable,
-    which callers handle via :func:`_launchctl_domain_unsupported`. A leftover
-    registration from an interrupted restart leaves the job
-    loaded-but-not-running, so the next bootstrap hits EIO; without this retry
-    we misclassify it as "launchd cannot manage this macOS version" and degrade
-    to a detached process, silently losing auto-start and crash-restart.
-
-    Recover by booting the stale label out and bootstrapping once more. If the
-    retry still fails, the ``CalledProcessError`` propagates so callers apply
-    their domain-unsupported fallback for a genuinely broken domain.
+    With a deadline, the initial bootstrap, EIO bootout, and retry all consume
+    the same wall-clock budget instead of each receiving a fresh timeout.
     """
-    try:
-        subprocess.run(
-            ["launchctl", "bootstrap", domain, str(plist_path)],
-            check=True,
-            timeout=timeout,
+
+    def run_launchctl(args: list[str], *, check: bool) -> None:
+        command = ["launchctl", *args]
+        command_timeout = (
+            timeout
+            if deadline is None
+            else _launchd_remaining_timeout(deadline, timeout)
         )
+        subprocess.run(command, check=check, timeout=command_timeout)
+
+    try:
+        run_launchctl(["bootstrap", domain, str(plist_path)], check=True)
         return
     except subprocess.CalledProcessError as exc:
         if exc.returncode != _LAUNCHCTL_BOOTSTRAP_EIO:
             raise
-        # Stale registration — drop the leftover label and bootstrap once more.
-        subprocess.run(
-            ["launchctl", "bootout", f"{domain}/{label}"],
-            check=False,
-            timeout=timeout,
-        )
-        subprocess.run(
-            ["launchctl", "bootstrap", domain, str(plist_path)],
-            check=True,
-            timeout=timeout,
-        )
+        run_launchctl(["bootout", f"{domain}/{label}"], check=False)
+        run_launchctl(["bootstrap", domain, str(plist_path)], check=True)
 
 
 def _launchd_reload_log_path() -> Path:
@@ -4299,13 +4416,21 @@ def _append_launchd_reload_log(message: str) -> None:
         pass
 
 
-def _launchctl_label_registered(label: str) -> bool:
+def _launchctl_label_registered(
+    label: str, *, deadline: float | None = None
+) -> bool:
     """True when ``launchctl list <label>`` reports the job as registered."""
+    command = ["launchctl", "list", label]
     try:
+        timeout = (
+            10.0
+            if deadline is None
+            else _launchd_remaining_timeout(deadline, 10.0)
+        )
         result = subprocess.run(
-            ["launchctl", "list", label],
+            command,
             check=False,
-            timeout=10,
+            timeout=timeout,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -4315,49 +4440,51 @@ def _launchctl_label_registered(label: str) -> bool:
 
 
 def _retry_launchctl_bootstrap_until_registered(
-    domain: str, plist_path, label: str, *, deadline: float
+    domain: str,
+    plist_path,
+    label: str,
+    *,
+    deadline: float,
+    last_error: list[BaseException] | None = None,
 ) -> bool:
-    """Bootstrap with retry until the label is registered or ``deadline`` passes.
-
-    Wraps :func:`_launchctl_bootstrap` (which already recovers the EIO
-    "already loaded" case) in a wall-clock retry loop for the *transient*
-    failure mode: under high load or a launchd race the bootstrap can fail
-    even after ``bootout`` already tore down the prior registration, leaving
-    the service orphaned from ``KeepAlive`` supervision. The reported incident
-    happened during a graceful drain (default ``agent.restart_drain_timeout``
-    = 180s), so a fixed ~10s window is too short — retry until ``deadline``.
-
-    Both ``CalledProcessError`` and ``TimeoutExpired`` are treated as
-    retryable: a ``bootstrap`` that times out after ``bootout`` still leaves
-    the service unloaded, so it must be retried, not allowed to escape. On
-    each failure a timestamped line is appended to the reload log; success is
-    confirmed with ``launchctl list`` (not merely a zero bootstrap exit).
-    Returns True once the label is registered, False if the deadline is hit.
-    """
+    """Bootstrap/retry until the label registers or one deadline expires."""
     attempt = 0
-    while True:
+    while time.monotonic() < deadline:
         attempt += 1
         try:
-            _launchctl_bootstrap(domain, plist_path, label, timeout=30)
-            if _launchctl_label_registered(label):
+            _launchctl_bootstrap(
+                domain,
+                plist_path,
+                label,
+                timeout=30,
+                deadline=deadline,
+            )
+            if _launchctl_label_registered(label, deadline=deadline):
                 return True
+            if last_error is not None:
+                last_error.clear()
             _append_launchd_reload_log(
                 f"bootstrap attempt {attempt} exited 0 but {domain}/{label} "
-                f"is not registered (launchctl list) — retrying"
+                "is not registered (launchctl list) — retrying"
             )
         except subprocess.CalledProcessError as exc:
+            if last_error is not None:
+                last_error[:] = [exc]
             _append_launchd_reload_log(
                 f"bootstrap attempt {attempt} failed (rc={exc.returncode}) "
                 f"for {domain}/{label} — retrying"
             )
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
+            if last_error is not None:
+                last_error[:] = [exc]
             _append_launchd_reload_log(
-                f"bootstrap attempt {attempt} timed out for {domain}/{label} "
-                f"— retrying"
+                f"bootstrap attempt {attempt} timed out for {domain}/{label} — retrying"
             )
-        if time.monotonic() >= deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             return False
-        time.sleep(2)
+        time.sleep(min(2.0, remaining))
+    return False
 
 
 # ── launchd unsupported marker ─────────────────────────────────────────────
@@ -4476,39 +4603,403 @@ def _launchd_fallback_to_detached(reason: str, *, exit_on_failure: bool = True) 
     return False
 
 
+def _launchd_target() -> str:
+    return f"{_launchd_domain()}/{get_launchd_label()}"
+
+
+def _launchd_reload_pending_path(plist_path: Path | None = None) -> Path:
+    """Return the durable marker for a plist launchd has not verified."""
+    path = plist_path or get_launchd_plist_path()
+    return path.with_name(f"{path.name}.reload-pending")
+
+
+def _fsync_directory(path: Path) -> None:
+    """Persist directory-entry changes for a completed filesystem mutation."""
+    directory_fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _mark_launchd_reload_pending(plist_path: Path | None = None) -> None:
+    """Atomically persist the fail-closed marker before plist mutation."""
+    marker = _launchd_reload_pending_path(plist_path)
+    temp_path: Path | None = None
+    fd: int | None = None
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{marker.name}.", suffix=".tmp", dir=marker.parent
+        )
+        temp_path = Path(temp_name)
+        handle = os.fdopen(fd, "w", encoding="utf-8")
+        fd = None
+        with handle:
+            handle.write("launchd plist reload pending\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, marker)
+        temp_path = None
+        _fsync_directory(marker.parent)
+    except OSError as exc:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        logger.error("Could not persist launchd reload marker %s: %s", marker, exc)
+        raise
+
+
+def _clear_launchd_reload_pending(plist_path: Path | None = None) -> None:
+    marker = _launchd_reload_pending_path(plist_path)
+    try:
+        marker.unlink()
+        _fsync_directory(marker.parent)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        logger.warning("Could not clear launchd reload marker %s: %s", marker, exc)
+
+
+def _launchd_reload_is_pending(plist_path: Path | None = None) -> bool:
+    marker = _launchd_reload_pending_path(plist_path)
+    try:
+        marker.stat()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        logger.warning("Could not stat launchd reload marker; assuming pending: %s", exc)
+        return True
+
+
+def _write_launchd_plist_with_pending_marker(
+    plist_path: Path, definition: str
+) -> None:
+    """Atomically replace a plist after durably marking reload pending."""
+    _mark_launchd_reload_pending(plist_path)
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    fd: int | None = None
+    try:
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{plist_path.name}.", suffix=".tmp", dir=plist_path.parent
+        )
+        temp_path = Path(temp_name)
+        handle = os.fdopen(fd, "w", encoding="utf-8")
+        fd = None
+        with handle:
+            handle.write(definition)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, plist_path)
+        temp_path = None
+        _fsync_directory(plist_path.parent)
+    except OSError:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+
+
+def _launchd_loaded_job_pid() -> int | None:
+    """Return the PID launchd has loaded for this gateway label, if known."""
+    try:
+        result = subprocess.run(
+            ["launchctl", "print", _launchd_target()],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    for line in (result.stdout or "").splitlines():
+        key, sep, value = line.strip().partition("=")
+        if sep and key.strip().lower() == "pid":
+            try:
+                pid = int(value.strip().rstrip(";"))
+            except ValueError:
+                return None
+            return pid if pid > 0 else None
+    return None
+
+
+def _reload_launchd_plist_now(
+    plist_path: Path,
+    label: str | None = None,
+    *,
+    check_bootstrap: bool = False,
+) -> bool:
+    """Reload *plist_path* under one deadline and verify registration."""
+    domain = _launchd_domain()
+    service_label = label or get_launchd_label()
+    target = f"{domain}/{service_label}"
+    reload_budget = max(30.0, _get_restart_drain_timeout())
+    deadline = time.monotonic() + reload_budget
+    last_error: list[BaseException] = []
+    try:
+        subprocess.run(
+            ["launchctl", "bootout", target],
+            check=False,
+            timeout=_launchd_remaining_timeout(deadline, 90.0),
+        )
+    except subprocess.TimeoutExpired as exc:
+        last_error[:] = [exc]
+        _append_launchd_reload_log(
+            f"bootout timed out for {target} within the shared reload deadline"
+        )
+
+    registered = _retry_launchctl_bootstrap_until_registered(
+        domain,
+        plist_path,
+        service_label,
+        deadline=deadline,
+        last_error=last_error,
+    )
+    if registered:
+        _clear_launchd_reload_pending(plist_path)
+        return True
+
+    # Re-persist in case a prior marker write was lost independently of the
+    # plist.  Never clear it until launchctl list verifies the registration.
+    _mark_launchd_reload_pending(plist_path)
+    _append_launchd_reload_log(
+        f"FAILED launchd reload of {target} — service NOT registered after "
+        f"retrying for {int(reload_budget)}s"
+    )
+    logger.error(
+        "launchd reload of %s failed — service not registered after %ds of "
+        "retries; reload marker preserved; see %s",
+        target,
+        int(reload_budget),
+        _launchd_reload_log_path(),
+    )
+    print(
+        f"⚠ launchd bootstrap did not register {target} after "
+        f"{int(reload_budget)}s; reload marker preserved"
+    )
+    if (
+        check_bootstrap
+        and last_error
+        and isinstance(last_error[-1], subprocess.CalledProcessError)
+        and _launchctl_domain_unsupported(last_error[-1].returncode)
+    ):
+        # Only expose unsupported-domain fallback after this single budget has
+        # been exhausted.  Callers must not begin a second reload transaction.
+        raise last_error[-1]
+    return False
+
+
+def _require_launchd_reload(
+    plist_path: Path,
+    label: str | None = None,
+    *,
+    check_bootstrap: bool = False,
+) -> None:
+    """Raise unless the central reload path verifies launchd registration."""
+    service_label = label or get_launchd_label()
+    if _reload_launchd_plist_now(
+        plist_path, service_label, check_bootstrap=check_bootstrap
+    ):
+        return
+    raise LaunchdReloadError(
+        f"launchd reload did not register {service_label}; "
+        f"pending marker preserved at {_launchd_reload_pending_path(plist_path)}"
+    )
+
+
+def _is_running_inside_gateway_process_tree() -> bool:
+    """Return True when this command runs below the active gateway process."""
+    try:
+        from gateway.status import get_running_pid
+
+        pid = get_running_pid()
+    except Exception:
+        return False
+    if pid is None or not _is_pid_ancestor_of_current_process(pid):
+        return False
+    if is_macos():
+        launchd_pid = _launchd_loaded_job_pid()
+        if launchd_pid is not None and launchd_pid != pid:
+            return False
+    return True
+
+
+def _launchd_path_entry_exists(path: str) -> bool:
+    """Return True when a PATH entry exists and can be inherited by launchd."""
+    try:
+        return Path(path).exists()
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _launchd_logical_hermes_path(path: str | Path | None) -> Path | None:
+    """Map physical paths under HERMES_HOME back to its configured spelling."""
+    if path is None:
+        return None
+    hermes_home = get_hermes_home()
+    candidate = Path(path).expanduser()
+    candidate_paths = [candidate]
+    try:
+        resolved_candidate = candidate.resolve()
+        if resolved_candidate not in candidate_paths:
+            candidate_paths.append(resolved_candidate)
+    except (OSError, RuntimeError):
+        pass
+    home_paths = [hermes_home]
+    try:
+        resolved_home = hermes_home.resolve()
+        if resolved_home not in home_paths:
+            home_paths.append(resolved_home)
+    except (OSError, RuntimeError):
+        pass
+    for candidate_path in candidate_paths:
+        for home_path in home_paths:
+            try:
+                relative = candidate_path.relative_to(home_path)
+            except ValueError:
+                continue
+            return hermes_home / relative
+    return candidate
+
+
+def _launchd_should_keep_inherited_path_entry(path: str) -> bool:
+    """Return True for inherited PATH entries worth preserving in launchd."""
+    entry = path.strip()
+    if not entry:
+        return False
+    lowered = entry.lower()
+    stale_markers = (
+        "/.codex/tmp/",
+        "/codex.system/bootstrap/",
+        "/applications/codex.app/",
+        "/opt/pkg/env/",
+        "/opt/pmk/env/",
+    )
+    if any(marker in lowered for marker in stale_markers):
+        return False
+    if entry == "/config" or entry.startswith("/config/"):
+        return False
+    if entry == "/share" or entry.startswith("/share/"):
+        return False
+    return _launchd_path_entry_exists(entry)
+
+
+def _append_launchd_path_entry(entries: list[str], path: str | Path | None) -> None:
+    """Append an existing launchd PATH entry once, preserving order."""
+    if path is None:
+        return
+    entry = str(path)
+    if _launchd_path_entry_exists(entry) and entry not in entries:
+        entries.append(entry)
+
+
 def generate_launchd_plist(app_wrapper: bool = False) -> str:
     detected_venv = _detect_venv_dir()
+    launchd_project_root = _launchd_logical_hermes_path(PROJECT_ROOT) or PROJECT_ROOT
+    launchd_venv = _launchd_logical_hermes_path(detected_venv)
     wrapper_identity = (
         _resolve_launchd_app_wrapper_identity(strict=True) if app_wrapper else None
     )
-    python_path = (
-        str(get_launchd_app_wrapper_executable_path(wrapper_identity))
+    raw_python_path = (
+        get_launchd_app_wrapper_executable_path(wrapper_identity)
         if app_wrapper
-        else get_python_path()
+        else Path(get_python_path())
     )
-    # Stable cwd anchor — never the volatile source checkout. See
-    # _stable_service_working_dir() for the rationale (same rot risk applies
-    # to launchd's WorkingDirectory as to systemd's).
-    working_dir = _stable_service_working_dir()
-    hermes_home = str(get_hermes_home().resolve())
-    log_dir = get_hermes_home() / "logs"
+    python_path = str(
+        _launchd_logical_hermes_path(raw_python_path) or raw_python_path
+    )
+    hermes_home_path = get_hermes_home()
+    hermes_home = str(_launchd_logical_hermes_path(hermes_home_path) or hermes_home_path)
+    launchd_hermes_home = Path(hermes_home)
+    stable_working_dir = _stable_service_working_dir()
+    working_dir = str(
+        _launchd_logical_hermes_path(stable_working_dir) or launchd_project_root
+    )
+    log_dir = hermes_home_path / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
+    launchd_log_dir = launchd_hermes_home / "logs"
     label = get_launchd_label()
     profile_arg = _profile_arg(hermes_home)
-    # Build a sane PATH for the launchd plist.  launchd provides only a
-    # minimal default (/usr/bin:/bin:/usr/sbin:/sbin) which misses Homebrew,
-    # nvm, cargo, etc.  We prepend venv/bin and node_modules/.bin (matching
-    # the systemd unit), then capture the user's full shell PATH so every
-    # user-installed tool (node, ffmpeg, …) is reachable.
-    venv_dir = str(detected_venv) if detected_venv else str(PROJECT_ROOT / "venv")
-    # Resolve the directory containing the node binary (e.g. Homebrew, nvm)
-    # so it's explicitly in PATH even if the user's shell PATH changes later.
-    priority_dirs = _build_service_path_dirs()
-    _append_node_dir_for_service(priority_dirs)
-    sane_path = ":".join(
-        dict.fromkeys(
-            priority_dirs + [p for p in os.environ.get("PATH", "").split(":") if p]
+
+    # Service-owned logical paths always precede inherited PATH entries.  Each
+    # inherited entry must exist, survive stale-runner filtering, and is added
+    # only once in its first observed position.
+    venv_bin = (
+        str(launchd_venv / "bin")
+        if launchd_venv
+        else str(launchd_project_root / "venv" / "bin")
+    )
+    venv_dir = str(launchd_venv) if launchd_venv else str(launchd_project_root / "venv")
+    priority_dirs: list[str] = []
+    for candidate in (
+        venv_bin,
+        launchd_hermes_home / "bin",
+        launchd_project_root.parent / "bin",
+        launchd_hermes_home / ".go" / "bin",
+        launchd_project_root.parent / ".go" / "bin",
+    ):
+        _append_launchd_path_entry(priority_dirs, candidate)
+
+    service_path_dirs = _build_service_path_dirs(
+        project_root=Path(launchd_project_root)
+    )
+    if launchd_venv:
+        active_prefix_bin = Path(sys.prefix) / "bin"
+        service_path_dirs = [
+            path for path in service_path_dirs if Path(path) != active_prefix_bin
+        ]
+    for candidate in service_path_dirs:
+        logical_candidate = _launchd_logical_hermes_path(candidate)
+        if logical_candidate and _launchd_should_keep_inherited_path_entry(
+            str(logical_candidate)
+        ):
+            _append_launchd_path_entry(priority_dirs, logical_candidate)
+
+    inherited_dirs: list[str] = []
+    for candidate in os.environ.get("PATH", "").split(os.pathsep):
+        logical_candidate = _launchd_logical_hermes_path(candidate)
+        if logical_candidate and _launchd_should_keep_inherited_path_entry(
+            str(logical_candidate)
+        ):
+            _append_launchd_path_entry(inherited_dirs, logical_candidate)
+
+    resolved_node = shutil.which("node")
+    if resolved_node:
+        resolved_node_dir = str(
+            _launchd_logical_hermes_path(Path(resolved_node).parent)
+            or Path(resolved_node).parent
         )
+        if _launchd_should_keep_inherited_path_entry(resolved_node_dir):
+            _append_launchd_path_entry(priority_dirs, resolved_node_dir)
+
+    system_fallback_dirs = [
+        "/usr/local/sbin",
+        "/usr/local/bin",
+        "/usr/sbin",
+        "/usr/bin",
+        "/sbin",
+        "/bin",
+    ]
+    system_dirs = [p for p in system_fallback_dirs if _launchd_path_entry_exists(p)]
+    sane_path = os.pathsep.join(
+        dict.fromkeys(priority_dirs + inherited_dirs + system_dirs)
     )
 
     environment = {
@@ -4517,16 +5008,23 @@ def generate_launchd_plist(app_wrapper: bool = False) -> str:
         "HERMES_HOME": hermes_home,
     }
     if app_wrapper:
+        wrapper_pythonpath = os.pathsep.join(
+            str(_launchd_logical_hermes_path(part) or part)
+            for part in _launchd_app_wrapper_pythonpath(detected_venv).split(os.pathsep)
+            if part
+        )
+        child_python = _launchd_child_python_path(detected_venv)
         environment.update(
             {
                 "PYTHONHOME": str(_python_home_from_path(get_python_path(), detected_venv)),
-                "PYTHONPATH": _launchd_app_wrapper_pythonpath(detected_venv),
-                "PYTHONEXECUTABLE": _launchd_child_python_path(detected_venv),
+                "PYTHONPATH": wrapper_pythonpath,
+                "PYTHONEXECUTABLE": str(
+                    _launchd_logical_hermes_path(child_python) or child_python
+                ),
                 MACOS_APP_WRAPPER_ENV_KEY: "1",
             }
         )
 
-    # Build ProgramArguments array, including --profile when using a named profile
     prog_args = [python_path, "-m", "hermes_cli.main"]
     if profile_arg:
         prog_args.extend(profile_arg.split())
@@ -4540,12 +5038,11 @@ def generate_launchd_plist(app_wrapper: bool = False) -> str:
         "LimitLoadToSessionType": ["Aqua", "Background"],
         "RunAtLoad": True,
         "KeepAlive": True,
-        # Preserve v0.20's crash-loop and graceful-drain safeguards when the
-        # plist is emitted through plistlib for either launch mode.
+        # v0.20 native launchd crash-loop and graceful-drain safeguards.
         "ThrottleInterval": 30,
         "ExitTimeOut": 25,
-        "StandardOutPath": f"{log_dir}/gateway.log",
-        "StandardErrorPath": f"{log_dir}/gateway.error.log",
+        "StandardOutPath": f"{launchd_log_dir}/gateway.log",
+        "StandardErrorPath": f"{launchd_log_dir}/gateway.error.log",
     }
     if app_wrapper:
         plist_data["AssociatedBundleIdentifiers"] = get_launchd_bundle_identifier()
@@ -4567,12 +5064,16 @@ def launchd_plist_is_current(app_wrapper: bool | None = None) -> bool:
     return _normalize_launchd_plist_for_comparison(installed) == _normalize_launchd_plist_for_comparison(expected)
 
 
-def refresh_launchd_plist_if_needed(app_wrapper: bool | None = None) -> bool:
-    """Rewrite the installed launchd plist when the generated definition has changed.
+def refresh_launchd_plist_if_needed(
+    app_wrapper: bool | None = None, *, check_bootstrap: bool = False
+) -> bool:
+    """Rewrite/reload a changed plist without reporting false success.
 
-    Unlike systemd, launchd picks up plist changes on the next ``launchctl kill``/
-    ``launchctl kickstart`` cycle — no daemon-reload is needed. We still bootout/
-    bootstrap to make launchd re-read the updated plist immediately.
+    ``False`` means no refresh was required. ``True`` means the definition was
+    registration-verified or safely deferred from inside the gateway tree.
+    Reload exhaustion raises :class:`LaunchdReloadError`.  Lifecycle callers
+    that support the detached fallback pass ``check_bootstrap=True`` so an
+    exhausted exit 5/125 remains distinguishable from generic exhaustion.
     """
     plist_path = get_launchd_plist_path()
     if not plist_path.exists():
@@ -4582,158 +5083,34 @@ def refresh_launchd_plist_if_needed(app_wrapper: bool | None = None) -> bool:
     if target_app_wrapper and not launchd_app_wrapper_is_current():
         install_launchd_app_wrapper(force=True)
 
-    if launchd_plist_is_current(app_wrapper=target_app_wrapper):
-        return False
-
-    new_plist = generate_launchd_plist(app_wrapper=target_app_wrapper)
-    if _refuse_temp_home_service_write(new_plist, "launchd plist"):
-        return False
-
-    plist_path.write_text(new_plist, encoding="utf-8")
     label = get_launchd_label()
-    domain = _launchd_domain()
-    target = f"{domain}/{label}"
+    reload_pending = _launchd_reload_is_pending(plist_path)
+    plist_current = launchd_plist_is_current(app_wrapper=target_app_wrapper)
+    if plist_current and not reload_pending:
+        return False
 
-    # If this refresh is running INSIDE the gateway's own launchd process tree
-    # (e.g. the agent triggered a self-update via its terminal tool), a direct
-    # `launchctl bootout` tears down the service's process group — which
-    # includes THIS CLI — before the follow-up `bootstrap` can run. The gateway
-    # then stays unloaded and KeepAlive can't revive it (#43842). Detect that
-    # case and hand the reload to a detached session that survives the bootout.
-    gateway_pid = None
-    try:
-        from gateway.status import get_running_pid
-        gateway_pid = get_running_pid()
-    except Exception:
-        gateway_pid = None
-
-    if (
-        gateway_pid is not None
-        and _is_pid_ancestor_of_current_process(gateway_pid)
-        and hasattr(os, "setsid")  # POSIX-only; launchd is macOS so always true here
-    ):
-        # Delegate to a new session: `start_new_session=True` detaches the
-        # helper from the gateway's process group, so the bootout that kills
-        # the gateway (and us) does not kill the helper before it bootstraps.
-        #
-        # The bootstrap is retried up to 5 times with verification: under
-        # high load (loadavg observed >= 9) or a launchd race, the bootout
-        # can succeed (removing the service from launchd) while the
-        # follow-up bootstrap fails silently. Without retry+verify the
-        # service stays unregistered — KeepAlive can't revive a service
-        # launchd no longer knows about, so the gateway stays dark until a
-        # manual `launchctl bootstrap`. Failures append a timestamped line
-        # to ~/.hermes/logs/launchd-reload.log, which the health watchdog
-        # can tail to detect a persistent orphan. See hermes-restart
-        # rootcause handoff (2026-06-26 incident).
-        reload_log_path = get_hermes_home() / "logs" / "launchd-reload.log"
-        try:
-            reload_log_path.parent.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            pass
-
-        # Write a durable pre-bootout marker so we can distinguish "helper
-        # never started" from "helper ran but bootout/bootstrap failed".
-        _append_launchd_reload_log(f"Launchd reload helper started for {target}")
-
-        # Retry until launchctl LISTS the label (not merely a zero bootstrap
-        # exit) or the drain window elapses. The failure happens while the old
-        # gateway is still draining (default agent.restart_drain_timeout=180s),
-        # so a fixed ~10s window is too short — bound by that budget instead.
-        _reload_budget = int(max(30.0, _get_restart_drain_timeout()))
-        # Label for the transient one-shot job (see `launchctl submit` below).
-        # Unique per reload so concurrent/repeated reloads never collide.
-        submit_label = f"{label}.reload.{os.getpid()}.{int(time.time())}"
-        reload_script = (
-            f"sleep 2; "
-            f"launchctl bootout {shlex.quote(target)} 2>/dev/null; "
-            f"sleep 1; "
-            f"_deadline=$(($(date +%s) + {_reload_budget})); "
-            f"while :; do "
-            f"  launchctl bootstrap {shlex.quote(domain)} {shlex.quote(str(plist_path))} 2>/dev/null; "
-            f"  if launchctl list {shlex.quote(label)} >/dev/null 2>&1; then break; fi; "
-            f"  echo \"[$(date '+%Y-%m-%d %H:%M:%S %z')] bootstrap not yet registered for {shlex.quote(target)} — retrying\" >> {shlex.quote(str(reload_log_path))}; "
-            f"  if [ $(date +%s) -ge $_deadline ]; then break; fi; "
-            f"  sleep 2; "
-            f"done; "
-            f"if ! launchctl list {shlex.quote(label)} >/dev/null 2>&1; then "
-            f"  echo \"[$(date '+%Y-%m-%d %H:%M:%S %z')] FAILED launchd reload for {shlex.quote(target)} — service NOT registered after {_reload_budget}s of retries\" >> {shlex.quote(str(reload_log_path))}; "
-            f"fi; "
-            # Submitted jobs stay registered with launchd after the script
-            # exits; without this, every reload leaks one dead label. Removing
-            # our own label is the documented way to end a one-shot submit job
-            # (it SIGTERMs the job, but this is the final statement anyway).
-            f"launchctl remove {shlex.quote(submit_label)} 2>/dev/null"
-        )
-        try:
-            # Spawn the reload helper via `launchctl submit` (a transient
-            # launchd one-shot job) instead of `start_new_session=True`.
-            # `start_new_session=True` only calls setsid(2), which creates a
-            # new POSIX session but does NOT move the child outside the
-            # launchd job's process coalition.  When `launchctl bootout` fires
-            # on the gateway label, launchd terminates ALL processes in that
-            # coalition — including a setsid-detached child (#69098).
-            #
-            # `launchctl submit` creates a wholly independent transient launchd
-            # job that launchd manages separately from the gateway, so bootout
-            # of the gateway job cannot reach the helper.
-            subprocess.Popen(
-                [
-                    "launchctl", "submit",
-                    "-l", submit_label,
-                    "-o", str(reload_log_path),
-                    "-e", str(reload_log_path),
-                    "--",
-                    "/bin/bash", "-c", reload_script,
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+    if not plist_current:
+        new_plist = generate_launchd_plist(app_wrapper=target_app_wrapper)
+        if _refuse_temp_home_service_write(new_plist, "launchd plist"):
+            raise LaunchdReloadError(
+                "Refusing to update launchd plist with a temporary HERMES_HOME"
             )
-        except Exception as e:
-            logger.warning("Deferred launchd reload could not be spawned: %s", e)
-            _append_launchd_reload_log(
-                f"FAILED to spawn launchd reload helper for {target}: {e}"
-            )
-            return False
-        print(
-            "↻ Updated gateway launchd service definition; reload deferred to a "
-            "transient launchd job (refresh ran inside the gateway process tree)"
-        )
+        _write_launchd_plist_with_pending_marker(plist_path, new_plist)
+        reload_pending = True
+
+    if _is_running_inside_gateway_process_tree():
+        # Gateway descendants may persist only the marker/plist mutation.  No
+        # bootout, submit, detached helper, bootstrap, or kickstart is allowed.
+        if reload_pending and plist_current:
+            _mark_launchd_reload_pending(plist_path)
+        print("↻ Updated gateway launchd service definition to match the current Hermes install")
+        print("⚠ launchd reload deferred because this command is running inside the gateway process tree")
+        print("  Run 'hermes gateway start' from an external shell to make launchd re-read the plist")
         return True
 
-    # Bootout/bootstrap so launchd picks up the new definition. The reported
-    # incident (2026-06-26) happened when bootout succeeded but bootstrap
-    # failed silently under load (loadavg 9.48) during a graceful /restart
-    # drain, leaving the service unregistered — KeepAlive can't revive a job
-    # launchd no longer knows about. Retry the bootstrap (via the shared
-    # _launchctl_bootstrap EIO-recovery helper) until the label is actually
-    # registered or the drain window elapses, verify with `launchctl list`,
-    # and log exhaustion so the reload watchdog can detect a persistent orphan.
-    subprocess.run(
-        ["launchctl", "bootout", target],
-        check=False,
-        timeout=90,
+    _require_launchd_reload(
+        plist_path, label, check_bootstrap=check_bootstrap
     )
-    # Size the retry window to the restart drain timeout (default 180s), not a
-    # fixed ~10s: the failure mode occurs while the old gateway is still
-    # draining, so a short window can exhaust before launchd settles.
-    _reload_budget = max(30.0, _get_restart_drain_timeout())
-    _deadline = time.monotonic() + _reload_budget
-    if not _retry_launchctl_bootstrap_until_registered(
-        domain, plist_path, label, deadline=_deadline
-    ):
-        _append_launchd_reload_log(
-            f"FAILED launchd reload of {target} — service NOT registered after "
-            f"retrying for {int(_reload_budget)}s (refresh ran outside gateway "
-            f"process tree)"
-        )
-        logger.error(
-            "launchd reload of %s failed — service not registered after %ds of "
-            "retries; see %s",
-            target,
-            int(_reload_budget),
-            _launchd_reload_log_path(),
-        )
     print(
         "↻ Updated gateway launchd service definition to match the current Hermes install"
     )
@@ -4742,9 +5119,9 @@ def refresh_launchd_plist_if_needed(app_wrapper: bool | None = None) -> bool:
 
 def launchd_install(force: bool = False, app_wrapper: bool = False):
     plist_path = get_launchd_plist_path()
-    target_app_wrapper = app_wrapper or (
-        plist_path.exists() and not force and _installed_launchd_plist_uses_app_wrapper(plist_path)
-    )
+    # --force controls replacement, not launch mode.  Preserve a valid
+    # installed wrapper unless the caller explicitly opts into it from raw.
+    target_app_wrapper = app_wrapper or _resolve_launchd_app_wrapper_mode(None)
 
     if target_app_wrapper:
         install_launchd_app_wrapper(force=force or not launchd_app_wrapper_is_current())
@@ -4752,7 +5129,21 @@ def launchd_install(force: bool = False, app_wrapper: bool = False):
     if plist_path.exists() and not force:
         if not launchd_plist_is_current(app_wrapper=target_app_wrapper):
             print(f"↻ Repairing outdated launchd service at: {plist_path}")
-            refresh_launchd_plist_if_needed(app_wrapper=target_app_wrapper)
+            try:
+                refreshed = refresh_launchd_plist_if_needed(
+                    app_wrapper=target_app_wrapper, check_bootstrap=True
+                )
+            except subprocess.CalledProcessError as exc:
+                if not _launchctl_domain_unsupported(exc.returncode):
+                    raise
+                _launchd_fallback_to_detached(
+                    f"launchctl stale reload exit {exc.returncode}"
+                )
+                return
+            if not refreshed:
+                raise LaunchdReloadError(
+                    f"launchd service definition at {plist_path} was not updated"
+                )
             print("✓ Service definition updated")
             return
         print(f"Service already installed at: {plist_path}")
@@ -4761,23 +5152,31 @@ def launchd_install(force: bool = False, app_wrapper: bool = False):
         print("Use --force to reinstall")
         return
 
-    plist_path.parent.mkdir(parents=True, exist_ok=True)
     new_plist = generate_launchd_plist(app_wrapper=target_app_wrapper)
     if _refuse_temp_home_service_write(new_plist, "launchd plist"):
-        return
+        raise LaunchdReloadError(
+            "Refusing to install launchd plist with a temporary HERMES_HOME"
+        )
     print(f"Installing launchd service to: {plist_path}")
     if target_app_wrapper:
         print(f"Using macOS app wrapper: {get_launchd_app_wrapper_path()}")
-    plist_path.write_text(new_plist, encoding="utf-8")
+    _write_launchd_plist_with_pending_marker(plist_path, new_plist)
+
+    if _is_running_inside_gateway_process_tree():
+        print("⚠ launchd load deferred because this command is running inside the gateway process tree")
+        print("  Run 'hermes gateway start' from an external shell to load the service definition")
+        return
 
     try:
-        _launchctl_bootstrap(
-            _launchd_domain(), plist_path, get_launchd_label(), timeout=30
+        _require_launchd_reload(
+            plist_path, get_launchd_label(), check_bootstrap=True
         )
-    except subprocess.CalledProcessError as e:
-        if not _launchctl_domain_unsupported(e.returncode):
+    except subprocess.CalledProcessError as exc:
+        if not _launchctl_domain_unsupported(exc.returncode):
             raise
-        _launchd_fallback_to_detached(f"launchctl bootstrap exit {e.returncode}")
+        _launchd_fallback_to_detached(
+            f"launchctl bootstrap exit {exc.returncode}"
+        )
         return
 
     print()
@@ -4793,15 +5192,24 @@ def launchd_install(force: bool = False, app_wrapper: bool = False):
 
 def launchd_uninstall():
     plist_path = get_launchd_plist_path()
-    label = get_launchd_label()
-    subprocess.run(
-        ["launchctl", "bootout", f"{_launchd_domain()}/{label}"],
-        check=False,
-        timeout=90,
-    )
+    if _is_running_inside_gateway_process_tree():
+        raise LaunchdStopError(
+            "Refusing to uninstall launchd from inside the gateway process tree; "
+            "run the command from an external shell"
+        )
+    if launchd_stop() is False:
+        raise LaunchdStopError(
+            "Gateway process is still running; refusing to remove "
+            f"launchd plist at {plist_path}"
+        )
 
     if plist_path.exists():
+        _mark_launchd_reload_pending(plist_path)
+        marker_path = _launchd_reload_pending_path(plist_path)
         plist_path.unlink()
+        _fsync_directory(plist_path.parent)
+        marker_path.unlink(missing_ok=True)
+        _fsync_directory(marker_path.parent)
         print(f"✓ Removed {plist_path}")
 
     print("✓ Service uninstalled")
@@ -4810,62 +5218,89 @@ def launchd_uninstall():
 def launchd_start():
     plist_path = get_launchd_plist_path()
     label = get_launchd_label()
+    target_app_wrapper = _resolve_launchd_app_wrapper_mode(None)
 
-    # Self-heal if the plist is missing entirely (e.g., manual cleanup, failed upgrade)
+    # Self-heal a missing plist without forgetting a discovered signed wrapper.
     if not plist_path.exists():
-        new_plist = generate_launchd_plist()
+        if target_app_wrapper and not launchd_app_wrapper_is_current():
+            install_launchd_app_wrapper(force=True)
+        new_plist = generate_launchd_plist(app_wrapper=target_app_wrapper)
         if _refuse_temp_home_service_write(new_plist, "launchd plist"):
             sys.exit(1)
         print("↻ launchd plist missing; regenerating service definition")
-        plist_path.parent.mkdir(parents=True, exist_ok=True)
-        plist_path.write_text(new_plist, encoding="utf-8")
+        _write_launchd_plist_with_pending_marker(plist_path, new_plist)
+        if _is_running_inside_gateway_process_tree():
+            print("⚠ launchd bootstrap deferred because this command is running inside the gateway process tree")
+            print("  Run 'hermes gateway start' from an external shell to load the regenerated plist")
+            return
         try:
-            _launchctl_bootstrap(_launchd_domain(), plist_path, label, timeout=30)
+            _require_launchd_reload(plist_path, label, check_bootstrap=True)
             subprocess.run(
                 ["launchctl", "kickstart", f"{_launchd_domain()}/{label}"],
                 check=True,
                 timeout=30,
             )
-        except subprocess.CalledProcessError as e:
-            if not _launchctl_domain_unsupported(e.returncode):
+        except subprocess.CalledProcessError as exc:
+            if not _launchctl_domain_unsupported(exc.returncode):
                 raise
-            _launchd_fallback_to_detached(f"launchctl exit {e.returncode}")
+            _launchd_fallback_to_detached(f"launchctl exit {exc.returncode}")
             return
         print("✓ Service started")
         _clear_launchd_unsupported_marker()
         return
 
-    refresh_launchd_plist_if_needed()
+    try:
+        refreshed = refresh_launchd_plist_if_needed(
+            app_wrapper=target_app_wrapper, check_bootstrap=True
+        )
+    except subprocess.CalledProcessError as exc:
+        if not _launchctl_domain_unsupported(exc.returncode):
+            raise
+        _launchd_fallback_to_detached(
+            f"launchctl stale/pending reload exit {exc.returncode}"
+        )
+        return
+    if _is_running_inside_gateway_process_tree():
+        if not refreshed:
+            print("✓ Gateway service is already running")
+        print("⚠ Not kickstarting launchd from inside the gateway process tree")
+        print("  Run 'hermes gateway start' from an external shell if launchd must be reloaded")
+        return
+    domain = _launchd_domain()
+    target = f"{domain}/{label}"
     try:
         subprocess.run(
-            ["launchctl", "kickstart", f"{_launchd_domain()}/{label}"],
+            ["launchctl", "kickstart", target],
             check=True,
             timeout=30,
         )
-    except subprocess.CalledProcessError as e:
-        if not _launchd_error_indicates_unloaded(e):
+    except subprocess.CalledProcessError as exc:
+        if not _launchd_error_indicates_unloaded(exc):
             raise
-        # Job not loaded in this domain — re-bootstrap the plist and retry.
         print("↻ launchd job was unloaded; reloading service definition")
         try:
-            _launchctl_bootstrap(_launchd_domain(), plist_path, label, timeout=30)
+            _require_launchd_reload(plist_path, label, check_bootstrap=True)
             subprocess.run(
-                ["launchctl", "kickstart", f"{_launchd_domain()}/{label}"],
+                ["launchctl", "kickstart", target],
                 check=True,
                 timeout=30,
             )
-        except subprocess.CalledProcessError as e2:
-            # Even a fresh bootstrap can't manage the domain on this host —
-            # degrade to a detached background process (issue #23387).
-            if not _launchctl_domain_unsupported(e2.returncode):
+        except subprocess.CalledProcessError as retry_exc:
+            if not _launchctl_domain_unsupported(retry_exc.returncode):
                 raise
-            _launchd_fallback_to_detached(f"launchctl exit {e2.returncode}")
+            _launchd_fallback_to_detached(
+                f"launchctl exit {retry_exc.returncode}"
+            )
             return
     print("✓ Service started")
     _clear_launchd_unsupported_marker()
 
 
 def launchd_stop():
+    if _is_running_inside_gateway_process_tree():
+        print("⚠ Refusing launchd stop from inside the gateway process tree")
+        print("  Run 'hermes gateway stop' from an external shell")
+        return False
     label = get_launchd_label()
     target = f"{_launchd_domain()}/{label}"
     try:
@@ -4876,24 +5311,21 @@ def launchd_stop():
             write_planned_stop_marker(pid)
     except Exception:
         pass
-    # bootout unloads the service definition so KeepAlive doesn't respawn
-    # the process.  A plain `kill SIGTERM` only signals the process — launchd
-    # immediately restarts it because KeepAlive is unconditionally true.
-    # `hermes gateway start` re-bootstraps when it detects the job is unloaded.
     try:
         subprocess.run(["launchctl", "bootout", target], check=True, timeout=90)
-    except subprocess.CalledProcessError as e:
-        # Job already unloaded (3/113/125), or the domain can't be managed at
-        # all (5/125, macOS 26+ detached-fallback process, issue #23387) — in
-        # both cases just fall through to the PID-based kill below.
-        if _launchd_error_indicates_unloaded(e) or _launchctl_domain_unsupported(
-            e.returncode
+    except subprocess.CalledProcessError as exc:
+        if _launchd_error_indicates_unloaded(exc) or _launchctl_domain_unsupported(
+            exc.returncode
         ):
             pass
         else:
             raise
-    _wait_for_gateway_exit(timeout=10.0, force_after=5.0)
+    exited = _wait_for_gateway_exit(timeout=10.0, force_after=5.0)
+    if exited is False:
+        print("⚠ Gateway process is still running; service stop did not complete")
+        return False
     print("✓ Service stopped")
+    return True
 
 
 def _wait_for_gateway_exit(
@@ -4932,8 +5364,14 @@ def _wait_for_gateway_exit(
             try:
                 terminate_pid(pid, force=True)
                 print(f"⚠ Gateway PID {pid} did not exit gracefully; sent SIGKILL")
-            except (ProcessLookupError, PermissionError, OSError):
-                return True  # Already gone or we can't touch it.
+            except ProcessLookupError:
+                return True
+            except (PermissionError, OSError) as exc:
+                remaining_pid = get_running_pid()
+                if remaining_pid is None:
+                    return True
+                print(f"⚠ Could not force-stop gateway PID {remaining_pid}: {exc}")
+                return False
             force_sent = True
 
         time.sleep(0.3)
@@ -4949,26 +5387,51 @@ def _wait_for_gateway_exit(
 
 
 def launchd_restart():
-    if _installed_launchd_plist_uses_app_wrapper() and not launchd_app_wrapper_is_current():
+    if _is_running_inside_gateway_process_tree():
+        raise LaunchdReloadError(
+            "Refusing launchd restart from inside the gateway process tree; "
+            "use the v0.20 in-band restart path or an external shell"
+        )
+    plist_path = get_launchd_plist_path()
+    target_app_wrapper = _resolve_launchd_app_wrapper_mode(None)
+    if target_app_wrapper and not launchd_app_wrapper_is_current():
         install_launchd_app_wrapper(force=True)
     label = get_launchd_label()
-    target = f"{_launchd_domain()}/{label}"
+    domain = _launchd_domain()
+    target = f"{domain}/{label}"
     drain_timeout = _get_restart_drain_timeout()
     from gateway.status import get_running_pid
 
+    reload_pending = False
     try:
+        reload_pending = _launchd_reload_is_pending(plist_path)
+        if not reload_pending:
+            plist_current = True
+            try:
+                plist_current = launchd_plist_is_current(
+                    app_wrapper=target_app_wrapper
+                )
+            except Exception:
+                # An unreadable freshness probe must not fabricate a stale
+                # rewrite; a durable pending marker remains authoritative.
+                plist_current = True
+            if not plist_current:
+                new_plist = generate_launchd_plist(
+                    app_wrapper=target_app_wrapper
+                )
+                if _refuse_temp_home_service_write(new_plist, "launchd plist"):
+                    raise LaunchdReloadError(
+                        "Refusing to restart launchd with a temporary HERMES_HOME"
+                    )
+                _write_launchd_plist_with_pending_marker(plist_path, new_plist)
+                reload_pending = True
+
         pid = get_running_pid()
-        if pid is not None and _request_gateway_self_restart(pid):
+        if pid is not None and not reload_pending and _request_gateway_self_restart(pid):
             print("✓ Service restart requested")
             _clear_launchd_unsupported_marker()
             return
         if pid is not None:
-            # Announce the drain BEFORE waiting on it. This wait can run for
-            # the full drain budget (180s by default) while the old gateway
-            # finishes in-flight agent runs, and it streams into surfaces with
-            # no other feedback — the desktop updater's live output most of
-            # all, where a silent stop here reads as "update stuck" (#44515).
-            # Mirrors the systemd branch's "draining (up to Ns)..." line.
             print(
                 f"→ Stopping gateway (PID {pid}) — draining in-flight runs "
                 f"(up to {drain_timeout:.0f}s)..."
@@ -4978,47 +5441,53 @@ def launchd_restart():
             except (ProcessLookupError, PermissionError, OSError):
                 pid = None
             if pid is not None:
-                exited = _wait_for_gateway_exit(timeout=drain_timeout, force_after=None)
+                exited = _wait_for_gateway_exit(
+                    timeout=drain_timeout, force_after=None
+                )
                 if not exited:
                     print(
                         f"⚠ Gateway drain timed out after {drain_timeout:.0f}s — forcing launchd restart"
                     )
-        subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
-        print("✓ Service restarted")
-        _clear_launchd_unsupported_marker()
-    except subprocess.CalledProcessError as e:
-        if not _launchd_error_indicates_unloaded(e):
-            # Not a "job unloaded" code. If the domain is fundamentally
-            # unmanageable (error 5), degrade to detached; the old process was
-            # already drained/terminated above. Otherwise re-raise.
-            if _launchctl_domain_unsupported(e.returncode):
-                _launchd_fallback_to_detached(f"launchctl kickstart exit {e.returncode}")
-                return
-            raise
-        # Job not loaded — bootstrap and start fresh
-        print("↻ launchd job was unloaded; reloading")
-        plist_path = get_launchd_plist_path()
-        try:
-            # Restart is the one path where the job is almost always still
-            # registered (we just drained it), so a plain bootstrap would hit
-            # EIO on the common case. Boot the stale label out first — cheaper
-            # and clearer here than routing through _launchctl_bootstrap's
-            # bootstrap-first/retry-on-EIO flow. See #23387, #42914.
+        if reload_pending:
+            print("↻ Reloading launchd service definition before restart")
+            _require_launchd_reload(plist_path, label, check_bootstrap=True)
             subprocess.run(
-                ["launchctl", "bootout", target],
-                check=False,
+                ["launchctl", "kickstart", target], check=True, timeout=30
+            )
+        else:
+            subprocess.run(
+                ["launchctl", "kickstart", "-k", target],
+                check=True,
                 timeout=90,
             )
-            subprocess.run(
-                ["launchctl", "bootstrap", _launchd_domain(), str(plist_path)],
-                check=True,
-                timeout=30,
+        print("✓ Service restarted")
+        _clear_launchd_unsupported_marker()
+    except subprocess.CalledProcessError as exc:
+        if reload_pending and _launchctl_domain_unsupported(exc.returncode):
+            # The pending/stale reload already consumed its one shared budget.
+            _launchd_fallback_to_detached(
+                f"launchctl pending reload exit {exc.returncode}"
             )
-            subprocess.run(["launchctl", "kickstart", target], check=True, timeout=30)
-        except subprocess.CalledProcessError as e2:
-            if not _launchctl_domain_unsupported(e2.returncode):
+            return
+        if not _launchd_error_indicates_unloaded(exc):
+            if _launchctl_domain_unsupported(exc.returncode):
+                _launchd_fallback_to_detached(
+                    f"launchctl kickstart exit {exc.returncode}"
+                )
+                return
+            raise
+        print("↻ launchd job was unloaded; reloading")
+        try:
+            _require_launchd_reload(plist_path, label, check_bootstrap=True)
+            subprocess.run(
+                ["launchctl", "kickstart", target], check=True, timeout=30
+            )
+        except subprocess.CalledProcessError as retry_exc:
+            if not _launchctl_domain_unsupported(retry_exc.returncode):
                 raise
-            _launchd_fallback_to_detached(f"launchctl exit {e2.returncode}")
+            _launchd_fallback_to_detached(
+                f"launchctl exit {retry_exc.returncode}"
+            )
             return
         print("✓ Service restarted")
         _clear_launchd_unsupported_marker()
@@ -5064,6 +5533,9 @@ def launchd_status(deep: bool = False):
 
     # ── Report ──
     print(f"Launchd plist: {plist_path}")
+    if _launchd_reload_is_pending(plist_path):
+        print("⚠ launchd service definition reload is pending")
+        print("  Run: hermes gateway start")
     if launchd_plist_is_current():
         print("✓ Service definition matches the current Hermes install")
     else:
@@ -7146,17 +7618,6 @@ def _dispatch_all_via_service_manager_if_s6(action: str) -> bool:
 
 
 
-def _is_running_inside_gateway_process_tree() -> bool:
-    """Return True when this command runs below the active gateway process."""
-    try:
-        from gateway.status import get_running_pid
-
-        pid = get_running_pid()
-    except Exception:
-        return False
-    return pid is not None and _is_pid_ancestor_of_current_process(pid)
-
-
 def _refuse_gateway_self_management(action: str) -> bool:
     """Return True after refusing self-targeting gateway stop/restart commands."""
     if os.getenv("_HERMES_GATEWAY") != "1" and not _is_running_inside_gateway_process_tree():
@@ -7460,7 +7921,11 @@ def _gateway_command_inner(args):
         if supports_systemd_services():
             systemd_uninstall(system=system)
         elif is_macos():
-            launchd_uninstall()
+            try:
+                launchd_uninstall()
+            except LaunchdStopError as exc:
+                print(f"✗ Gateway service uninstall failed: {exc}")
+                sys.exit(1)
         elif is_windows():
             from hermes_cli import gateway_windows
 
@@ -7584,10 +8049,14 @@ def _gateway_command_inner(args):
                     pass
             elif is_macos() and get_launchd_plist_path().exists():
                 try:
-                    launchd_stop()
-                    service_available = True
-                except subprocess.CalledProcessError:
-                    pass
+                    stop_result = launchd_stop()
+                except subprocess.CalledProcessError as exc:
+                    print(f"✗ Gateway service stop failed: {exc}")
+                    sys.exit(1)
+                if stop_result is False:
+                    print("✗ Gateway service stop failed; gateway process is still running.")
+                    sys.exit(1)
+                service_available = True
             elif is_windows():
                 from hermes_cli import gateway_windows
 
@@ -7617,10 +8086,14 @@ def _gateway_command_inner(args):
                     pass
             elif is_macos() and get_launchd_plist_path().exists():
                 try:
-                    launchd_stop()
-                    service_available = True
-                except subprocess.CalledProcessError:
-                    pass
+                    stop_result = launchd_stop()
+                except subprocess.CalledProcessError as exc:
+                    print(f"✗ Gateway service stop failed: {exc}")
+                    sys.exit(1)
+                if stop_result is False:
+                    print("✗ Gateway service stop failed; gateway process is still running.")
+                    sys.exit(1)
+                service_available = True
             elif is_windows():
                 from hermes_cli import gateway_windows
 
@@ -7674,10 +8147,14 @@ def _gateway_command_inner(args):
                     pass
             elif is_macos() and get_launchd_plist_path().exists():
                 try:
-                    launchd_stop()
-                    service_stopped = True
-                except subprocess.CalledProcessError:
-                    pass
+                    stop_result = launchd_stop()
+                except subprocess.CalledProcessError as exc:
+                    print(f"✗ Gateway service stop failed: {exc}")
+                    sys.exit(1)
+                if stop_result is False:
+                    print("✗ Gateway service stop failed; gateway process is still running.")
+                    sys.exit(1)
+                service_stopped = True
             elif is_windows():
                 from hermes_cli import gateway_windows
 
@@ -7731,6 +8208,9 @@ def _gateway_command_inner(args):
             try:
                 launchd_restart()
                 service_available = True
+            except LaunchdReloadError as exc:
+                print(f"✗ Gateway service restart failed: {exc}")
+                sys.exit(1)
             except subprocess.CalledProcessError:
                 pass
         elif is_windows():
