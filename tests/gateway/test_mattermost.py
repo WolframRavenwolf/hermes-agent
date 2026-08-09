@@ -87,16 +87,38 @@ class TestMattermostConfigLoading:
 # Adapter format / truncate
 # ---------------------------------------------------------------------------
 
-def _make_adapter():
+def _make_adapter(extra=None):
     """Create a MattermostAdapter with mocked config."""
     from plugins.platforms.mattermost.adapter import MattermostAdapter
+    adapter_extra = {"url": "https://mm.example.com"}
+    if extra:
+        adapter_extra.update(extra)
     config = PlatformConfig(
         enabled=True,
         token="test-token",
-        extra={"url": "https://mm.example.com"},
+        extra=adapter_extra,
     )
     adapter = MattermostAdapter(config)
     return adapter
+
+
+class TestMattermostFilePostMessage:
+    def test_preserves_explicit_caption(self):
+        from plugins.platforms.mattermost.adapter import _file_post_message
+
+        assert _file_post_message(" report attached ", ["report.pdf"]) == "report attached"
+
+    def test_uses_filename_for_file_only_post(self):
+        from plugins.platforms.mattermost.adapter import _file_post_message
+
+        assert _file_post_message("", ["voice.ogg"]) == "📎 voice.ogg"
+
+    def test_lists_multiple_filenames(self):
+        from plugins.platforms.mattermost.adapter import _file_post_message
+
+        assert _file_post_message(None, ["one.png", "two.pdf"]) == (
+            "📎 one.png\n📎 two.pdf"
+        )
 
 
 class TestMattermostFormatMessage:
@@ -242,6 +264,45 @@ class TestMattermostSend:
         assert flat_payload["channel_id"] == "channel_1"
         assert "Mattermost thread delivery failed" in flat_payload["message"]
         assert "Final answer body" in flat_payload["message"]
+
+    @pytest.mark.asyncio
+    async def test_thread_fallback_prefix_respects_configured_post_hard_cap(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("MATTERMOST_MAX_POST_LENGTH", raising=False)
+        adapter = _make_adapter({"max_post_length": 500, "reply_mode": "thread"})
+        adapter._api_get = AsyncMock(
+            return_value={"id": "bad_root", "root_id": ""}
+        )
+        adapter._last_post_status = 400
+        adapter._last_post_error = "invalid root_id"
+        payloads = []
+
+        async def _post(_path, payload):
+            payloads.append(dict(payload))
+            if "root_id" in payload:
+                return {}
+            return {"id": f"flat-{len(payloads)}"}
+
+        adapter._api_post = AsyncMock(side_effect=_post)
+        body = "x" * 500
+
+        result = await adapter.send(
+            "channel_1",
+            body,
+            reply_to="bad_root",
+            metadata={"notify": True},
+        )
+
+        flat_payloads = [payload for payload in payloads if "root_id" not in payload]
+        assert result.success is True
+        assert result.message_id == "flat-2"
+        assert result.continuation_message_ids == ()
+        assert result.raw_response == {"message_ids": ("flat-2",)}
+        assert len(payloads) == 2
+        assert len(flat_payloads) == 1
+        assert flat_payloads[0]["message"] == body
+        assert len(flat_payloads[0]["message"]) == 500
 
 
     @pytest.mark.asyncio

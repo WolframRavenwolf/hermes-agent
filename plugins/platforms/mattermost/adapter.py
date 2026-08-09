@@ -9,6 +9,7 @@ Environment variables:
     MATTERMOST_TOKEN            Bot token or personal-access token
     MATTERMOST_ALLOWED_USERS    Comma-separated user IDs
     MATTERMOST_HOME_CHANNEL     Channel ID for cron/notification delivery
+    MATTERMOST_MAX_POST_LENGTH  Optional outbound chunk limit (max 16383)
 """
 
 from __future__ import annotations
@@ -56,9 +57,91 @@ def _get_scoped_secret(name, default=None):
 
 logger = logging.getLogger(__name__)
 
-# Mattermost post size limit (server default is 16383, but 4000 is the
-# practical limit for readable messages — matching OpenClaw's choice).
-MAX_POST_LENGTH = 4000
+# Mattermost post size limits.  Mattermost's current hard product limit is
+# 16,383 characters per post (65,535 bytes / worst-case 4 bytes per rune).
+# Keep the legacy 4,000-character default for upstream compatibility, but let
+# users raise it when they prefer fewer larger Mattermost posts.
+MATTERMOST_SERVER_MAX_POST_LENGTH = 16383
+MIN_MAX_POST_LENGTH = 500
+DEFAULT_MAX_POST_LENGTH = 4000
+MAX_POST_LENGTH = DEFAULT_MAX_POST_LENGTH
+
+
+def _coerce_max_post_length(value: Any, default: int = DEFAULT_MAX_POST_LENGTH) -> int:
+    """Return a safe Mattermost post length from config/env input."""
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        limit = default
+    if limit < MIN_MAX_POST_LENGTH:
+        limit = default
+    return min(limit, MATTERMOST_SERVER_MAX_POST_LENGTH)
+
+
+def _resolve_max_post_length(extra: Optional[Dict[str, Any]] = None) -> int:
+    """Resolve the effective Mattermost post length.
+
+    Environment wins over config.yaml/PlatformConfig extras so emergency runtime
+    overrides can take effect without editing config files.
+    """
+    raw = os.getenv("MATTERMOST_MAX_POST_LENGTH")
+    if raw is None and isinstance(extra, dict):
+        raw = extra.get("max_post_length")
+    return _coerce_max_post_length(raw)
+
+
+def _file_post_message(caption: Optional[str], filenames: List[str]) -> str:
+    """Return a Mattermost post body for file attachments.
+
+    Mattermost accepts posts whose only visible content is ``file_ids`` with an
+    empty ``message``, but some clients/threads can make those file-only replies
+    easy to miss.  Use the explicit caption when present; otherwise include a
+    tiny filename line so attachment posts remain visible and discoverable.
+    """
+    body = (caption or "").strip()
+    if body:
+        return body
+    clean = [str(name).strip() for name in filenames if str(name).strip()]
+    if not clean:
+        return "📎 Attachment"
+    if len(clean) == 1:
+        return f"📎 {clean[0]}"
+    return "\n".join(f"📎 {name}" for name in clean)
+
+
+def _cap_safe_payloads(
+    payload: Dict[str, Any],
+    max_length: int,
+    splitter=None,
+) -> List[Dict[str, Any]]:
+    """Split a Mattermost payload without losing text or repeating files."""
+    limit = max(1, int(max_length))
+    message = str(payload.get("message") or "")
+    chunks = splitter(message, limit) if splitter and message else [message]
+    if not chunks:
+        chunks = [""]
+
+    # A platform-aware splitter may deliberately preserve an indivisible atom.
+    # Mattermost's cap is a hard wire boundary, so hard-split that rare result.
+    bounded_chunks: List[str] = []
+    for chunk in chunks:
+        chunk = str(chunk)
+        bounded_chunks.extend(
+            chunk[index:index + limit]
+            for index in range(0, len(chunk), limit)
+        )
+    if not bounded_chunks:
+        bounded_chunks = [""]
+
+    payloads: List[Dict[str, Any]] = []
+    for index, chunk in enumerate(bounded_chunks):
+        chunk_payload = dict(payload)
+        chunk_payload["message"] = chunk
+        if index:
+            chunk_payload.pop("file_ids", None)
+        payloads.append(chunk_payload)
+    return payloads
+
 
 # Channel type codes returned by the Mattermost API.
 _CHANNEL_TYPE_MAP = {
@@ -133,6 +216,12 @@ class MattermostAdapter(BasePlatformAdapter):
         self._ws_task: Optional[asyncio.Task] = None
         self._reconnect_task: Optional[asyncio.Task] = None
         self._closing = False
+
+        # Effective outbound post length.  Expose the same value through
+        # MAX_MESSAGE_LENGTH because streaming/progress code probes adapters
+        # with getattr(adapter, "MAX_MESSAGE_LENGTH", ...).
+        self.max_post_length: int = _resolve_max_post_length(config.extra)
+        self.MAX_MESSAGE_LENGTH: int = self.max_post_length
 
         # Reply mode: "thread" to nest replies, "off" for flat messages.
         self._reply_mode: str = (
@@ -246,15 +335,60 @@ class MattermostAdapter(BasePlatformAdapter):
         flat_payload = dict(payload)
         flat_payload.pop("root_id", None)
         original = str(flat_payload.get("message") or "")
-        flat_payload["message"] = (
+        warning_prefix = (
             "⚠️ Mattermost thread delivery failed; posting final reply in channel.\n\n"
-            + original
-        ).strip()
+        )
+        fallback_message = warning_prefix + original
+        # The caller has already split this payload to the configured hard cap.
+        # Do not fan it out again merely to add advisory text: that obscures the
+        # one-logical-payload/one-result-ID contract.  Keep the original bytes
+        # intact and omit the prefix when both cannot fit in one flat post.
+        flat_payload["message"] = (
+            fallback_message
+            if len(fallback_message) <= self.max_post_length
+            else original
+        )
         logger.warning(
             "Mattermost: falling back to flat channel delivery for notify-worthy post in %s",
             chat_id,
         )
         return await self._api_post("posts", flat_payload)
+
+    async def _post_chunked_payload(
+        self,
+        chat_id: str,
+        payload: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]],
+        *,
+        error: str,
+    ) -> SendResult:
+        """Post one logical payload as cap-safe posts with complete ID tracking."""
+        payloads = _cap_safe_payloads(
+            payload,
+            self.max_post_length,
+            self.truncate_message,
+        )
+        message_ids: List[str] = []
+        for chunk_payload in payloads:
+            data = await self._post_preserving_thread(
+                chat_id, chunk_payload, metadata,
+            )
+            if not data or "id" not in data:
+                return SendResult(
+                    success=False,
+                    message_id=message_ids[-1] if message_ids else None,
+                    error=error,
+                    continuation_message_ids=tuple(message_ids),
+                    raw_response={"message_ids": tuple(message_ids)},
+                )
+            message_ids.append(str(data["id"]))
+
+        return SendResult(
+            success=True,
+            message_id=message_ids[-1],
+            continuation_message_ids=tuple(message_ids[:-1]),
+            raw_response={"message_ids": tuple(message_ids)},
+        )
 
     async def _api_put(
         self, path: str, payload: Dict[str, Any]
@@ -393,25 +527,20 @@ class MattermostAdapter(BasePlatformAdapter):
             return SendResult(success=True)
 
         formatted = self.format_message(content)
-        chunks = self.truncate_message(formatted, MAX_POST_LENGTH)
-
-        last_id = None
-        for chunk in chunks:
-            payload: Dict[str, Any] = _with_mentions_disabled({
-                "channel_id": chat_id,
-                "message": chunk,
-            })
-            # Thread support: reply_to or metadata["thread_id"] is the root post ID.
-            resolved_root = await self._thread_root_for_send(reply_to, metadata)
-            if resolved_root:
-                payload["root_id"] = resolved_root
-
-            data = await self._post_preserving_thread(chat_id, payload, metadata)
-            if not data or "id" not in data:
-                return SendResult(success=False, error="Failed to create post")
-            last_id = data["id"]
-
-        return SendResult(success=True, message_id=last_id)
+        payload: Dict[str, Any] = _with_mentions_disabled({
+            "channel_id": chat_id,
+            "message": formatted,
+        })
+        # Thread support: reply_to or metadata["thread_id"] is the root post ID.
+        resolved_root = await self._thread_root_for_send(reply_to, metadata)
+        if resolved_root:
+            payload["root_id"] = resolved_root
+        return await self._post_chunked_payload(
+            chat_id,
+            payload,
+            metadata,
+            error="Failed to create post",
+        )
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return channel name and type."""
@@ -437,17 +566,69 @@ class MattermostAdapter(BasePlatformAdapter):
         )
 
     async def edit_message(
-        self, chat_id: str, message_id: str, content: str, *, finalize: bool = False
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Edit an existing post."""
+        """Edit one post, surfacing any cap-safe continuation posts."""
         formatted = self.format_message(content)
+        payloads = _cap_safe_payloads(
+            _with_mentions_disabled({"message": formatted}),
+            self.max_post_length,
+            self.truncate_message,
+        )
         data = await self._api_put(
             f"posts/{message_id}/patch",
-            _with_mentions_disabled({"message": formatted}),
+            payloads[0],
         )
         if not data or "id" not in data:
             return SendResult(success=False, error="Failed to edit post")
-        return SendResult(success=True, message_id=data["id"])
+
+        continuation_ids: List[str] = []
+        delivered_chunks = [payloads[0]["message"]]
+        resolved_root = None
+        if len(payloads) > 1:
+            resolved_root = await self._thread_root_for_send(message_id, metadata)
+        for chunk_payload in payloads[1:]:
+            post_payload = dict(chunk_payload)
+            post_payload["channel_id"] = chat_id
+            if resolved_root:
+                post_payload["root_id"] = resolved_root
+            posted = await self._post_preserving_thread(
+                chat_id, post_payload, metadata,
+            )
+            if not posted or "id" not in posted:
+                last_id = continuation_ids[-1] if continuation_ids else str(data["id"])
+                delivered_prefix = "".join(
+                    re.sub(r" \(\d+/\d+\)$", "", chunk)
+                    for chunk in delivered_chunks
+                )
+                return SendResult(
+                    success=False,
+                    message_id=last_id,
+                    error="Failed to create edit continuation",
+                    continuation_message_ids=tuple(continuation_ids),
+                    raw_response={
+                        "partial_overflow": True,
+                        "delivered_chunks": len(delivered_chunks),
+                        "total_chunks": len(payloads),
+                        "last_message_id": last_id,
+                        "delivered_prefix": delivered_prefix,
+                        "continuation_message_ids": tuple(continuation_ids),
+                    },
+                )
+            continuation_ids.append(str(posted["id"]))
+            delivered_chunks.append(post_payload["message"])
+
+        return SendResult(
+            success=True,
+            message_id=(continuation_ids[-1] if continuation_ids else str(data["id"])),
+            continuation_message_ids=tuple(continuation_ids),
+        )
 
     async def send_image(
         self,
@@ -1062,95 +1243,156 @@ async def _standalone_send(
     upload_headers = {"Authorization": f"Bearer {token}"}
 
     media_files = media_files or []
+    message_ids: List[str] = []
+
+    def _failure(error: str) -> Dict[str, Any]:
+        """Return a complete standalone result, including any delivered prefix."""
+        delivered_ids = list(message_ids)
+        return {
+            "success": False,
+            "partial_failure": bool(delivered_ids),
+            "platform": "mattermost",
+            "chat_id": chat_id,
+            "message_id": delivered_ids[-1] if delivered_ids else None,
+            "message_ids": delivered_ids,
+            "error": error,
+        }
 
     try:
         # Resolve proxy + session kwargs once so a single ClientSession can
-        # cover the optional file uploads + final post.
+        # cover the optional file uploads + posts.
         from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
         _proxy = resolve_proxy_url(platform_env_var="MATTERMOST_PROXY")
         _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
+
+        media_paths: List[str] = []
+        for media in media_files:
+            if isinstance(media, dict):
+                file_path = media.get("path")
+            elif isinstance(media, (tuple, list)):
+                # BasePlatformAdapter.extract_media() emits
+                # ``(path, is_voice)`` tuples. Mattermost stores all media
+                # as ordinary file attachments, so only the path matters.
+                file_path = media[0] if media else None
+            else:
+                file_path = media
+            if file_path and os.path.exists(file_path):
+                media_paths.append(str(file_path))
+
+        # Mattermost accepts at most five file_ids per post. Upload and post one
+        # batch before starting the next so a later failure cannot orphan files
+        # from batches that were never attempted. A failed post can still leave
+        # its own uploads unattached; Mattermost offers no atomic upload+post API.
+        media_batches = [
+            media_paths[index:index + 5]
+            for index in range(0, len(media_paths), 5)
+        ] or [[]]
+        max_post_length = _resolve_max_post_length(
+            getattr(pconfig, "extra", {}) or {}
+        )
 
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=60),
             **_sess_kw,
         ) as session:
-            # 1. Upload media (if any) and collect file_ids.
-            file_ids: List[str] = []
-            for media in media_files:
-                if isinstance(media, dict):
-                    file_path = media.get("path")
-                elif isinstance(media, (tuple, list)):
-                    # BasePlatformAdapter.extract_media() emits
-                    # ``(path, is_voice)`` tuples. Mattermost stores all media
-                    # as ordinary file attachments, so only the path matters.
-                    file_path = media[0] if media else None
-                else:
-                    file_path = media
-                if not file_path or not os.path.exists(file_path):
-                    continue
-                form = aiohttp.FormData()
-                # Mattermost requires channel_id on file uploads so the
-                # server can attribute them.
-                form.add_field("channel_id", chat_id)
-                with open(file_path, "rb") as fh:
-                    form.add_field(
-                        "files",
-                        fh.read(),
-                        filename=os.path.basename(file_path),
-                    )
-                async with session.post(
-                    f"{base_url}/api/v4/files",
-                    data=form,
-                    headers=upload_headers,
-                    **_req_kw,
-                ) as upload_resp:
-                    if upload_resp.status not in {200, 201}:
-                        body = await upload_resp.text()
-                        return {
-                            "error": (
-                                f"Mattermost file upload failed "
+            for batch_index, media_batch in enumerate(media_batches):
+                file_ids: List[str] = []
+                uploaded_names: List[str] = []
+                for file_path in media_batch:
+                    filename = os.path.basename(file_path)
+                    form = aiohttp.FormData()
+                    # Mattermost requires channel_id on file uploads so the
+                    # server can attribute them.
+                    form.add_field("channel_id", chat_id)
+                    with open(file_path, "rb") as fh:
+                        form.add_field(
+                            "files",
+                            fh.read(),
+                            filename=filename,
+                        )
+                    async with session.post(
+                        f"{base_url}/api/v4/files",
+                        data=form,
+                        headers=upload_headers,
+                        **_req_kw,
+                    ) as upload_resp:
+                        if upload_resp.status not in {200, 201}:
+                            body = await upload_resp.text()
+                            return _failure(
+                                "Mattermost file upload failed "
                                 f"({upload_resp.status}): {body[:400]}"
                             )
-                        }
-                    upload_data = await upload_resp.json()
-                    for info in upload_data.get("file_infos", []):
-                        if info.get("id"):
-                            file_ids.append(info["id"])
-
-            # 2. Post the message (with thread root + attached file_ids).
-            payload: Dict[str, Any] = {
-                "channel_id": chat_id,
-                "message": message,
-            }
-            if thread_id:
-                payload["root_id"] = thread_id
-            if file_ids:
-                payload["file_ids"] = file_ids
-            async with session.post(
-                f"{base_url}/api/v4/posts",
-                headers=headers,
-                json=payload,
-                **_req_kw,
-            ) as resp:
-                if resp.status not in {200, 201}:
-                    body = await resp.text()
-                    return {
-                        "error": (
-                            f"Mattermost API error ({resp.status}): "
-                            f"{body[:400]}"
+                        upload_data = await upload_resp.json()
+                    uploaded_id = next(
+                        (
+                            str(info["id"])
+                            for info in upload_data.get("file_infos", [])
+                            if info.get("id")
+                        ),
+                        None,
+                    )
+                    if not uploaded_id:
+                        return _failure(
+                            "Mattermost file upload succeeded but returned no file id"
                         )
-                    }
-                data = await resp.json()
+                    file_ids.append(uploaded_id)
+                    uploaded_names.append(filename)
+
+                # Preserve caller text byte-for-byte on the first media batch
+                # only. Later attachment posts use filename labels so the
+                # caption is neither repeated nor silently discarded.
+                if batch_index == 0:
+                    post_message = (
+                        message
+                        if message
+                        else _file_post_message(None, uploaded_names)
+                    )
+                else:
+                    post_message = _file_post_message(None, uploaded_names)
+                payload: Dict[str, Any] = {
+                    "channel_id": chat_id,
+                    "message": post_message,
+                }
+                if thread_id:
+                    payload["root_id"] = thread_id
+                if file_ids:
+                    payload["file_ids"] = file_ids
+
+                for wire_payload in _cap_safe_payloads(
+                    payload,
+                    max_post_length,
+                ):
+                    async with session.post(
+                        f"{base_url}/api/v4/posts",
+                        headers=headers,
+                        json=wire_payload,
+                        **_req_kw,
+                    ) as resp:
+                        if resp.status not in {200, 201}:
+                            body = await resp.text()
+                            return _failure(
+                                f"Mattermost API error ({resp.status}): "
+                                f"{body[:400]}"
+                            )
+                        data = await resp.json()
+                    post_id = data.get("id")
+                    if not post_id:
+                        return _failure(
+                            "Mattermost API success response missing post id"
+                        )
+                    message_ids.append(str(post_id))
+
             return {
                 "success": True,
                 "platform": "mattermost",
                 "chat_id": chat_id,
-                "message_id": data.get("id"),
+                "message_id": message_ids[-1] if message_ids else None,
+                "message_ids": message_ids,
             }
     except aiohttp.ClientError as exc:
-        return {"error": f"Mattermost send failed (network): {exc}"}
+        return _failure(f"Mattermost send failed (network): {exc}")
     except Exception as exc:  # noqa: BLE001
-        return {"error": f"Mattermost send failed: {exc}"}
+        return _failure(f"Mattermost send failed: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -1325,10 +1567,10 @@ def register(ctx) -> None:
         # adapter" when cron runs separately from the gateway.  Mirrors
         # the Discord / Teams pattern.
         standalone_sender_fn=_standalone_send,
-        # Mattermost practical post-length limit (server default is 16383
-        # but 4000 is the readable threshold the adapter has used since
-        # day one).
-        max_message_length=MAX_POST_LENGTH,
+        # Mattermost default post-length limit. Runtime adapter instances and
+        # direct sends can override this via ``mattermost.max_post_length`` or
+        # ``MATTERMOST_MAX_POST_LENGTH`` up to Mattermost's 16,383-char cap.
+        max_message_length=_resolve_max_post_length(),
         # Display
         emoji="💬",
         allow_update_command=True,

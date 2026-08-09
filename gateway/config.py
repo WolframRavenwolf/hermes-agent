@@ -715,6 +715,12 @@ class PlatformConfig:
 DEFAULT_STREAMING_EDIT_INTERVAL: float = 0.8
 DEFAULT_STREAMING_BUFFER_THRESHOLD: int = 24
 DEFAULT_STREAMING_CURSOR: str = " ▉"
+# Cursor decoration must stay a small fraction of an on-wire post.  The stream
+# consumer applies both bounds in the platform's own length unit before it
+# reserves content space, so a custom cursor can never consume the full cap.
+MAX_STREAMING_CURSOR_LENGTH: int = 32
+STREAMING_CURSOR_LIMIT_DIVISOR: int = 10
+STREAMING_FORMATTING_HEADROOM: int = 8
 
 
 @dataclass

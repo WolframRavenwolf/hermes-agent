@@ -31,6 +31,9 @@ from gateway.config import (
     DEFAULT_STREAMING_EDIT_INTERVAL as _DEFAULT_STREAMING_EDIT_INTERVAL,
     DEFAULT_STREAMING_BUFFER_THRESHOLD as _DEFAULT_STREAMING_BUFFER_THRESHOLD,
     DEFAULT_STREAMING_CURSOR as _DEFAULT_STREAMING_CURSOR,
+    MAX_STREAMING_CURSOR_LENGTH as _MAX_STREAMING_CURSOR_LENGTH,
+    STREAMING_CURSOR_LIMIT_DIVISOR as _STREAMING_CURSOR_LIMIT_DIVISOR,
+    STREAMING_FORMATTING_HEADROOM as _STREAMING_FORMATTING_HEADROOM,
 )
 from gateway.response_filters import (
     is_intentional_silence_response as _is_intentional_silence_response,
@@ -203,6 +206,9 @@ class GatewayStreamConsumer:
         self.adapter = adapter
         self.chat_id = chat_id
         self.cfg = config or StreamConsumerConfig()
+        # ``run`` tightens this to the active platform cap/length unit.  Keep a
+        # normalized value here for direct helper calls made before ``run``.
+        self._wire_cursor = str(self.cfg.cursor or "")
         self.metadata = metadata
         # Fired whenever a fresh content bubble is created on the platform
         # (first-send of a new message, commentary, overflow chunk, or
@@ -754,7 +760,33 @@ class GatewayStreamConsumer:
         # legacy per-message limit so a reply that fits one rich send/draft
         # isn't fragmented at 4096 while streaming.  See _raw_message_limit.
         _raw_limit = self._raw_message_limit()
-        _safe_limit = max(500, _raw_limit - _len_fn(self.cfg.cursor) - 100)
+        # A custom cursor is decoration, not content. Bound it both
+        # proportionally (10% of this platform's cap) and absolutely, then cap
+        # the working buffer after reserving that effective cursor. This keeps
+        # one update mapped to one editable message even when a configured
+        # cursor is itself at/above Mattermost's post cap.
+        _raw_limit = max(1, int(_raw_limit))
+        _cursor_budget = min(
+            _MAX_STREAMING_CURSOR_LENGTH,
+            _raw_limit // _STREAMING_CURSOR_LIMIT_DIVISOR,
+        )
+        _cursor_cp = _custom_unit_to_cp(
+            self._wire_cursor, _cursor_budget, _len_fn,
+        )
+        self._wire_cursor = self._wire_cursor[:_cursor_cp]
+        _cursor_len = _len_fn(self._wire_cursor)
+        _content_budget = max(
+            1,
+            _raw_limit - _cursor_len - _STREAMING_FORMATTING_HEADROOM,
+        )
+        _safe_limit = min(
+            _content_budget,
+            max(
+                1,
+                500 - _cursor_len,
+                _raw_limit - _cursor_len - 100,
+            ),
+        )
 
         # Resolve native draft streaming once per run.  When enabled the
         # consumer routes mid-stream frames through adapter.send_draft and
@@ -959,6 +991,11 @@ class GatewayStreamConsumer:
                         # full timeout waiting on already-delivered content.
                         if got_flush:
                             self._signal_flush(flush_event)
+                        # A failed sealed-head send leaves the full buffer for a
+                        # later/final fallback. Yield before retrying so this
+                        # early-continue path cannot starve finish()/flush queue
+                        # producers when a small platform cap keeps overflowing.
+                        await asyncio.sleep(0.05)
                         continue
                     # Existing message: edit it with the first chunk, then
                     # start a new message for the overflow remainder.
@@ -1003,7 +1040,7 @@ class GatewayStreamConsumer:
 
                     display_text = self._accumulated
                     if not got_done and not got_segment_break and commentary_text is None:
-                        display_text += self.cfg.cursor
+                        display_text += self._wire_cursor
 
                     # Segment break: finalize the current message so platforms
                     # that need explicit closure (e.g. DingTalk AI Cards) don't
@@ -1245,8 +1282,8 @@ class GatewayStreamConsumer:
     def _visible_prefix(self) -> str:
         """Return the visible text already shown in the streamed message."""
         prefix = self._last_sent_text or ""
-        if self.cfg.cursor and prefix.endswith(self.cfg.cursor):
-            prefix = prefix[:-len(self.cfg.cursor)]
+        if self._wire_cursor and prefix.endswith(self._wire_cursor):
+            prefix = prefix[:-len(self._wire_cursor)]
         return self._clean_for_display(prefix)
 
     def _continuation_text(self, final_text: str) -> str:
@@ -1383,10 +1420,10 @@ class GatewayStreamConsumer:
                 if (
                     self._message_id
                     and self._last_sent_text
-                    and self.cfg.cursor
-                    and self._last_sent_text.endswith(self.cfg.cursor)
+                    and self._wire_cursor
+                    and self._last_sent_text.endswith(self._wire_cursor)
                 ):
-                    clean_text = self._last_sent_text[:-len(self.cfg.cursor)]
+                    clean_text = self._last_sent_text[:-len(self._wire_cursor)]
                     try:
                         result = await self._edit_message(
                             message_id=self._message_id,
@@ -2023,8 +2060,8 @@ class GatewayStreamConsumer:
         # A bare streaming cursor is not meaningful user-visible content and
         # can render as a stray tofu/white-box message on some clients.
         visible_without_cursor = text
-        if self.cfg.cursor:
-            visible_without_cursor = visible_without_cursor.replace(self.cfg.cursor, "")
+        if self._wire_cursor:
+            visible_without_cursor = visible_without_cursor.replace(self._wire_cursor, "")
         _visible_stripped = visible_without_cursor.strip()
         if not _visible_stripped:
             return True  # cursor-only / whitespace-only update
@@ -2041,8 +2078,8 @@ class GatewayStreamConsumer:
         # Existing messages (edits) are unaffected — only first sends gated.
         _MIN_NEW_MSG_CHARS = 4
         if (self._message_id is None
-                and self.cfg.cursor
-                and self.cfg.cursor in text
+                and self._wire_cursor
+                and self._wire_cursor in text
                 and len(_visible_stripped) < _MIN_NEW_MSG_CHARS):
             return True  # too short for a standalone message — accumulate more
 
@@ -2188,8 +2225,8 @@ class GatewayStreamConsumer:
                         if (
                             finalize
                             and is_turn_final
-                            and self.cfg.cursor
-                            and self._last_sent_text.endswith(self.cfg.cursor)
+                            and self._wire_cursor
+                            and self._last_sent_text.endswith(self._wire_cursor)
                             and self._visible_prefix() == text
                         ):
                             # The final clean-up edit failed, but the complete
