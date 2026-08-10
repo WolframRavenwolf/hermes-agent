@@ -30,6 +30,7 @@ def _make_agent(chain):
     agent._cached_system_prompt = "cached"
     agent._primary_runtime = {}
     agent._fallback_activated = False
+    setattr(agent, "_active_fallback_service_tier_override", None)
     agent._fallback_index = 0
     agent._fallback_chain = list(chain)
     agent._fallback_model = chain[0] if chain else None
@@ -76,6 +77,19 @@ def test_switch_with_empty_chain_stays_empty():
 
     assert agent._fallback_chain == []
     assert agent._fallback_model is None
+
+
+def test_switch_clears_active_fallback_service_tier_policy():
+    agent = _make_agent(
+        [{"provider": "nous", "model": "hermes-4", "service_tier_override": "normal"}]
+    )
+    setattr(agent, "_fallback_activated", True)
+    setattr(agent, "_active_fallback_service_tier_override", "normal")
+
+    _switch_to_anthropic(agent)
+
+    assert getattr(agent, "_active_fallback_service_tier_override", None) is None
+    assert getattr(agent, "_primary_runtime")["fallback_service_tier_override"] is None
 
 
 

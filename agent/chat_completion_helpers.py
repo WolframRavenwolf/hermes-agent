@@ -31,6 +31,10 @@ from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import FailoverReason
 from agent.errors import EmptyStreamError
+from agent.fallback_policy import (
+    activate_fallback_service_tier_override,
+    apply_fallback_service_tier_override,
+)
 from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint
@@ -1125,6 +1129,11 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
     if tools_for_api is None:
         tools_for_api = agent.tools
 
+    request_overrides = apply_fallback_service_tier_override(
+        getattr(agent, "request_overrides", None),
+        getattr(agent, "_active_fallback_service_tier_override", None),
+    )
+
     if agent.api_mode == "anthropic_messages":
         _transport = agent._get_transport()
         anthropic_messages = agent._prepare_anthropic_messages_for_api(api_messages)
@@ -1143,7 +1152,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             preserve_dots=agent._anthropic_preserve_dots(),
             context_length=ctx_len,
             base_url=getattr(agent, "_anthropic_base_url", None),
-            fast_mode=(agent.request_overrides or {}).get("speed") == "fast",
+            fast_mode=request_overrides.get("speed") == "fast",
             drop_context_1m_beta=bool(getattr(agent, "_oauth_1m_beta_disabled", False)),
         )
         # Nous Portal reads ``tags`` and ``session_id`` as top-level body fields
@@ -1225,7 +1234,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             base_url=agent.base_url,
             max_tokens=agent.max_tokens,
             timeout=agent._resolved_api_call_timeout(),
-            request_overrides=agent.request_overrides,
+            request_overrides=request_overrides,
             is_github_responses=is_github_responses,
             is_codex_backend=is_codex_backend,
             is_xai_responses=is_xai_responses,
@@ -1327,7 +1336,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             ephemeral_max_output_tokens=_ephemeral_out,
             max_tokens_param_fn=agent._max_tokens_param,
             reasoning_config=agent.reasoning_config,
-            request_overrides=agent.request_overrides,
+            request_overrides=request_overrides,
             session_id=getattr(agent, "session_id", None),
             provider_profile=_profile,
             ollama_num_ctx=agent._ollama_num_ctx,
@@ -1359,7 +1368,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         ephemeral_max_output_tokens=_ephemeral_out,
         max_tokens_param_fn=agent._max_tokens_param,
         reasoning_config=agent.reasoning_config,
-        request_overrides=agent.request_overrides,
+        request_overrides=request_overrides,
         session_id=getattr(agent, "session_id", None),
         model_lower=(agent.model or "").lower(),
         is_openrouter=_is_or,
@@ -2059,6 +2068,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # short-circuit the freshly activated fallback before it gets a
         # single stream attempt.
         _reset_stale_streak(agent)
+        activate_fallback_service_tier_override(agent, fb, log=logger)
         return True
     except Exception as e:
         if fb_provider == "nous":

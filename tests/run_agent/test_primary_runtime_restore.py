@@ -123,7 +123,11 @@ class TestRestorePrimaryRuntime:
 
     def test_restores_model_and_provider(self):
         agent = _make_agent(
-            fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
+            fallback_model={
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4",
+                "service_tier_override": "normal",
+            },
         )
         original_model = agent.model
         original_provider = agent.provider
@@ -134,6 +138,7 @@ class TestRestorePrimaryRuntime:
             agent._try_activate_fallback()
 
         assert agent._fallback_activated is True
+        assert agent._active_fallback_service_tier_override == "normal"
         assert agent.model == "anthropic/claude-sonnet-4"
         assert agent.provider == "openrouter"
 
@@ -143,6 +148,7 @@ class TestRestorePrimaryRuntime:
 
         assert result is True
         assert agent._fallback_activated is False
+        assert agent._active_fallback_service_tier_override is None
         assert agent.model == original_model
         assert agent.provider == original_provider
 

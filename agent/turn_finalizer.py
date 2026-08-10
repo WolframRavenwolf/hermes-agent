@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.fallback_policy import apply_fallback_service_tier_override
 from agent.message_content import flatten_message_text
 
 
@@ -628,6 +629,11 @@ def finalize_turn(
             last_reasoning = msg["reasoning"]
             break
 
+    _effective_request_overrides = apply_fallback_service_tier_override(
+        getattr(agent, "request_overrides", {}) or {},
+        getattr(agent, "_active_fallback_service_tier_override", None),
+    )
+
     # Build result with interrupt info if applicable
     result = {
         "final_response": final_response,
@@ -659,7 +665,7 @@ def finalize_turn(
         # Requested service tier (from request_overrides.extra_body), for
         # billing audits by callers like `hermes -z --usage-file`.
         "service_tier": (
-            (getattr(agent, "request_overrides", {}) or {}).get("extra_body") or {}
+            _effective_request_overrides.get("extra_body") or {}
         ).get("service_tier"),
         "session_id": agent.session_id,
     }

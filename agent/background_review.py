@@ -24,6 +24,7 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
+from agent.fallback_policy import apply_fallback_service_tier_override
 from agent.thread_scoped_output import thread_scoped_silence
 
 logger = logging.getLogger(__name__)
@@ -64,7 +65,10 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
         "base_url": parent_runtime.get("base_url") or None,
         "api_mode": parent_api_mode,
         "credential_pool": getattr(agent, "_credential_pool", None),
-        "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
+        "request_overrides": apply_fallback_service_tier_override(
+            getattr(agent, "request_overrides", {}) or {},
+            getattr(agent, "_active_fallback_service_tier_override", None),
+        ),
         "max_tokens": getattr(agent, "max_tokens", None),
         "command": getattr(agent, "acp_command", None),
         "args": list(getattr(agent, "acp_args", []) or []),

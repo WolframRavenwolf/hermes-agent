@@ -45,6 +45,7 @@ class TestFallbackChainInit:
         assert agent._fallback_chain == []
         assert agent._fallback_index == 0
         assert agent._fallback_model is None
+        assert getattr(agent, "_active_fallback_service_tier_override", None) is None
 
 
 
@@ -86,12 +87,55 @@ class TestFallbackChainAdvancement:
             assert agent.model == "gpt-4o"
             assert agent._fallback_activated is True
 
+    def test_successful_entry_activates_normal_service_tier_override(self):
+        fbs = [
+            {
+                "provider": "openai",
+                "model": "gpt-4o",
+                "service_tier_override": "normal",
+            },
+        ]
+        agent = _make_agent(fallback_model=fbs)
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(_mock_client(), "gpt-4o"),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert agent._active_fallback_service_tier_override == "normal"
+
+    def test_later_entry_without_override_clears_previous_entry_policy(self):
+        fbs = [
+            {
+                "provider": "openai",
+                "model": "gpt-4o",
+                "service_tier_override": "normal",
+            },
+            {"provider": "zai", "model": "glm-4.7"},
+        ]
+        agent = _make_agent(fallback_model=fbs)
+
+        with patch("agent.auxiliary_client.resolve_provider_client") as mock_rpc:
+            mock_rpc.side_effect = [
+                (_mock_client(), "gpt-4o"),
+                (_mock_client(), "glm-4.7"),
+            ]
+            assert agent._try_activate_fallback() is True
+            assert agent._active_fallback_service_tier_override == "normal"
+            assert agent._try_activate_fallback() is True
+
+        assert getattr(agent, "_active_fallback_service_tier_override", None) is None
 
 
     def test_skips_unconfigured_provider_to_next(self):
         """If resolve_provider_client returns None, skip to next in chain."""
         fbs = [
-            {"provider": "broken", "model": "nope"},
+            {
+                "provider": "broken",
+                "model": "nope",
+                "service_tier_override": "normal",
+            },
             {"provider": "openai", "model": "gpt-4o"},
         ]
         agent = _make_agent(fallback_model=fbs)
@@ -103,6 +147,7 @@ class TestFallbackChainAdvancement:
             assert agent._try_activate_fallback() is True
             assert agent.model == "gpt-4o"
             assert agent._fallback_index == 2
+        assert getattr(agent, "_active_fallback_service_tier_override", None) is None
 
     def test_skips_provider_that_raises_to_next(self):
         """If resolve_provider_client raises, skip to next in chain."""

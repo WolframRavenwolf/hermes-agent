@@ -41,6 +41,8 @@ class _StubAgent:
         self._interrupt_message = None
         self._tool_guardrail_halt_decision = None
         self._response_was_previewed = False
+        self.request_overrides: dict = {}
+        self._active_fallback_service_tier_override: str | None = None
         self._skill_nudge_interval = 0
         self._iters_since_skill = 0
         for attr in (
@@ -162,5 +164,18 @@ def test_clean_turn_has_no_cleanup_errors_key():
     assert result["final_response"] == "PARTIAL SUMMARY FROM MODEL"
     assert result["completed"] is False
     assert "cleanup_errors" not in result
+
+
+def test_result_reports_effective_fallback_service_tier_for_billing_audit():
+    agent = _StubAgent(raise_in=())
+    agent.request_overrides = {
+        "extra_body": {"service_tier": "flex", "store": False}
+    }
+    agent._active_fallback_service_tier_override = "normal"
+
+    result = _run(agent)
+
+    assert result["service_tier"] is None
+    assert agent.request_overrides["extra_body"]["service_tier"] == "flex"
 
 

@@ -31,6 +31,7 @@ class _FakeAgent:
         self.model = model
         self._credential_pool: Any = None
         self.request_overrides = {}
+        self._active_fallback_service_tier_override: str | None = None
         self.max_tokens: int | None = None
 
     def _current_main_runtime(self):
@@ -86,6 +87,29 @@ def test_unrouted_runtime_keeps_parent_pool_and_overrides():
     assert rt["credential_pool"] == "parent-pool"
     assert rt["request_overrides"] == {"service_tier": "priority"}
     assert rt["max_tokens"] == 4096
+
+
+def test_unrouted_runtime_applies_active_fallback_tier_policy_without_mutation():
+    agent = _FakeAgent()
+    agent.request_overrides = {
+        "service_tier": "priority",
+        "extra_body": {"speed": "fast", "store": False},
+        "custom": {"trace": True},
+    }
+    agent._active_fallback_service_tier_override = "normal"
+
+    with (
+        patch("hermes_cli.config.load_config", return_value={}),
+        patch("hermes_cli.config.load_config_readonly", return_value={}),
+    ):
+        rt = br._resolve_review_runtime(agent)
+
+    assert rt["request_overrides"] == {
+        "extra_body": {"store": False},
+        "custom": {"trace": True},
+    }
+    assert agent.request_overrides["service_tier"] == "priority"
+    assert agent.request_overrides["extra_body"]["speed"] == "fast"
 
 
 def test_routing_same_model_as_parent_is_not_routed():

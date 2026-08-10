@@ -1701,6 +1701,9 @@ def restore_primary_runtime(agent) -> bool:
 
         # ── Reset fallback chain for the new turn ──
         agent._fallback_activated = False
+        agent._active_fallback_service_tier_override = rt.get(
+            "fallback_service_tier_override"
+        )
         agent._fallback_index = 0
 
         # Reset the stale-call circuit breaker (#58962): the streak measured
@@ -2722,6 +2725,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         "requested_provider": agent.requested_provider,
         "base_url": agent.base_url,
         "api_mode": agent.api_mode,
+        "fallback_service_tier_override": None,
         "api_key": getattr(agent, "api_key", ""),
         "client_kwargs": dict(agent._client_kwargs),
         "use_prompt_caching": agent._use_prompt_caching,
@@ -2744,6 +2748,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
 
     # ── Reset fallback state ──
     agent._fallback_activated = False
+    agent._active_fallback_service_tier_override = None
     agent._fallback_index = 0
 
     # When the user deliberately swaps primary providers (e.g. openrouter

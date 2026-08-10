@@ -27,6 +27,8 @@ def test_init_tries_fallback_when_primary_returns_none():
                      explicit_base_url=None, explicit_api_key=None):
         if provider == "tencent-token-plan":
             return fb, "kimi2.5"
+        if provider == "openai":
+            return _mock_client(api_key="next-key", base_url="https://next.example/v1"), "gpt-next"
         return None, None  # primary exhausted
 
     with patch("agent.auxiliary_client.resolve_provider_client", side_effect=fake_resolve), \
@@ -42,11 +44,36 @@ def test_init_tries_fallback_when_primary_returns_none():
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,
-            fallback_model=[{"provider": "tencent-token-plan", "model": "kimi2.5"}],
+            fallback_model=[  # type: ignore[arg-type]
+                {
+                    "provider": "tencent-token-plan",
+                    "model": "kimi2.5",
+                    "service_tier_override": "normal",
+                },
+                {"provider": "openai", "model": "gpt-next"},
+            ],
         )
         assert agent.provider == "tencent-token-plan"
         assert agent.model == "kimi2.5"
         assert agent._fallback_activated is True
+        assert getattr(agent, "_active_fallback_service_tier_override", None) == "normal"
+
+        # The init-time fallback becomes this process's restorable runtime.
+        # Restoring it on the next turn must preserve the entry's cost policy.
+        with patch("run_agent.OpenAI", return_value=MagicMock()):
+            assert agent._restore_primary_runtime() is True
+        assert getattr(agent, "_active_fallback_service_tier_override", None) == "normal"
+
+        # A later fallback entry without an override must clear the init entry's
+        # policy, and the next turn must restore the init-time route plus policy.
+        assert agent._try_activate_fallback() is True
+        assert getattr(agent, "model") == "gpt-next"
+        assert getattr(agent, "_active_fallback_service_tier_override", None) is None
+
+        with patch("run_agent.OpenAI", return_value=MagicMock()):
+            assert agent._restore_primary_runtime() is True
+        assert getattr(agent, "model") == "kimi2.5"
+        assert getattr(agent, "_active_fallback_service_tier_override", None) == "normal"
 
 
 def test_init_raises_when_no_fallback_configured():

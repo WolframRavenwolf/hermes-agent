@@ -31,6 +31,7 @@ from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse, urlunparse
 
 from agent.context_compressor import ContextCompressor
+from agent.fallback_policy import activate_fallback_service_tier_override
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import StreamingContextScrubber
 from agent.session_activity import ActivityProvenance
@@ -1264,6 +1265,11 @@ def init_agent(
                             agent.provider = _fb["provider"]
                             agent.model = _fb_model or _fb["model"]
                             agent._fallback_activated = True
+                            activate_fallback_service_tier_override(
+                                agent,
+                                _fb,
+                                log=logger,
+                            )
                             client_kwargs = {
                                 "api_key": _fb_client.api_key,
                                 "base_url": str(_fb_client.base_url),
@@ -1398,6 +1404,11 @@ def init_agent(
         agent._fallback_chain = []
     agent._fallback_index = 0
     agent._fallback_activated = getattr(agent, "_fallback_activated", False)
+    agent._active_fallback_service_tier_override = getattr(
+        agent,
+        "_active_fallback_service_tier_override",
+        None,
+    )
     # Legacy attribute kept for backward compat (tests, external callers)
     agent._fallback_model = agent._fallback_chain[0] if agent._fallback_chain else None
     if agent._fallback_chain and not agent.quiet_mode:
@@ -2767,6 +2778,11 @@ def init_agent(
         "requested_provider": agent.requested_provider,
         "base_url": agent.base_url,
         "api_mode": agent.api_mode,
+        "fallback_service_tier_override": getattr(
+            agent,
+            "_active_fallback_service_tier_override",
+            None,
+        ),
         "api_key": getattr(agent, "api_key", ""),
         "client_kwargs": dict(agent._client_kwargs),
         "use_prompt_caching": agent._use_prompt_caching,
