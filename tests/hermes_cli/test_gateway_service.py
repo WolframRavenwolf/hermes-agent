@@ -268,6 +268,15 @@ class TestLaunchdMacOSAppWrapper:
     @pytest.fixture(autouse=True)
     def _default_app_wrapper_config(self, monkeypatch):
         monkeypatch.setattr(gateway_cli, "read_raw_config", lambda: {})
+
+    def test_generate_launchd_plist_sets_open_file_soft_limit_only(self):
+        plist = plistlib.loads(
+            gateway_cli.generate_launchd_plist().encode("utf-8")
+        )
+
+        assert plist["SoftResourceLimits"] == {"NumberOfFiles": 4096}
+        assert "HardResourceLimits" not in plist
+
     def test_generate_launchd_plist_with_app_wrapper_uses_named_bundle_executable(self, tmp_path, monkeypatch):
         home = tmp_path / "home"
         repo = tmp_path / "repo"

@@ -4910,6 +4910,9 @@ def _append_launchd_path_entry(entries: list[str], path: str | Path | None) -> N
         entries.append(entry)
 
 
+MACOS_GATEWAY_OPEN_FILE_SOFT_LIMIT = 4096
+
+
 def generate_launchd_plist(app_wrapper: bool = False) -> str:
     detected_venv = _detect_venv_dir()
     launchd_project_root = _launchd_logical_hermes_path(PROJECT_ROOT) or PROJECT_ROOT
@@ -5038,6 +5041,12 @@ def generate_launchd_plist(app_wrapper: bool = False) -> str:
         "LimitLoadToSessionType": ["Aqua", "Background"],
         "RunAtLoad": True,
         "KeepAlive": True,
+        # The macOS user-domain default of 256 is too small for a long-lived
+        # multi-platform gateway coordinating SQLite, sockets, subprocesses,
+        # and concurrent subagents. Keep the inherited hard limit unchanged.
+        "SoftResourceLimits": {
+            "NumberOfFiles": MACOS_GATEWAY_OPEN_FILE_SOFT_LIMIT
+        },
         # v0.20 native launchd crash-loop and graceful-drain safeguards.
         "ThrottleInterval": 30,
         "ExitTimeOut": 25,
