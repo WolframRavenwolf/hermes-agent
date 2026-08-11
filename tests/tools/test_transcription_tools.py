@@ -206,6 +206,159 @@ class TestTranscribeGroq:
 # _transcribe_openai — additional tests
 # ============================================================================
 
+
+class TestTranscribeOpenAIContextual:
+    def test_gpt_transcribe_forwards_prompt_keywords_and_languages(
+        self, monkeypatch, sample_wav
+    ):
+        monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "test-key")
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_response.text = "Hallo Hermes"
+        mock_client.audio.transcriptions.create.return_value = mock_response
+        config = {
+            "openai": {
+                "prompt": "German Discord voice chat about AI.",
+                "languages": ["de", "en"],
+                "keywords": ["Hermes Agent", "Mac mini"],
+            }
+        }
+
+        with patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("tools.transcription_tools._load_stt_config", return_value=config), \
+             patch("openai.OpenAI", return_value=mock_client):
+            from tools.transcription_tools import _transcribe_openai
+
+            result = _transcribe_openai(sample_wav, "gpt-transcribe")
+
+        assert result["success"] is True
+        kwargs = mock_client.audio.transcriptions.create.call_args.kwargs
+        assert kwargs["model"] == "gpt-transcribe"
+        assert kwargs["prompt"] == "German Discord voice chat about AI."
+        assert kwargs["extra_body"] == {
+            "languages": ["de", "en"],
+            "keywords": ["Hermes Agent", "Mac mini"],
+        }
+        assert "language" not in kwargs
+
+    def test_gpt_transcribe_decodes_cli_json_list_strings(
+        self, monkeypatch, sample_wav
+    ):
+        monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "test-key")
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_response.text = "Hallo Hermes"
+        mock_client.audio.transcriptions.create.return_value = mock_response
+        config = {
+            "openai": {
+                "languages": '["de","en"]',
+                "keywords": '["Hermes Agent","Mac mini"]',
+            }
+        }
+
+        with patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("tools.transcription_tools._load_stt_config", return_value=config), \
+             patch("openai.OpenAI", return_value=mock_client):
+            from tools.transcription_tools import _transcribe_openai
+
+            result = _transcribe_openai(sample_wav, "gpt-transcribe")
+
+        assert result["success"] is True
+        kwargs = mock_client.audio.transcriptions.create.call_args.kwargs
+        assert kwargs["extra_body"] == {
+            "languages": ["de", "en"],
+            "keywords": ["Hermes Agent", "Mac mini"],
+        }
+
+    def test_malformed_context_is_rejected_before_provider_call(
+        self,
+        sample_wav,
+        monkeypatch,
+    ):
+        mock_client = MagicMock()
+        config = {
+            "openai": {
+                "keywords": ["bad\nkeyword"],
+                "languages": ["de"],
+            }
+        }
+
+        with patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch(
+                 "tools.transcription_tools._load_stt_config",
+                 return_value=config,
+             ), \
+             patch("openai.OpenAI", return_value=mock_client):
+            from tools.transcription_tools import _transcribe_openai
+
+            result = _transcribe_openai(
+                sample_wav,
+                "gpt-transcribe",
+                api_key="key",
+            )
+
+        assert result["success"] is False
+        assert "forbidden" in result["error"]
+        mock_client.audio.transcriptions.create.assert_not_called()
+
+    def test_gpt_transcribe_uses_single_language_as_languages_fallback(
+        self, monkeypatch, sample_wav
+    ):
+        monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "test-key")
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_response.text = "Hallo"
+        mock_client.audio.transcriptions.create.return_value = mock_response
+        config = {"openai": {"language": "de"}}
+
+        with patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("tools.transcription_tools._load_stt_config", return_value=config), \
+             patch("openai.OpenAI", return_value=mock_client):
+            from tools.transcription_tools import _transcribe_openai
+
+            _transcribe_openai(sample_wav, "gpt-transcribe")
+
+        kwargs = mock_client.audio.transcriptions.create.call_args.kwargs
+        assert kwargs["extra_body"] == {"languages": ["de"]}
+
+
+class TestExplicitProviderOverride:
+    def test_public_transcribe_audio_signature_does_not_expose_provider_override(self):
+        import inspect
+
+        from tools.transcription_tools import transcribe_audio
+
+        assert "provider" not in inspect.signature(transcribe_audio).parameters
+
+    def test_transcribe_audio_can_override_global_provider_for_one_call(
+        self, sample_wav
+    ):
+        config = {
+            "provider": "local",
+            "local": {"model": "large-v3"},
+            "openai": {"model": "whisper-1"},
+        }
+        with patch("tools.transcription_tools._load_stt_config", return_value=config), \
+             patch(
+                 "tools.transcription_tools._transcribe_openai",
+                 return_value={
+                     "success": True,
+                     "transcript": "Hallo",
+                     "provider": "openai",
+                 },
+             ) as mock_openai:
+            from tools.transcription_tools import _transcribe_audio_with_provider
+
+            result = _transcribe_audio_with_provider(
+                sample_wav,
+                model="gpt-transcribe",
+                provider="openai",
+            )
+
+        assert result["success"] is True
+        mock_openai.assert_called_once_with(sample_wav, "gpt-transcribe")
+
+
 class TestTranscribeLocalCommand:
     def test_command_provider_uses_sanitized_child_env(self, monkeypatch):
         """Salvage of #56332: command STT must not inherit Hermes secrets."""

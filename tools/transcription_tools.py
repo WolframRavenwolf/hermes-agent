@@ -27,6 +27,7 @@ Usage::
         print(result["transcript"])
 """
 
+import json
 import logging
 import os
 import platform
@@ -192,6 +193,27 @@ def _resolve_stt_language(
         if isinstance(candidate, str) and candidate.strip():
             return candidate.strip()
     return None
+
+
+def _decode_stt_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        if stripped.startswith("["):
+            try:
+                value = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                raise ValueError("expected a valid JSON list of strings") from exc
+            if not isinstance(value, list):
+                raise ValueError("expected a valid JSON list of strings")
+        else:
+            return [stripped]
+    if isinstance(value, (list, tuple)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    raise ValueError("expected a string or list of strings")
 
 
 def _has_openai_audio_backend() -> bool:
@@ -1912,9 +1934,13 @@ def _transcribe_openai(
             return {"success": False, "transcript": "", "error": str(exc)}
         base_url = base_url or fallback_base
 
+    # Resolve once so gpt-transcribe can consume its richer context fields
+    # without loading a potentially different config snapshot mid-request.
+    stt_config = _load_stt_config()
+    provider_config = _get_stt_section(stt_config, provider_label)
     # Language: stt.<provider>.language > stt.language > env > auto-detect.
     # Explicit language hint improves accuracy for non-English languages.
-    language = _resolve_stt_language(provider_label)
+    language = _resolve_stt_language(provider_label, stt_config)
 
     if not _HAS_OPENAI:
         return {"success": False, "transcript": "", "error": "openai package not installed"}
@@ -1938,19 +1964,54 @@ def _transcribe_openai(
 
         def _create_transcription(path: str):
             with open(path, "rb") as audio_file:
-                create_kwargs = {
+                create_kwargs: Dict[str, Any] = {
                     "model": model_name,
                     "file": audio_file,
                     "response_format": "text" if model_name == "whisper-1" else "json",
                 }
-                if language:
-                    if model_name == "gpt-transcribe":
-                        # gpt-transcribe replaces the singular ``language``
-                        # field with a ``languages`` list; the API rejects
-                        # requests that send the legacy field.
-                        create_kwargs["extra_body"] = {"languages": [language]}
-                    else:
-                        create_kwargs["language"] = language
+                if provider_label == "openai" and model_name == "gpt-transcribe":
+                    # gpt-transcribe replaces singular ``language`` with a
+                    # ``languages`` list and additionally supports a free-text
+                    # prompt plus literal keyword hints.
+                    raw_languages = provider_config.get("languages")
+                    languages = _decode_stt_string_list(raw_languages)
+                    if not languages and language:
+                        languages = [language]
+                    raw_keywords = provider_config.get("keywords")
+                    keywords = _decode_stt_string_list(raw_keywords)
+                    for keyword in keywords:
+                        if any(character in keyword for character in "<>\r\n"):
+                            raise ValueError(
+                                "OpenAI transcription keyword contains a forbidden character"
+                            )
+                    for language_code in languages:
+                        if not re.fullmatch(
+                            r"[A-Za-z]{2,3}(?:-[A-Za-z]{2,4})?",
+                            language_code,
+                        ):
+                            raise ValueError(
+                                f"invalid OpenAI transcription language code: {language_code!r}"
+                            )
+                    extra_body: Dict[str, Any] = {}
+                    if languages:
+                        extra_body["languages"] = languages
+                    if keywords:
+                        extra_body["keywords"] = keywords
+                    if extra_body:
+                        create_kwargs["extra_body"] = extra_body
+                    prompt = str(provider_config.get("prompt") or "").strip()
+                    if len(prompt) > 5000:
+                        raise ValueError(
+                            "OpenAI transcription prompt exceeds 5000 characters"
+                        )
+                    if prompt:
+                        create_kwargs["prompt"] = prompt
+                    if languages:
+                        logger.debug(
+                            "Using language hints %s for OpenAI STT", languages
+                        )
+                elif language:
+                    create_kwargs["language"] = language
                     logger.debug("Using language hint '%s' for OpenAI STT", language)
                 return client.audio.transcriptions.create(**create_kwargs)
 
@@ -2351,7 +2412,12 @@ def _transcribe_deepinfra(file_path: str, model_name: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _transcribe_prepared_audio(file_path: str, model: Optional[str] = None) -> Dict[str, Any]:
+def _transcribe_prepared_audio(
+    file_path: str,
+    model: Optional[str] = None,
+    *,
+    provider: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     Transcribe an audio file using the configured STT provider.
 
@@ -2395,7 +2461,11 @@ def _transcribe_prepared_audio(file_path: str, model: Optional[str] = None) -> D
             "error": "STT is disabled in config.yaml (stt.enabled: false).",
         }
 
-    provider = _get_provider(stt_config)
+    provider = (
+        str(provider).strip().lower()
+        if provider is not None
+        else _get_provider(stt_config)
+    )
     if not _is_local_stt_provider(provider, stt_config):
         error = _validate_audio_file_size(Path(file_path))
         if error:
@@ -2521,8 +2591,18 @@ def _transcribe_prepared_audio(file_path: str, model: Optional[str] = None) -> D
     }
 
 
-def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, Any]:
-    """Safely validate, preprocess supported inputs, and dispatch transcription."""
+def _transcribe_audio_with_provider(
+    file_path: str,
+    model: Optional[str] = None,
+    *,
+    provider: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Safely validate, preprocess, and dispatch with an internal provider override.
+
+    ``provider`` is an optional per-call override. It doesn't mutate the user
+    config and is used by surfaces that expose explicit STT modes while the
+    global default remains unchanged.
+    """
     # Refuse to feed a credential / secret store (auth.json, .env, OAuth
     # tokens, mcp-tokens/, ...) to an STT provider — before ANY validation or
     # preprocessing, so the refusal names the real reason rather than a
@@ -2554,10 +2634,22 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         prepared_error = _validate_audio_file(prepared_path, enforce_size_limit=False)
         if prepared_error:
             return prepared_error
-        return _transcribe_prepared_audio(prepared_path, model)
+        return _transcribe_prepared_audio(
+            prepared_path,
+            model,
+            provider=provider,
+        )
     finally:
         if cleanup_dir:
             shutil.rmtree(cleanup_dir, ignore_errors=True)
+
+
+def transcribe_audio(
+    file_path: str,
+    model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Safely validate, preprocess, and transcribe an audio file."""
+    return _transcribe_audio_with_provider(file_path, model)
 
 
 def _is_local_or_private_url(url: str) -> bool:
