@@ -1537,6 +1537,11 @@ DEFAULT_CONFIG = {
         "openai": {
             "model": "whisper-1",  # whisper-1, gpt-4o-mini-transcribe, gpt-4o-transcribe, gpt-transcribe
             "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
+            # Rich context used by gpt-transcribe and inherited by Discord's
+            # openai_live_high mode. Empty values preserve old requests.
+            "prompt": "",
+            "languages": [],
+            "keywords": [],
         },
         "mistral": {
             "model": "voxtral-mini-latest",  # voxtral-mini-latest, voxtral-mini-2602
@@ -1566,6 +1571,7 @@ DEFAULT_CONFIG = {
         "thinking_sound": True,       # Calm ambient bubble sound while the agent works in voice chat (volume follows beep_volume)
         "silence_threshold": 200,     # RMS below this = silence (0-32767)
         "silence_duration": 3.0,      # Seconds of silence before auto-stop
+
         "barge_in": True,             # Interrupt the agent / stop TTS when the user starts talking
         "barge_in_grace_seconds": 0.5,  # Trip suppression right after TTS playback starts (onset transient); the mic itself is live for the whole turn
         "barge_in_threshold_multiplier": 3.0,  # Speech trigger = quiet-room floor x this (floor is calibrated BEFORE playback, never against speaker bleed)
@@ -1973,6 +1979,20 @@ DEFAULT_CONFIG = {
         # The adapter also probes clip duration and extends this floor by a
         # padding window, so long TTS readbacks are not cut at exactly 120s.
         "voice_playback_timeout_seconds": 120,
+        # Discord voice-channel STT only. "configured" preserves stt.provider;
+        # named modes select contextual file STT or true streaming STT without
+        # changing voice-message/CLI transcription globally.
+        "voice_stt": {
+            "mode": "configured",  # configured | openai_contextual | openai_live_high
+            "openai_live": {
+                "model": "gpt-live-transcribe",
+                "delay": "high",
+                "endpoint": "wss://api.openai.com/v1/realtime?intent=transcription",  # Host/path validated before key use
+                "completion_timeout_seconds": 20.0,
+                "send_timeout_seconds": 5.0,
+                "max_session_seconds": 3300.0,  # Rollover before 60-minute limit
+            },
+        },
         # Voice-channel audio effects (the continuous mixer). OFF by default.
         # When enabled, the bot installs a software mixer on the outgoing voice
         # stream so a low ambient "thinking" bed, verbal acknowledgements, and

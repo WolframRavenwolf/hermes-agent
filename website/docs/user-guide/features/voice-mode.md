@@ -400,6 +400,53 @@ Only users listed in `DISCORD_ALLOWED_USERS` can interact via voice. Other users
 DISCORD_ALLOWED_USERS=284102345871466496
 ```
 
+### Select a Discord voice STT mode
+
+Discord voice channels can select an STT mode without changing the global
+`stt.provider` used by voice messages, CLI voice mode, or other platforms:
+
+| Mode | Behavior |
+|---------|----------|
+| `configured` | Existing behavior: use the configured global `stt.provider` after the utterance ends. |
+| `openai_contextual` | Send the completed utterance to the OpenAI file-transcription endpoint with `gpt-transcribe`, plus `stt.openai.prompt`, `languages`, and `keywords`. |
+| `openai_live_high` | Stream authorized Discord PCM to a persistent `gpt-live-transcribe` transcription WebSocket with `delay: high`, then manually commit after Hermes' existing silence boundary. |
+
+Select the mode before joining the voice channel:
+
+```bash
+hermes config set discord.voice_stt.mode openai_contextual
+# or
+hermes config set discord.voice_stt.mode openai_live_high
+# restore the normal global STT provider
+hermes config set discord.voice_stt.mode configured
+```
+
+The mode is latched when `/voice join` connects. Leave and rejoin to switch
+modes. No gateway restart is required.
+
+`openai_contextual` uses Hermes' normal OpenAI audio credential resolution; a
+configured direct key takes precedence over the optional managed gateway.
+`openai_live_high` specifically requires a direct OpenAI credential in
+`stt.openai.api_key`, `VOICE_TOOLS_OPENAI_KEY`, or `OPENAI_API_KEY`, because the
+public Realtime WebSocket isn't proxied through Hermes' managed audio gateway.
+It opens that paid WebSocket lazily on the first authorized audio
+chunk, reuses it across turns, rolls it between turns after
+`max_session_seconds` (3300 seconds by default, before the provider's 60-minute
+limit), reapplies the same prompt/keywords/languages, and closes it on
+`/voice leave`; it does not keep a paid idle session while Hermes is outside a
+voice channel. `stt.enabled: false` is a runtime master kill switch: it closes an
+active Live controller and discards pending audio before further cloud egress.
+Re-enabling STT requires leave/rejoin before Live opens a new controller. Each
+utterance is capped at 60 seconds and the thread-to-async Live queue at 5
+seconds of Discord PCM; overflow fails closed through source-byte accounting.
+Live failures are content-free in logs and do not silently invoke a second paid
+transcription backend.
+
+The Live controller keeps one session per authorized speaker and reconciles
+every final event through the `item_id` returned by
+`input_audio_buffer.committed`, because OpenAI does not guarantee completion
+ordering across turns.
+
 ---
 
 ## Configuration Reference
@@ -417,6 +464,18 @@ voice:
   silence_duration: 3.0            # Seconds of silence before auto-stop
   stop_phrases: ["stop"]           # Saying exactly one of these ends the voice chat; [] disables
 
+# Discord voice-channel STT selection
+discord:
+  voice_stt:
+    mode: "configured"             # configured | openai_contextual | openai_live_high
+    openai_live:
+      model: "gpt-live-transcribe"
+      delay: "high"
+      endpoint: "wss://api.openai.com/v1/realtime?intent=transcription"  # Fixed/validated before key use
+      completion_timeout_seconds: 20
+      send_timeout_seconds: 5
+      max_session_seconds: 3300    # Roll before provider's 60-minute limit
+
 # Speech-to-Text
 stt:
   enabled: true                     # set to false to skip auto-transcription —
@@ -430,6 +489,12 @@ stt:
     language: ""                     # optional ISO-639-1 hint; blank = use HERMES_LOCAL_STT_LANGUAGE if set, else auto-detect
   groq:
     language: ""                     # optional ISO-639-1 hint; blank = use HERMES_LOCAL_STT_LANGUAGE if set, else auto-detect
+  openai:
+    model: "whisper-1"
+    language: ""
+    prompt: ""                       # free-text context for gpt-transcribe and Discord Live STT
+    languages: []                    # e.g. ["de", "en"]
+    keywords: []                     # literal names, acronyms, and product terms
   # model: "whisper-1"              # Legacy: used when provider is not set
 
 # Text-to-Speech
@@ -491,10 +556,11 @@ DISCORD_ALLOWED_USERS=...
 | **OpenAI** | `whisper-1` | Fast (~1s) | Good | Paid | Yes |
 | **OpenAI** | `gpt-4o-transcribe` | Medium (~2s) | Best | Paid | Yes |
 | **OpenAI** | `gpt-transcribe` | Fast | Best | Paid ($0.0045/min) | Yes |
+| **OpenAI Realtime** | `gpt-live-transcribe` (`high`) | Streaming | Best, tune on real audio | Paid | Yes |
 | **Mistral** | `voxtral-mini-latest` | Fast | Good | Paid | Yes |
 | **xAI** | `grok-stt` | Fast | Good | Paid | Yes |
 
-Provider priority (automatic fallback): **local** > **groq** > **openai**
+Provider priority for the `configured` mode (automatic fallback): **local** > **groq** > **openai**. Named Discord modes are explicit and do not silently change provider.
 
 ### TTS Provider Comparison
 
