@@ -123,6 +123,47 @@ def _assert_user_call_has_skip_db(calls, expected_skip_db: bool):
         )
 
 
+@pytest.mark.parametrize(
+    "goal_hook_error",
+    [None, RuntimeError("judge failed after streaming delivery")],
+    ids=["goal-hook-succeeds", "goal-hook-fails-best-effort"],
+)
+@pytest.mark.asyncio
+async def test_streamed_response_runs_goal_hook_without_duplicate_return(
+    monkeypatch, tmp_path, goal_hook_error
+):
+    """A streamed final reply still drives Goal evaluation exactly once."""
+    runner = _bootstrap(monkeypatch, tmp_path)
+    response = "completed streamed turn"
+    source = _source()
+    session_entry = runner.session_store.get_or_create_session(source)
+    runner._post_turn_goal_continuation = AsyncMock(side_effect=goal_hook_error)
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": response,
+            "messages": [
+                {"role": "user", "content": "hello world"},
+                {"role": "assistant", "content": response},
+            ],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+            "already_sent": True,
+        }
+    )
+
+    result = await runner._handle_message_with_agent(
+        _event(), source, "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    assert result is None
+    runner._post_turn_goal_continuation.assert_awaited_once_with(
+        session_entry=session_entry,
+        source=source,
+        final_response=response,
+    )
+
+
 # ── Test 1: agent_failed_early path uses skip_db=True ─────────────────
 
 
