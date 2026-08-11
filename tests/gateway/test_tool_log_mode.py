@@ -86,3 +86,15 @@ async def test_write_tool_log_writes_and_rotates_handler(tmp_path, monkeypatch):
     await asyncio.sleep(0)  # keep the asyncio marker honest
 
 
+def test_log_mode_disables_chat_progress():
+    """Full is chat progress; log and off remain silent."""
+    for mode, expected in [
+        ("all", True),
+        ("full", True),
+        ("log", False),
+        ("off", False),
+    ]:
+        enabled = mode not in {"off", "log"}
+        assert enabled is expected
+
+

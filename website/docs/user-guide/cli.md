@@ -347,6 +347,10 @@ display:
 
 This is useful on narrow terminals or when tool arguments contain very long file paths.
 
+### Gateway comment descriptions (not CLI/TUI)
+
+The opt-in `display.tool_progress_comment_descriptions` setting can replace compact messaging-gateway previews for `terminal` and `execute_code` when the first physical line itself is a safe `#` description comment. It intentionally does **not** change CLI or TUI tool previews. See [Display Settings](/user-guide/configuration#comment-descriptions-for-compact-gateway-tool-progress) for the exact parser, security, mode, and per-platform behavior.
+
 ## Session Management
 
 ### Resuming Sessions

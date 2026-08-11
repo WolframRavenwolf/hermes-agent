@@ -1604,6 +1604,7 @@ This controls both the `text_to_speech` tool and spoken replies in voice mode (`
 ```yaml
 display:
   tool_progress: all      # off | new | all | verbose
+  tool_progress_comment_descriptions: false  # Gateway all/new: use leading # comments as compact labels
   tool_progress_command: false  # Enable /verbose slash command in messaging gateway
   focus_view: false       # CLI focus view (/focus) — reduced output, display-only
   platforms: {}           # Per-platform display overrides (see below)
@@ -1711,6 +1712,40 @@ display:
 In the CLI, cycle through these modes with `/verbose`. To use `/verbose` in messaging platforms (Telegram, Discord, Slack, etc.), set `tool_progress_command: true` in the `display` section above. The command will then cycle the mode and save to config.
 
 Tool progress requires a gateway adapter that can display progress updates safely. Platforms without message editing support, including Signal, suppress tool-progress bubbles even if `/verbose` saves a non-`off` mode.
+
+### Comment descriptions for compact gateway tool progress
+
+`display.tool_progress_comment_descriptions` is an opt-in gateway display setting. When it is `true`, compact `all` and `new` progress checks the first physical line of `terminal.command` and `execute_code.code`. A leading `#` comment becomes the short description instead of exposing the command or code body:
+
+```python
+# Analyze the test results #
+print(results)
+```
+
+```text
+🐍 Running code: Analyze the test results
+```
+
+The default is `false`, so existing previews remain byte-for-byte compatible until you opt in. Enable it globally or only on one platform:
+
+```yaml
+display:
+  tool_progress_comment_descriptions: false
+  platforms:
+    mattermost:
+      tool_progress_comment_descriptions: true
+```
+
+Parsing is deliberately narrow and deterministic:
+
+- only `terminal.command` and `execute_code.code` participate;
+- leading whitespace before the opening `#` is allowed, but a shebang (`#!`) is not a description;
+- only the first physical line is inspected (LF, CRLF, and lone CR are recognized), so an empty first line falls back to the legacy preview;
+- exactly one opening `#` and following whitespace are removed, so an immediate second `#` remains visible;
+- a final `#` is removed only when it is separated by whitespace, preserving inner hashes, hashtags, and names such as `C#`;
+- an empty or non-string description falls back to the legacy preview.
+
+The label uses the existing compact-gateway preview cap: a positive `display.tool_preview_length` uses that value, while `0` retains the gateway's existing effective 40-character compact cap. It is treated as untrusted display data: Unicode controls and Default-Ignorable-Code-Point characters are removed before recognized secrets - including URL userinfo and credential-named query parameters - are force-redacted even when ordinary display redaction is disabled. The clean redacted label is capped, then ASCII characters that can activate chat markup, mentions, emoji aliases, or URL/email autolinks are rendered as visually similar inert fullwidth characters; no link metadata is emitted. These comments are display annotations, not approval or audit evidence. The option, friendly-label mode, and preview cap are snapshotted per turn, and both comment labels and legacy compact fallbacks use those snapshots so concurrent platform overrides cannot interfere with one another. Tool execution, stored arguments, API tool events, CLI/TUI output, live status, and `verbose`, `full`, or `log` progress are unchanged.
 
 ### Focus view (`/focus`, CLI + TUI)
 

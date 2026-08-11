@@ -99,6 +99,12 @@ class TestVerboseAndToolProgress:
         assert isinstance(cli.tool_progress_mode, str)
         assert cli.tool_progress_mode in {"off", "new", "all", "verbose"}
 
+    def test_gateway_full_global_mode_normalizes_to_classic_cli_all(self):
+        cli = _make_cli(
+            config_overrides={"display": {"tool_progress": "full"}}
+        )
+        assert cli.tool_progress_mode == "all"
+
 
 class TestFallbackChainInit:
     def test_merges_new_and_legacy_fallback_config(self):

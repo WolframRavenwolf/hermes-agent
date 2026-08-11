@@ -10,6 +10,7 @@ import re
 import sys
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from difflib import unified_diff
 from pathlib import Path
@@ -188,6 +189,49 @@ def _truncate_preview(text: str, max_len: int | None) -> str:
     return text
 
 
+_TOOL_PROGRESS_COMMENT_ARG_KEYS = {
+    "terminal": "command",
+    "execute_code": "code",
+}
+
+
+def extract_tool_progress_comment_description(
+    tool_name: str,
+    args: dict | None,
+) -> str | None:
+    """Return a human label from a supported tool's first physical line.
+
+    The accepted line is an ordinary ``#`` comment after optional indentation.
+    Shebangs are excluded. Exactly one opening marker and its following
+    whitespace are removed; a single whitespace-separated closing marker is
+    removed as well. Missing, malformed, or empty labels return ``None``.
+    """
+    arg_key = _TOOL_PROGRESS_COMMENT_ARG_KEYS.get(tool_name)
+    if arg_key is None or not isinstance(args, dict):
+        return None
+
+    source = args.get(arg_key)
+    if not isinstance(source, str):
+        return None
+
+    first_line = re.split(r"\r\n|\n|\r", source, maxsplit=1)[0].lstrip()
+    if not first_line.startswith("#") or first_line.startswith("#!"):
+        return None
+
+    remainder = first_line[1:]
+    opening_whitespace = bool(remainder and remainder[0].isspace())
+    description = remainder.lstrip().rstrip()
+    if (
+        description.endswith("#")
+        and (
+            (len(description) >= 2 and description[-2].isspace())
+            or (description == "#" and opening_whitespace)
+        )
+    ):
+        description = description[:-1].rstrip()
+    return description or None
+
+
 @dataclass(frozen=True)
 class ToolPreview:
     """A compact tool preview plus presentation facts lost to truncation."""
@@ -195,6 +239,116 @@ class ToolPreview:
     text: str
     truncated: bool = False
     url: str | None = None
+
+
+_INERT_PROGRESS_CHAR_TRANSLATION = str.maketrans(
+    {
+        "\\": "＼",
+        "`": "｀",
+        "*": "＊",
+        "_": "＿",
+        "{": "｛",
+        "}": "｝",
+        "[": "［",
+        "]": "］",
+        "(": "（",
+        ")": "）",
+        "<": "＜",
+        ">": "＞",
+        "#": "＃",
+        "+": "＋",
+        "-": "－",
+        "=": "＝",
+        ".": "．",
+        "!": "！",
+        "|": "｜",
+        "~": "～",
+        "@": "＠",
+        "&": "＆",
+        ":": "：",
+        "/": "／",
+    }
+)
+
+# Unicode DerivedCoreProperties.txt: Default_Ignorable_Code_Point.
+_DEFAULT_IGNORABLE_RANGES = (
+    (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
+    (0x061C, 0x061C),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x206F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFF8),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+)
+
+
+def _is_default_ignorable(char: str) -> bool:
+    codepoint = ord(char)
+    for start, end in _DEFAULT_IGNORABLE_RANGES:
+        if codepoint < start:
+            return False
+        if codepoint <= end:
+            return True
+    return False
+
+
+def _normalize_tool_progress_description(text: str) -> str:
+    """Strip controls/default-ignorables and collapse visible whitespace."""
+    clean_chars = []
+    for char in text:
+        if unicodedata.category(char).startswith("C") or _is_default_ignorable(char):
+            if char.isspace():
+                clean_chars.append(" ")
+            continue
+        clean_chars.append(char)
+    return " ".join("".join(clean_chars).split())
+
+
+def _neutralize_tool_progress_description(text: str) -> str:
+    """Make a normalized one-line label inert across chat markup dialects."""
+    return text.translate(_INERT_PROGRESS_CHAR_TRANSLATION)
+
+
+def prepare_tool_progress_comment_description(
+    tool_name: str,
+    args: dict | None,
+    *,
+    max_len: int,
+) -> ToolPreview | None:
+    """Build a capped, non-linkable, inert comment-label preview."""
+    description = extract_tool_progress_comment_description(tool_name, args)
+    if description is None:
+        return None
+
+    description = _normalize_tool_progress_description(description)
+    if not description:
+        return None
+    description = _normalize_tool_progress_description(
+        redact_sensitive_text(
+            description,
+            force=True,
+            redact_url_credentials=True,
+        )
+    )
+    if not description:
+        return None
+    text = _truncate_preview(description, max_len)
+    safe_text = _neutralize_tool_progress_description(text)
+    return ToolPreview(
+        text=safe_text,
+        truncated=text != description,
+        url=None,
+    )
 
 
 _SHELL_SILENT_HEADS = {"cd", "pushd", "popd", "export", "set", "unset", "source", ".", "true", "false", ":"}
@@ -661,15 +815,23 @@ def get_friendly_tool_labels() -> bool:
     return _friendly_tool_labels
 
 
-def get_tool_verb(tool_name: str) -> str | None:
+def get_tool_verb(
+    tool_name: str,
+    *,
+    friendly_labels: bool | None = None,
+) -> str | None:
     """Return the friendly verb for a built-in tool, or None.
 
     Returns None when friendly labels are disabled or the tool has no curated
     verb (custom/plugin/MCP tools).  Callers that already hold a computed
     argument preview can compose ``f"{verb} {preview}"`` themselves; use
-    :func:`tool_verb_connector` to pick the right joiner.
+    :func:`tool_verb_connector` to pick the right joiner. Passing
+    *friendly_labels* uses an already resolved turn-local setting instead of
+    the legacy module default.
     """
-    if not _friendly_tool_labels:
+    if friendly_labels is None:
+        friendly_labels = _friendly_tool_labels
+    if not friendly_labels:
         return None
     return _TOOL_VERBS.get(tool_name)
 

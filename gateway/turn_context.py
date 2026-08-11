@@ -42,6 +42,9 @@ class TurnContext:
     progress_mode: str = "off"
     progress_grouping: str = "grouped"
     tool_progress_enabled: bool = False
+    tool_progress_comment_descriptions: bool = field(default=False, kw_only=True)
+    friendly_tool_labels: bool = field(default=True, kw_only=True)
+    tool_preview_max_len: int = field(default=0, kw_only=True)
 
     # --- queues ----------------------------------------------------------
     progress_queue: Any = None

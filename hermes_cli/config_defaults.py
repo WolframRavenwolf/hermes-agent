@@ -1203,6 +1203,11 @@ DEFAULT_CONFIG = {
         # honored at runtime (gateway display_config back-compat read) and
         # folded into display.platforms by the v15→16 migration.
         "tool_preview_length": 0,  # Max chars for tool call previews (0 = no limit, show full paths/commands)
+        # Gateway compact progress only: when enabled, use the first physical
+        # `#` comment in terminal.command / execute_code.code as the friendly
+        # progress description. Off by default; per-platform overrides are
+        # supported under display.platforms.<platform>.
+        "tool_progress_comment_descriptions": False,
         # Human-phrased tool status labels for built-in tools: "Searching the
         # web for ...", "Reading <file>", "Browsing <url>" instead of the raw
         # tool name. Applies to CLI spinner + gateway/desktop tool-progress.

@@ -4246,10 +4246,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self.console = Console()
         self.config = CLI_CONFIG
         self.compact = compact if compact is not None else CLI_CONFIG["display"].get("compact", False)
-        # tool_progress: "off", "new", "all", "verbose" (from config.yaml display section)
-        # YAML 1.1 parses bare `off` as boolean False — normalise to string.
+        # Classic CLI supports only off/new/all/verbose.  Gateway-only modes
+        # such as full/log must not enter the CLI/TUI rendering cycle when set
+        # globally in config.yaml. YAML 1.1 also parses bare `off` as False.
         _raw_tp = CLI_CONFIG["display"].get("tool_progress", "all")
-        self.tool_progress_mode = "off" if _raw_tp is False else str(_raw_tp)
+        _cli_tp = "off" if _raw_tp is False else str(_raw_tp).strip().lower()
+        self.tool_progress_mode = (
+            _cli_tp if _cli_tp in {"off", "new", "all", "verbose"} else "all"
+        )
         # focus_view: display-only reduced-output mode (/focus). When on, the
         # tool-progress mode is snapped to "off" so the EXISTING suppression
         # path hides per-tool lines, and the pre-focus mode is stashed so

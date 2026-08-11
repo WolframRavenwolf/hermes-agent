@@ -33,6 +33,7 @@ from typing import Any
 _GLOBAL_DEFAULTS: dict[str, Any] = {
     "tool_progress": "all",
     "tool_progress_grouping": "accumulate",  # "accumulate" = edit one bubble; "separate" = one msg per tool
+    "tool_progress_comment_descriptions": False,
     "show_reasoning": False,
     # How a reasoning/thinking summary is rendered when show_reasoning is on.
     #   "code"      -> 💭 **Reasoning:** + fenced code block (legacy default)
@@ -265,7 +266,7 @@ def _normalise(setting: str, value: Any) -> Any:
             return "off"
         if val in {"true", "1", "yes", "on"}:
             return "all"
-        return val if val in {"off", "new", "all", "verbose", "log"} else "all"
+        return val if val in {"off", "new", "all", "verbose", "full", "log"} else "all"
     if setting in {
         "show_reasoning",
         "streaming",
@@ -274,6 +275,7 @@ def _normalise(setting: str, value: Any) -> Any:
         "busy_ack_detail",
         "busy_steer_ack_enabled",
         "thinking_progress",
+        "tool_progress_comment_descriptions",
     }:
         if isinstance(value, str):
             val = value.strip().lower()

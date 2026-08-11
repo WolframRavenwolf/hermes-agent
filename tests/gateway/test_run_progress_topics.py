@@ -2,13 +2,16 @@
 
 import asyncio
 import importlib
+import json
 import sys
+import threading
 import time
 import types
 from types import SimpleNamespace
 
 import pytest
 
+from agent.conversation_compression import COMPACTION_DONE_STATUS, COMPACTION_STATUS
 import gateway.platforms.base as base_platform
 from gateway.config import Platform, PlatformConfig, StreamingConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
@@ -112,6 +115,276 @@ class SmallLimitProgressAdapter(ProgressCaptureAdapter):
         return SendResult(success=True, message_id=message_id)
 
 
+class SmallLimitCodeBlockProgressAdapter(SmallLimitProgressAdapter):
+    """Tiny-limit adapter that also renders terminal commands as fences."""
+
+    supports_code_blocks = True
+
+
+class Utf16SmallLimitProgressAdapter(SmallLimitProgressAdapter):
+    """Counts UTF-16 code units, as Telegram-compatible adapters do."""
+
+    @property
+    def message_len_fn(self):
+        return lambda text: len(text.encode("utf-16-le")) // 2
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        if self.message_len_fn(content) > self.MAX_MESSAGE_LENGTH:
+            self.oversized_sends.append(content)
+        self.sent.append(
+            {
+                "chat_id": chat_id,
+                "content": content,
+                "reply_to": reply_to,
+                "metadata": metadata,
+            }
+        )
+        return SendResult(success=True, message_id=self._mint_id())
+
+
+class PathologicalLengthProgressAdapter(SmallLimitProgressAdapter):
+    """Treats even one code point as oversized to exercise best-effort progress."""
+
+    MAX_MESSAGE_LENGTH = 10
+
+    @property
+    def message_len_fn(self):
+        return lambda text: 11 if text else 0
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        if self.message_len_fn(content) > self.MAX_MESSAGE_LENGTH:
+            self.oversized_sends.append(content)
+        self.sent.append(
+            {
+                "chat_id": chat_id,
+                "content": content,
+                "reply_to": reply_to,
+                "metadata": metadata,
+            }
+        )
+        return SendResult(success=True, message_id=self._mint_id())
+
+
+class FailFirstEditProgressAdapter(SmallLimitProgressAdapter):
+    """Permanently rejects the first accumulated progress edit."""
+
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self.failed_edit_ids = []
+
+    async def edit_message(self, chat_id, message_id, content) -> SendResult:
+        if not self.failed_edit_ids:
+            self.failed_edit_ids.append(message_id)
+            self.edits.append(
+                {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "content": content,
+                }
+            )
+            return SendResult(success=False, error="message cannot be edited")
+        return await super().edit_message(chat_id, message_id, content)
+
+
+class TrackingSmallLimitProgressAdapter(SmallLimitProgressAdapter):
+    """Records IDs so a continuation chunk cannot be edited later."""
+
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self.sent_message_ids = []
+        self.edited_message_ids = []
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        result = await super().send(
+            chat_id, content, reply_to=reply_to, metadata=metadata
+        )
+        self.sent_message_ids.append(result.message_id)
+        return result
+
+    async def edit_message(self, chat_id, message_id, content) -> SendResult:
+        self.edited_message_ids.append(message_id)
+        return await super().edit_message(chat_id, message_id, content)
+
+
+class SlowFullChunkProgressAdapter(SmallLimitProgressAdapter):
+    """Lets task cancellation land while the first continuation is sending."""
+
+    send_started = threading.Event()
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        self.send_started.set()
+        await asyncio.sleep(0.05)
+        return await super().send(
+            chat_id, content, reply_to=reply_to, metadata=metadata
+        )
+
+
+class ShieldedSeparateSendProgressAdapter(SmallLimitProgressAdapter):
+    """Blocks the first separate send until parent cancellation can be observed."""
+
+    first_send_started = threading.Event()
+
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self.send_attempts = []
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        self.send_attempts.append(content)
+        if len(self.send_attempts) == 1:
+            self.first_send_started.set()
+            await asyncio.sleep(0.05)
+        return await super().send(
+            chat_id, content, reply_to=reply_to, metadata=metadata
+        )
+
+
+class CompleteFirstSeparateSendProgressAdapter(SmallLimitProgressAdapter):
+    """Lets normal cleanup cancel progress after its first send succeeds."""
+
+    first_send_finished = threading.Event()
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        result = await super().send(
+            chat_id, content, reply_to=reply_to, metadata=metadata
+        )
+        self.first_send_finished.set()
+        return result
+
+
+class QueuedSeparateSendProgressAdapter(SmallLimitProgressAdapter):
+    """Holds the first send while two later entries queue for cancellation drain."""
+
+    first_send_started = threading.Event()
+
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self.send_attempts = []
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        self.send_attempts.append(content)
+        if len(self.send_attempts) == 1:
+            self.first_send_started.set()
+            await asyncio.sleep(0.2)
+        return await super().send(
+            chat_id, content, reply_to=reply_to, metadata=metadata
+        )
+
+
+class BlockingFinalizeEditProgressAdapter(SmallLimitProgressAdapter):
+    """Blocks the pre-split edit until progress-task cancellation can land."""
+
+    initial_send_finished = threading.Event()
+    finalize_started = threading.Event()
+
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self.operations = []
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        result = await super().send(
+            chat_id, content, reply_to=reply_to, metadata=metadata
+        )
+        self.operations.append(("send", content))
+        self.initial_send_finished.set()
+        return result
+
+    async def edit_message(self, chat_id, message_id, content) -> SendResult:
+        self.finalize_started.set()
+        await asyncio.sleep(0.2)
+        result = await super().edit_message(chat_id, message_id, content)
+        self.operations.append(("edit", content))
+        return result
+
+
+class BlockingFinalizeSendProgressAdapter(SmallLimitProgressAdapter):
+    """Forces and blocks the pre-split fresh-send finalization path."""
+
+    initial_send_finished = threading.Event()
+    finalize_started = threading.Event()
+
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self.send_attempts = []
+        self.operations = []
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        self.send_attempts.append(content)
+        if len(self.send_attempts) == 1:
+            # Leave the accumulated buffer pending with no editable message ID.
+            self.initial_send_finished.set()
+            return SendResult(success=False, error="synthetic initial failure")
+        if len(self.send_attempts) == 2:
+            self.finalize_started.set()
+            await asyncio.sleep(0.2)
+        result = await super().send(
+            chat_id, content, reply_to=reply_to, metadata=metadata
+        )
+        self.operations.append(("send", content))
+        return result
+
+
+class RepeatedCancelFinalizeEditProgressAdapter(SmallLimitProgressAdapter):
+    """Exposes the progress parent while a pre-split edit child is blocked."""
+
+    initial_send_finished = threading.Event()
+    cancellation_point_started = threading.Event()
+    progress_task = None
+
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self.operations = []
+        self.edit_attempts = []
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        cls = type(self)
+        if cls.progress_task is None:
+            cls.progress_task = asyncio.current_task()
+        result = await super().send(
+            chat_id, content, reply_to=reply_to, metadata=metadata
+        )
+        self.operations.append(("send", content))
+        cls.initial_send_finished.set()
+        return result
+
+    async def edit_message(self, chat_id, message_id, content) -> SendResult:
+        self.edit_attempts.append(content)
+        type(self).cancellation_point_started.set()
+        await asyncio.sleep(0.2)
+        result = await super().edit_message(chat_id, message_id, content)
+        self.operations.append(("edit", content))
+        return result
+
+
+class RepeatedCancelChunkSendProgressAdapter(SmallLimitProgressAdapter):
+    """Exposes the progress parent while its first full-chunk child is blocked."""
+
+    initial_send_finished = threading.Event()
+    cancellation_point_started = threading.Event()
+    progress_task = None
+
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self.chunk_attempts = []
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        cls = type(self)
+        if cls.progress_task is None:
+            cls.progress_task = asyncio.current_task()
+            result = await super().send(
+                chat_id, content, reply_to=reply_to, metadata=metadata
+            )
+            cls.initial_send_finished.set()
+            return result
+
+        self.chunk_attempts.append(content)
+        if not cls.cancellation_point_started.is_set():
+            cls.cancellation_point_started.set()
+            await asyncio.sleep(0.2)
+        return await super().send(
+            chat_id, content, reply_to=reply_to, metadata=metadata
+        )
+
+
 class MetadataEditProgressCaptureAdapter(ProgressCaptureAdapter):
     async def edit_message(
         self, chat_id, message_id, content, *, finalize: bool = False, metadata=None
@@ -187,6 +460,19 @@ class NonEditingProgressCaptureAdapter(ProgressCaptureAdapter):
         raise AssertionError("non-editable adapters should not receive edit_message calls")
 
 
+class LifecycleProgressCaptureAdapter(ProgressCaptureAdapter):
+    """Signals when the first lifecycle/progress bubble is visible."""
+
+    first_send_finished = threading.Event()
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        result = await super().send(
+            chat_id, content, reply_to=reply_to, metadata=metadata
+        )
+        type(self).first_send_finished.set()
+        return result
+
+
 class FakeAgent:
     def __init__(self, **kwargs):
         # Capture anything passed via kwargs (older code path) but don't
@@ -208,6 +494,136 @@ class FakeAgent:
             "messages": [],
             "api_calls": 1,
         }
+
+
+class CompressionLifecycleAndToolAgent:
+    """Emits automatic compaction lifecycle before its first tool call."""
+
+    def __init__(self, **kwargs):
+        self.status_callback = kwargs.get("status_callback")
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        status_callback = self.status_callback
+        tool_callback = self.tool_progress_callback
+        assert status_callback is not None
+        assert tool_callback is not None
+        status_callback("lifecycle", COMPACTION_STATUS)
+        assert LifecycleProgressCaptureAdapter.first_send_finished.wait(timeout=2.0)
+        status_callback("compacted", COMPACTION_DONE_STATUS)
+        tool_callback("tool.started", "terminal", "pwd", {"command": "pwd"})
+        time.sleep(0.4)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+class CompressionLifecycleOnlyAgent:
+    """Emits automatic compaction lifecycle without any tool calls."""
+
+    wait_for_first_send = True
+
+    def __init__(self, **kwargs):
+        self.status_callback = kwargs.get("status_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        status_callback = self.status_callback
+        assert status_callback is not None
+        status_callback("lifecycle", COMPACTION_STATUS)
+        if self.wait_for_first_send:
+            assert LifecycleProgressCaptureAdapter.first_send_finished.wait(timeout=2.0)
+        status_callback("compacted", COMPACTION_DONE_STATUS)
+        time.sleep(0.1)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+class CompressionLifecycleNoWaitAgent(CompressionLifecycleOnlyAgent):
+    """Lifecycle emitter for standalone/no-progress-queue fallbacks."""
+
+    wait_for_first_send = False
+
+
+class CompressionFailureStatusAgent:
+    """Emits a non-routine compaction failure that must stay standalone."""
+
+    FAILURE = "⚠️ Context compaction failed; continuing with existing context."
+
+    def __init__(self, **kwargs):
+        self.status_callback = kwargs.get("status_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        assert self.status_callback is not None
+        self.status_callback("compression_failed", self.FAILURE)
+        time.sleep(0.1)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+class CompressionExhaustedAgent:
+    """Returns the real non-empty terminal compression result shape."""
+
+    ERROR = "Context length exceeded: max compression attempts (3) reached."
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        return {
+            "final_response": self.ERROR,
+            "messages": [],
+            "completed": False,
+            "api_calls": 1,
+            "error": self.ERROR,
+            "partial": True,
+            "failed": True,
+            "compression_exhausted": True,
+        }
+
+
+class HeartbeatAndToolAgent:
+    """Keeps the real heartbeat producer alive for two mutable updates."""
+
+    summaries = 0
+    second_heartbeat_seen = threading.Event()
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def get_activity_summary(self):
+        type(self).summaries += 1
+        count = type(self).summaries
+        if count >= 2:
+            type(self).second_heartbeat_seen.set()
+        return {
+            "api_call_count": count,
+            "max_iterations": 666,
+            "current_tool": f"heartbeat-phase-{count}",
+            "last_activity_desc": f"heartbeat-phase-{count}",
+            "seconds_since_activity": 0.0,
+        }
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        callback = self.tool_progress_callback
+        assert callback is not None
+        callback("tool.started", "terminal", "first command", {})
+        assert type(self).second_heartbeat_seen.wait(timeout=3.0)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+class LateProgressCallbackAgent:
+    """Retains callbacks so tests can probe ingress after owner cleanup."""
+
+    instance = None
+
+    def __init__(self, **kwargs):
+        type(self).instance = self
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.status_callback = kwargs.get("status_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        return {"final_response": "done", "messages": [], "api_calls": 1}
 
 
 class ThinkingAgent:
@@ -866,6 +1282,374 @@ class VerboseAgent:
         }
 
 
+class FullTerminalArgsAgent:
+    """Emits every terminal option so full mode cannot collapse to command-only."""
+
+    ARGS = {
+        "command": "python -c \"print('full terminal payload')\"",
+        "workdir": "/tmp/full-mode-project",
+        "timeout": 321,
+        "background": True,
+        "pty": False,
+        "notify_on_complete": True,
+        "watch_patterns": ["ready", "finished"],
+    }
+    RESULT_MARKER = "FULL-MODE-RESULT-MUST-NOT-RENDER"
+    THINKING_MARKER = "FULL-MODE-THINKING-MUST-NOT-RENDER"
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        assert cb is not None
+        cb("tool.started", "terminal", self.ARGS["command"], dict(self.ARGS))
+        cb(
+            "tool.completed",
+            "terminal",
+            None,
+            None,
+            result={"output": self.RESULT_MARKER},
+        )
+        cb("_thinking", self.THINKING_MARKER)
+        time.sleep(0.35)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+class FullMediaArgsAgent:
+    """Emits ordinary non-terminal media/path/question arguments."""
+
+    ARGS = {
+        "media": ["/tmp/frame-α.png", "/tmp/frame-β.jpg"],
+        "path": "/tmp/screenshots",
+        "question": "Compare every frame without dropping metadata",
+    }
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        assert cb is not None
+        cb(
+            "tool.started", "vision_analyze", self.ARGS["question"], dict(self.ARGS)
+        )
+        time.sleep(0.35)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+class FullSecretArgsAgent:
+    """Emits a credential while global redaction is disabled by the test."""
+
+    SECRET = "sk-testFullModeSecret1234567890ABCDE"
+    ARGS = {
+        "token": SECRET,
+        "path": "/tmp/non-secret-path",
+        "nested": {"question": "keep this structure"},
+    }
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        assert cb is not None
+        cb(
+            "tool.started", "custom_upload", "upload", dict(self.ARGS)
+        )
+        time.sleep(0.35)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+class OversizedSingleFullEntryAgent:
+    """Emits one progress entry larger than the adapter's message limit."""
+
+    PAYLOAD = "lossless-" + "0123456789abcdef" * 40 + "-end"
+    ARGS = {"question": PAYLOAD}
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        assert cb is not None
+        cb(
+            "tool.started", "full_payload_tool", "oversized-preview", dict(self.ARGS)
+        )
+        time.sleep(0.35)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+class FullStrictRedactionAgent:
+    """Exercises full-mode's chat-strict structured redaction boundary."""
+
+    QUERY_SECRET = "opaque-query-value-917263"
+    QUERY_VISIBLE_VALUE = "ordinary-query-value-381"
+    URL_USER = "opaque-url-user-624"
+    URL_PASSWORD = "opaque-url-password-735"
+    URL_FRAGMENT = "opaque-url-fragment-846"
+    AUTHORIZATION = "Custom opaque-header-authorization-159"
+    COOKIE = "session=opaque-cookie-value-260"
+    QUOTED_SECRET = 'opaque-before-quote"opaque-after-quote-371'
+    TOKEN_PREFIX_VALUE = "opaque-token-prefix-key-value-593"
+    REDACTED_KEY_ONE = "sk-AAA111111111ZZZZ"
+    REDACTED_KEY_TWO = "sk-AAA222222222ZZZZ"
+    ARGS = {
+        "request_url": (
+            f"prefix https://{URL_USER}:{URL_PASSWORD}@api.example.test/v1/items"
+            f"?access_token={QUERY_SECRET}&visible={QUERY_VISIBLE_VALUE}"
+            f"#{URL_FRAGMENT} suffix"
+        ),
+        "headers": {
+            "Authorization": AUTHORIZATION,
+            "Cookie": COOKIE,
+        },
+        "secret_value": QUOTED_SECRET,
+        "tokenPrefixData": TOKEN_PREFIX_VALUE,
+        "safe": {"path": "/tmp/visible", "items": ["alpha", ("beta",)]},
+        REDACTED_KEY_ONE: "first-collision-value",
+        REDACTED_KEY_TWO: "second-collision-value",
+    }
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        self.tool_progress_callback(
+            "tool.started", "strict_redaction_tool", "strict", self.ARGS
+        )
+        time.sleep(0.35)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+class FullCliCredentialAgent:
+    """Emits opaque CLI and structured credentials for the enqueue boundary."""
+
+    SECRETS = {
+        "curl_short": "opaque-curl-short-481",
+        "curl_long": "opaque-curl-long-592",
+        "password": "opaque-password-quote-'-603",
+        "token": "opaque-cli-token-714",
+        "bearer": "opaque-body-bearer-825",
+        "jwt": "opaque-body-jwt-936",
+        "env_password": "opaque env password phrase 147",
+        "recovery_key": "opaque recovery key material 258",
+    }
+    RECOVERY_ENV_NAME = "MATRIX_RECOVERY_" + "KEY"
+    COMMAND = (
+        f"export MY_DATABASE_PASSWORD='{SECRETS['env_password']}' "
+        f"export {RECOVERY_ENV_NAME}='{SECRETS['recovery_key']}' "
+        f"curl -u alice:{SECRETS['curl_short']} "
+        f"--user=alice:{SECRETS['curl_long']} "
+        f"--password \"{SECRETS['password']}\" "
+        f"--token='{SECRETS['token']}' https://example.test/health"
+    )
+    ARGS = {
+        "command": COMMAND,
+        "body": {"bearer": SECRETS["bearer"], "jwt": SECRETS["jwt"]},
+        "safe": {"path": "/tmp/visible", "token_count": 4},
+    }
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        self.tool_progress_callback(
+            "tool.started", "credential_cli", "strict", self.ARGS
+        )
+        time.sleep(0.35)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+class OversizedVerboseTerminalAgent:
+    """Emits a verbose fenced entry that exceeds a tiny adapter limit."""
+
+    COMMAND = "printf 'verbose fence'\n" + "x" * 500
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        self.tool_progress_callback(
+            "tool.started", "terminal", self.COMMAND, {"command": self.COMMAND}
+        )
+        time.sleep(0.35)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+class EditFailureThenOversizedFullAgent:
+    """Disables editing before emitting an oversized marked full entry."""
+
+    BIG_ARGS = {"question": "after-edit-failure-" + "abcdef0123456789" * 40}
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        cb("tool.started", "first_full_tool", "first", {"value": "first"})
+        time.sleep(1.7)
+        cb("tool.started", "second_full_tool", "second", {"value": "second"})
+        time.sleep(0.4)
+        cb("tool.started", "full_payload_tool", "big", self.BIG_ARGS)
+        time.sleep(0.35)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+class OversizedThenSmallFullAgent:
+    """Emits a continuation-split full entry followed by another tool."""
+
+    BIG_ARGS = {"question": "split-state-" + "0123456789abcdef" * 40}
+    SMALL_ARGS = {"question": "fresh bubble after split"}
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        cb("tool.started", "full_payload_tool", "big", self.BIG_ARGS)
+        time.sleep(0.35)
+        cb("tool.started", "post_split_tool", "small", self.SMALL_ARGS)
+        time.sleep(0.35)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+class CancelDuringShieldedSeparateSendAgent:
+    """Returns while the first separate-mode progress send is blocked."""
+
+    ARGS = {"question": "cancelled separate send"}
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        assert cb is not None
+        cb("tool.started", "separate_cancel_tool", "cancel", self.ARGS)
+        assert ShieldedSeparateSendProgressAdapter.first_send_started.wait(timeout=2.0)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+class CancelAfterSuccessfulSeparateSendAgent:
+    """Returns only after separate-mode progress was acknowledged."""
+
+    ARGS = {"question": "acknowledged separate send"}
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        assert cb is not None
+        cb("tool.started", "separate_ack_tool", "ack", self.ARGS)
+        assert CompleteFirstSeparateSendProgressAdapter.first_send_finished.wait(
+            timeout=2.0
+        )
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+class CancelWithQueuedSeparateProgressAgent:
+    """Returns with two entries queued behind an in-flight separate send."""
+
+    ENTRIES = (
+        ("separate_first_tool", {"question": "first separate payload"}),
+        ("separate_second_tool", {"question": "second separate payload"}),
+        ("separate_third_tool", {"question": "third separate payload"}),
+    )
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        assert cb is not None
+        first_name, first_args = self.ENTRIES[0]
+        cb("tool.started", first_name, "first", first_args)
+        assert QueuedSeparateSendProgressAdapter.first_send_started.wait(timeout=2.0)
+        for tool_name, args in self.ENTRIES[1:]:
+            cb("tool.started", tool_name, "queued", args)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+class CancelDuringFullSplitAgent:
+    """Returns as soon as the first full continuation send begins."""
+
+    ARGS = {"question": "cancel-safe-" + "0123456789abcdef" * 40}
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        assert cb is not None
+        cb("tool.started", "full_payload_tool", "cancel-safe", self.ARGS)
+        assert SlowFullChunkProgressAdapter.send_started.wait(timeout=2.0)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+class CancelDuringPreSplitFinalizeAgent:
+    """Queues a pending small buffer and returns during pre-split finalization."""
+
+    ADAPTER_CLS = None
+    FIRST_ARGS = {"question": "pending-first"}
+    SECOND_ARGS = {"question": "pending-second"}
+    BIG_ARGS = {"question": "pre-split-cancel-" + "0123456789abcdef" * 40}
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        adapter_cls = self.ADAPTER_CLS
+        assert cb is not None
+        assert adapter_cls is not None
+        cb("tool.started", "pending_first_tool", "first", self.FIRST_ARGS)
+        assert adapter_cls.initial_send_finished.wait(timeout=2.0)
+        cb("tool.started", "pending_second_tool", "second", self.SECOND_ARGS)
+        cb("tool.started", "full_payload_tool", "oversized", self.BIG_ARGS)
+        assert adapter_cls.finalize_started.wait(timeout=3.0)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+class RepeatedCancelDuringFullSplitAgent:
+    """Keeps the agent alive while a test cancels its progress task twice."""
+
+    ADAPTER_CLS = None
+    release_agent = threading.Event()
+    SMALL_ARGS = {"question": "pending-before-repeated-cancel"}
+    BIG_ARGS = {"question": "repeated-cancel-" + "0123456789abcdef" * 40}
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        adapter_cls = self.ADAPTER_CLS
+        assert cb is not None
+        assert adapter_cls is not None
+        cb("tool.started", "pending_tool", "pending", self.SMALL_ARGS)
+        assert adapter_cls.initial_send_finished.wait(timeout=2.0)
+        cb("tool.started", "full_payload_tool", "oversized", self.BIG_ARGS)
+        assert adapter_cls.cancellation_point_started.wait(timeout=3.0)
+        assert self.release_agent.wait(timeout=5.0)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
 async def _run_with_agent(
     monkeypatch,
     tmp_path,
@@ -877,8 +1661,9 @@ async def _run_with_agent(
     platform=Platform.TELEGRAM,
     chat_id="-1001",
     chat_type="group",
-    thread_id="17585",
+    thread_id: str | None = "17585",
     adapter_cls=ProgressCaptureAdapter,
+    defer_terminal_lifecycle_progress=False,
 ):
     if config_data:
         import yaml
@@ -924,8 +1709,428 @@ async def _run_with_agent(
         source=source,
         session_id=session_id,
         session_key=session_key,
+        defer_terminal_lifecycle_progress=defer_terminal_lifecycle_progress,
     )
     return adapter, result
+
+
+@pytest.mark.asyncio
+async def test_mattermost_accumulates_compaction_lifecycle_and_later_tool_progress(
+    monkeypatch, tmp_path
+):
+    LifecycleProgressCaptureAdapter.first_send_finished.clear()
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CompressionLifecycleAndToolAgent,
+        session_id="sess-mattermost-compaction-lifecycle-tool",
+        config_data={
+            "compression": {"progress_notices": True},
+            "display": {
+                "tool_progress": "all",
+                "tool_progress_grouping": "accumulate",
+                "interim_assistant_messages": False,
+                "platforms": {"mattermost": {"tool_progress": "all"}},
+            },
+        },
+        platform=Platform.MATTERMOST,
+        chat_id="channel-1",
+        chat_type="channel",
+        thread_id="root-1",
+        adapter_cls=LifecycleProgressCaptureAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert [call["content"] for call in adapter.sent] == [COMPACTION_STATUS]
+    assert adapter.edits
+    final_progress = adapter.edits[-1]
+    assert final_progress["message_id"] == "progress-1"
+    lines = final_progress["content"].splitlines()
+    assert lines[:2] == [COMPACTION_STATUS, COMPACTION_DONE_STATUS]
+    assert "pwd" in final_progress["content"]
+
+
+@pytest.mark.asyncio
+async def test_mattermost_compaction_only_turn_still_uses_progress_accumulator(
+    monkeypatch, tmp_path
+):
+    LifecycleProgressCaptureAdapter.first_send_finished.clear()
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CompressionLifecycleOnlyAgent,
+        session_id="sess-mattermost-compaction-lifecycle-only",
+        config_data={
+            "compression": {"progress_notices": True},
+            "display": {
+                "tool_progress": "off",
+                "thinking_progress": False,
+                "tool_progress_grouping": "accumulate",
+                "interim_assistant_messages": False,
+            },
+        },
+        platform=Platform.MATTERMOST,
+        chat_id="channel-1",
+        chat_type="channel",
+        thread_id="root-1",
+        adapter_cls=LifecycleProgressCaptureAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert [call["content"] for call in adapter.sent] == [COMPACTION_STATUS]
+    assert adapter.edits[-1] == {
+        "chat_id": "channel-1",
+        "message_id": "progress-1",
+        "content": f"{COMPACTION_STATUS}\n{COMPACTION_DONE_STATUS}",
+    }
+
+
+@pytest.mark.asyncio
+async def test_separate_grouping_keeps_compaction_lifecycle_standalone(
+    monkeypatch, tmp_path
+):
+    LifecycleProgressCaptureAdapter.first_send_finished.clear()
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CompressionLifecycleAndToolAgent,
+        session_id="sess-mattermost-compaction-lifecycle-separate",
+        config_data={
+            "compression": {"progress_notices": True},
+            "display": {
+                "tool_progress": "all",
+                "tool_progress_grouping": "separate",
+                "interim_assistant_messages": False,
+                "platforms": {"mattermost": {"tool_progress": "all"}},
+            },
+        },
+        platform=Platform.MATTERMOST,
+        chat_id="channel-1",
+        chat_type="channel",
+        thread_id="root-1",
+        adapter_cls=LifecycleProgressCaptureAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    sent = [call["content"] for call in adapter.sent]
+    assert sent[:2] == [COMPACTION_STATUS, COMPACTION_DONE_STATUS]
+    assert len(sent) == 3
+    assert adapter.edits == []
+
+
+@pytest.mark.asyncio
+async def test_compaction_failure_status_stays_standalone(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CompressionFailureStatusAgent,
+        session_id="sess-mattermost-compaction-failure-standalone",
+        config_data={
+            "compression": {"progress_notices": True},
+            "display": {
+                "tool_progress": "off",
+                "tool_progress_grouping": "accumulate",
+                "interim_assistant_messages": False,
+            },
+        },
+        platform=Platform.MATTERMOST,
+        chat_id="channel-1",
+        chat_type="channel",
+        thread_id="root-1",
+    )
+
+    assert result["final_response"] == "done"
+    assert [call["content"] for call in adapter.sent] == [
+        CompressionFailureStatusAgent.FAILURE
+    ]
+    assert adapter.edits == []
+
+
+@pytest.mark.asyncio
+async def test_non_editable_adapter_keeps_compaction_lifecycle_standalone(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CompressionLifecycleNoWaitAgent,
+        session_id="sess-compaction-lifecycle-non-editable",
+        config_data={
+            "compression": {"progress_notices": True},
+            "display": {
+                "tool_progress": "off",
+                "tool_progress_grouping": "accumulate",
+                "interim_assistant_messages": False,
+            },
+        },
+        platform=Platform.MATTERMOST,
+        chat_id="channel-1",
+        chat_type="channel",
+        thread_id="root-1",
+        adapter_cls=NonEditingProgressCaptureAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert [call["content"] for call in adapter.sent] == [
+        COMPACTION_STATUS,
+        COMPACTION_DONE_STATUS,
+    ]
+    assert adapter.edits == []
+
+
+@pytest.mark.asyncio
+async def test_raw_api_surface_keeps_compaction_lifecycle_standalone(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CompressionLifecycleNoWaitAgent,
+        session_id="sess-compaction-lifecycle-api-raw",
+        config_data={
+            "compression": {"progress_notices": True},
+            "display": {
+                "tool_progress": "off",
+                "tool_progress_grouping": "accumulate",
+                "interim_assistant_messages": False,
+            },
+        },
+        platform=Platform.API_SERVER,
+        chat_id="api-client-1",
+        chat_type="direct",
+        thread_id=None,
+    )
+
+    assert result["final_response"] == "done"
+    assert [call["content"] for call in adapter.sent] == [
+        COMPACTION_STATUS,
+        COMPACTION_DONE_STATUS,
+    ]
+    assert adapter.edits == []
+
+
+@pytest.mark.asyncio
+async def test_real_heartbeat_producer_upserts_inside_accumulated_progress(
+    monkeypatch, tmp_path
+):
+    HeartbeatAndToolAgent.summaries = 0
+    HeartbeatAndToolAgent.second_heartbeat_seen.clear()
+    # Leave enough time for track_agent()'s 50ms promotion before the first
+    # heartbeat's live-owner check. The production default is 180 seconds.
+    monkeypatch.setenv("HERMES_AGENT_NOTIFY_INTERVAL", "0.15")
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        HeartbeatAndToolAgent,
+        session_id="sess-heartbeat-accumulated-progress",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "tool_progress_grouping": "accumulate",
+                "long_running_notifications": True,
+                "busy_ack_detail": True,
+                "interim_assistant_messages": False,
+            }
+        },
+        platform=Platform.MATTERMOST,
+        chat_id="channel-1",
+        chat_type="channel",
+        thread_id="root-1",
+    )
+
+    assert result["final_response"] == "done"
+    assert len(adapter.sent) == 1
+    visible = (adapter.edits or adapter.sent)[-1]["content"]
+    assert "first command" in visible
+    assert visible.count("⏳ Working") == 1
+    assert "heartbeat-phase-2" in visible
+    assert "heartbeat-phase-1" not in visible
+
+
+@pytest.mark.asyncio
+async def test_nonempty_compression_exhaustion_preserves_flag_and_completion_bridge(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CompressionExhaustedAgent,
+        session_id="sess-terminal-compression-bridge",
+        config_data={
+            "display": {
+                "tool_progress": "off",
+                "tool_progress_grouping": "accumulate",
+                "long_running_notifications": False,
+                "interim_assistant_messages": False,
+            }
+        },
+        platform=Platform.MATTERMOST,
+        chat_id="channel-1",
+        chat_type="channel",
+        thread_id="root-1",
+        defer_terminal_lifecycle_progress=True,
+    )
+
+    assert result["compression_exhausted"] is True
+    complete = result.get("_complete_lifecycle_progress")
+    assert callable(complete)
+    terminal = f"{CompressionExhaustedAgent.ERROR}\n\n🔄 Session auto-reset."
+    delivered = await complete(terminal)
+    assert delivered is True, {
+        "sent": adapter.sent,
+        "edits": adapter.edits,
+        "result_keys": sorted(result),
+    }
+    visible = (adapter.edits or adapter.sent)[-1]["content"]
+    assert visible == terminal
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("platform", "adapter_cls", "grouping", "chat_id", "chat_type", "thread_id"),
+    [
+        (
+            Platform.MATTERMOST,
+            ProgressCaptureAdapter,
+            "separate",
+            "channel-1",
+            "channel",
+            "root-1",
+        ),
+        (
+            Platform.MATTERMOST,
+            NonEditingProgressCaptureAdapter,
+            "accumulate",
+            "channel-1",
+            "channel",
+            "root-1",
+        ),
+        (
+            Platform.API_SERVER,
+            ProgressCaptureAdapter,
+            "accumulate",
+            "api-client-1",
+            "direct",
+            None,
+        ),
+    ],
+    ids=("separate", "non-editable", "raw-api"),
+)
+async def test_terminal_compression_fallback_stays_outside_progress_rail(
+    monkeypatch,
+    tmp_path,
+    platform,
+    adapter_cls,
+    grouping,
+    chat_id,
+    chat_type,
+    thread_id,
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CompressionExhaustedAgent,
+        session_id=f"sess-terminal-compression-fallback-{grouping}-{platform.value}",
+        config_data={
+            "display": {
+                "tool_progress": "off",
+                "tool_progress_grouping": grouping,
+                "long_running_notifications": False,
+                "interim_assistant_messages": False,
+            }
+        },
+        platform=platform,
+        chat_id=chat_id,
+        chat_type=chat_type,
+        thread_id=thread_id,
+        adapter_cls=adapter_cls,
+        defer_terminal_lifecycle_progress=True,
+    )
+
+    assert result["compression_exhausted"] is True
+    assert result["final_response"] == CompressionExhaustedAgent.ERROR
+    assert "_complete_lifecycle_progress" not in result
+    assert adapter.sent == []
+    assert adapter.edits == []
+
+
+@pytest.mark.asyncio
+async def test_compression_exhaustion_leaves_queued_followup_for_post_reset_drain(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CompressionExhaustedAgent,
+        session_id="sess-terminal-compression-with-queued-followup",
+        pending_text="run me after the reset",
+        config_data={
+            "display": {
+                "tool_progress": "off",
+                "tool_progress_grouping": "accumulate",
+                "long_running_notifications": False,
+                "interim_assistant_messages": False,
+            }
+        },
+        platform=Platform.MATTERMOST,
+        chat_id="channel-1",
+        chat_type="channel",
+        thread_id="root-1",
+        defer_terminal_lifecycle_progress=True,
+    )
+
+    session_key = "agent:main:mattermost:channel:channel-1:root-1"
+    assert result["compression_exhausted"] is True
+    assert callable(result.get("_complete_lifecycle_progress"))
+    assert adapter._pending_messages[session_key].text == "run me after the reset"
+    assert adapter.sent == []
+
+    # Close the handed-off rail so the test leaves no live task behind.
+    await result["_complete_lifecycle_progress"](
+        f"{CompressionExhaustedAgent.ERROR}\n\n🔄 Session auto-reset."
+    )
+
+
+@pytest.mark.asyncio
+async def test_cleanup_fences_late_tool_and_compression_progress_callbacks(
+    monkeypatch, tmp_path
+):
+    LateProgressCallbackAgent.instance = None
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        LateProgressCallbackAgent,
+        session_id="sess-late-progress-ingress-fence",
+        config_data={
+            "compression": {"progress_notices": True},
+            "display": {
+                "tool_progress": "all",
+                "tool_progress_grouping": "accumulate",
+                "long_running_notifications": False,
+                "interim_assistant_messages": False,
+            },
+        },
+        platform=Platform.MATTERMOST,
+        chat_id="channel-1",
+        chat_type="channel",
+        thread_id="root-1",
+    )
+
+    assert result["final_response"] == "done"
+    agent = LateProgressCallbackAgent.instance
+    assert agent is not None
+    turn = agent.tool_progress_callback.__self__
+    queue_before = turn._ctx.progress_queue.qsize()
+
+    agent.tool_progress_callback(
+        "tool.started", "terminal", "late command", {"command": "late command"}
+    )
+    agent.status_callback("lifecycle", COMPACTION_STATUS)
+
+    assert turn._ctx.progress_queue.qsize() == queue_before
+    assert adapter.sent == []
+    assert adapter.edits == []
 
 
 @pytest.mark.asyncio
@@ -1268,6 +2473,1023 @@ class CodeBlockProgressAdapter(ProgressCaptureAdapter):
     supports_code_blocks = True
 
 
+def _first_progress_json(adapter):
+    """Return the JSON dict from a one-entry full-mode progress message."""
+    assert adapter.sent, "expected a full-mode progress bubble"
+    content = adapter.sent[0]["content"]
+    _, json_text = content.split("\n", 1)
+    return content, json.loads(json_text)
+
+
+def _expected_full_message(tool_name, args):
+    from agent.display import get_tool_emoji
+    from gateway.run import _redact_full_progress_args
+
+    safe_args = _redact_full_progress_args(args)
+    return (
+        f"{get_tool_emoji(tool_name, default='⚙️')} {tool_name}\n"
+        f"{json.dumps(safe_args, ensure_ascii=False, default=str)}"
+    )
+
+
+def test_full_mode_structured_redactor_is_recursive_and_non_mutating():
+    from gateway.run import _redact_full_progress_args
+
+    original_tuple = ("visible", {"password": "opaque-password-482"})
+    original_list = [original_tuple]
+    original = {
+        "safe": original_list,
+        "apiKey": "opaque-api-key-604",
+        "x-api-key": "opaque-x-api-key-609",
+        "private_key": {"nested": "opaque-private-key-715"},
+        "key_material": ["opaque-key-material-826"],
+    }
+
+    redacted = _redact_full_progress_args(original)
+
+    assert redacted is not original
+    assert redacted["safe"] is not original_list
+    assert redacted["safe"][0] is not original_tuple
+    assert isinstance(redacted["safe"][0], tuple)
+    assert original["safe"] == [
+        ("visible", {"password": "opaque-password-482"})
+    ]
+    assert redacted["safe"][0][1]["password"] == "***"
+    assert redacted["apiKey"] == "***"
+    assert redacted["x-api-key"] == "***"
+    assert redacted["private_key"] == "***"
+    assert redacted["key_material"] == "***"
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        (
+            "前https://user:password@example.test/x?plain=opaque#fragment",
+            "前https://***@example.test/x?plain=***#***",
+        ),
+        (
+            "prefix（https://name:pass@example.test/path?q=hidden#anchor",
+            "prefix（https://***@example.test/path?q=***#***",
+        ),
+    ],
+)
+def test_full_mode_redacts_urls_adjacent_to_cjk_and_punctuation(value, expected):
+    from gateway.run import _redact_full_progress_string
+
+    rendered = _redact_full_progress_string(value)
+
+    assert rendered == expected
+    secrets = (
+        "user",
+        "password",
+        "opaque",
+        "fragment",
+        "name",
+        "pass",
+        "hidden",
+        "anchor",
+    )
+    for secret in secrets:
+        if secret in value:
+            assert secret not in rendered
+
+
+def test_full_mode_masks_lowercase_compound_secret_keys_without_renaming_keys():
+    from gateway.run import _redact_full_progress_args
+
+    original = {
+        "dbpassword": "raw-db-password-183",
+        "oauth_token": "raw-oauth-token-294",
+        "authtoken": "raw-auth-token-305",
+        "clientcredentialsblob": "raw-client-credentials-416",
+        "safevalue": "keep-visible",
+    }
+
+    redacted = _redact_full_progress_args(original)
+
+    assert set(redacted) == set(original)
+    assert redacted["safevalue"] == "keep-visible"
+    for key in original.keys() - {"safevalue"}:
+        assert redacted[key] == "***"
+        assert original[key] not in json.dumps(redacted)
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        (
+            "前custom+v1.2://url-user:url-pass@example.test/items"
+            "?visible=opaque-visible&empty=#opaque-fragment 后",
+            "前custom+v1.2://***@example.test/items"
+            "?visible=***&empty=***#*** 后",
+        ),
+        (
+            "git+ssh://git@example.test/repo?ref=opaque-ref&flag#opaque-anchor",
+            "git+ssh://***@example.test/repo?ref=***&flag#***",
+        ),
+        (
+            "s3://opaque-bucket-user@bucket.example.test/object?version=opaque-version",
+            "s3://***@bucket.example.test/object?version=***",
+        ),
+        (
+            "authorization://header-user:header-pass@example.test/session"
+            "?scope=opaque-scope#opaque-fragment",
+            "authorization://***@example.test/session?scope=***#***",
+        ),
+    ],
+)
+def test_full_mode_redacts_every_rfc_scheme_url(value, expected):
+    from gateway.run import _redact_full_progress_string
+
+    assert _redact_full_progress_string(value) == expected
+
+
+def test_full_mode_masks_dsn_and_connection_url_compound_keys_fail_closed():
+    from gateway.run import _redact_full_progress_args
+
+    original = {
+        "dsn": "opaque-dsn-100",
+        "database_dsn": "opaque-database-dsn-200",
+        "primaryDatabaseUrl": "opaque-primary-database-url-300",
+        "readonly_connection_string": "opaque-readonly-connection-string-400",
+        "db_uri": {"nested": "opaque-db-uri-500"},
+        "monkey": "keep-monkey-visible",
+        "monkey_business": "keep-business-visible",
+        "database_name": "inventory",
+        "connection_timeout": 30,
+        "url": "https://example.test/health",
+    }
+
+    redacted = _redact_full_progress_args(original)
+
+    for key in {
+        "dsn",
+        "database_dsn",
+        "primaryDatabaseUrl",
+        "readonly_connection_string",
+        "db_uri",
+    }:
+        assert redacted[key] == "***"
+        assert str(original[key]) not in json.dumps(redacted)
+    assert redacted["monkey"] == "keep-monkey-visible"
+    assert redacted["monkey_business"] == "keep-business-visible"
+    assert redacted["database_name"] == "inventory"
+    assert redacted["connection_timeout"] == 30
+    assert redacted["url"] == "https://example.test/health"
+
+
+def test_full_mode_masks_sensitive_string_and_list_headers():
+    from gateway.run import _redact_full_progress_args
+
+    header_values = [
+        "Authorization: Custom opaque-authorization-510",
+        "Proxy-Authorization: Basic opaque-proxy-authorization-620",
+        "Cookie: session=opaque-cookie-730; theme=dark",
+        "Set-Cookie: session=opaque-set-cookie-840; HttpOnly; Secure",
+        "X-API-Key: opaque-x-api-key-950",
+        "API-Key: opaque-api-key-061",
+        "X-Auth-Token: opaque-auth-token-172",
+        "CSRF-Token: opaque-csrf-token-283",
+    ]
+    original = {
+        "headers": header_values,
+        "header_block": (
+            "Authorization: Bearer opaque-block-authorization-394\n"
+            "Set-Cookie: session=opaque-block-cookie-405; SameSite=Lax"
+        ),
+        "safe_headers": [
+            "Accept: application/json",
+            "Content-Type: application/json",
+            "X-Request-ID: public-trace-123",
+        ],
+    }
+
+    redacted = _redact_full_progress_args(original)
+
+    assert redacted["headers"] == [
+        f"{header.partition(':')[0]}: ***" for header in header_values
+    ]
+    assert redacted["header_block"] == (
+        "Authorization: ***\nSet-Cookie: ***"
+    )
+    assert redacted["safe_headers"] == original["safe_headers"]
+    assert all(secret not in json.dumps(redacted) for secret in (
+        "opaque-authorization-510",
+        "opaque-proxy-authorization-620",
+        "opaque-cookie-730",
+        "opaque-set-cookie-840",
+        "opaque-x-api-key-950",
+        "opaque-api-key-061",
+        "opaque-auth-token-172",
+        "opaque-csrf-token-283",
+        "opaque-block-authorization-394",
+        "opaque-block-cookie-405",
+    ))
+
+
+def test_full_mode_masks_sensitive_headers_inside_curl_strings_losslessly():
+    from gateway.run import _redact_full_progress_string
+
+    command = (
+        "curl -H 'Authorization: Bearer opaque-curl-auth-516' "
+        "-H \"Proxy-Authorization: Basic opaque-curl-proxy-627\" "
+        "-H 'Cookie: sid=opaque-curl-cookie-738; theme=dark' "
+        "-H 'X-API-Key: opaque-curl-api-key-849' "
+        "-H 'X-CSRF-Token: opaque-curl-csrf-950' "
+        "-H 'Accept: application/json' https://example.test/health"
+    )
+
+    redacted = _redact_full_progress_string(command)
+
+    assert redacted == (
+        "curl -H 'Authorization: ***' "
+        "-H \"Proxy-Authorization: ***\" "
+        "-H 'Cookie: ***' "
+        "-H 'X-API-Key: ***' "
+        "-H 'X-CSRF-Token: ***' "
+        "-H 'Accept: application/json' https://example.test/health"
+    )
+
+
+def test_full_mode_masks_cli_credentials_quote_safely():
+    from gateway.run import _redact_full_progress_string
+
+    command = (
+        "curl -u alice:opaque-short-password-101 "
+        "--user bob:opaque-long-password-202 "
+        "--user=carol:opaque-equals-password-303 "
+        "--password 'opaque spaced password 404' "
+        "--password=opaque-equals-password-505 "
+        '"--token" "opaque quoted token 606" '
+        "'--api-key=opaque api key 707' "
+        "--jwt opaque-jwt-value-808 --bearer=opaque-bearer-value-909 "
+        "https://example.test/health"
+    )
+
+    redacted = _redact_full_progress_string(command)
+
+    assert redacted == (
+        "curl -u *** "
+        "--user *** "
+        "--user=*** "
+        "--password '***' "
+        "--password=*** "
+        '"--token" "***" '
+        "'--api-key=***' "
+        "--jwt *** --bearer=*** "
+        "https://example.test/health"
+    )
+    for secret in (
+        "opaque-short-password-101",
+        "opaque-long-password-202",
+        "opaque-equals-password-303",
+        "opaque spaced password 404",
+        "opaque-equals-password-505",
+        "opaque quoted token 606",
+        "opaque api key 707",
+        "opaque-jwt-value-808",
+        "opaque-bearer-value-909",
+    ):
+        assert secret not in redacted
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        (
+            "MY_DATABASE_PASSWORD='opaque database phrase 101' command",
+            "MY_DATABASE_PASSWORD='***' command",
+        ),
+        (
+            'export API_TOKEN="opaque exported token phrase 202"; command',
+            'export API_TOKEN="***"; command',
+        ),
+        (
+            "env CLIENT_SECRET='opaque client phrase 303' command",
+            "env CLIENT_SECRET='***' command",
+        ),
+        (
+            "'MY_DATABASE_PASSWORD=opaque whole word phrase 404' command",
+            "'MY_DATABASE_PASSWORD=***' command",
+        ),
+        (
+            "MY_DATABASE_PASSWORD=opaque-single-value command",
+            "MY_DATABASE_PASSWORD=*** command",
+        ),
+        (
+            "MY_DATABASE_LABEL='visible database label' command",
+            "MY_DATABASE_LABEL='visible database label' command",
+        ),
+    ],
+)
+def test_full_mode_masks_quoted_secret_environment_assignments(command, expected):
+    from gateway.run import _redact_full_progress_string
+
+    assert _redact_full_progress_string(command) == expected
+
+
+def test_full_mode_masks_key_suffix_environment_assignment():
+    from gateway.run import _redact_full_progress_string
+
+    env_name = "MATRIX_RECOVERY_" + "KEY"
+    secret = "opaque recovery material 515"
+    command = env_name + "='" + secret + "' command"
+    expected = env_name + "='***' command"
+
+    rendered = _redact_full_progress_string(command)
+
+    assert rendered == expected
+    assert secret not in rendered
+
+
+def test_full_mode_keeps_benign_cli_flag_lookalikes():
+    from gateway.run import _redact_full_progress_string
+
+    command = (
+        "curl --user alice --username alice:visible --user-agent alice:visible "
+        "--password-policy strict --password-file ./fixture.txt "
+        "--token-count 4 --tokenizer local --api-key-file ./public.json "
+        "--jwt-decoder local --bearer-format compact; "
+        "tool --password ; echo still-visible"
+    )
+
+    assert _redact_full_progress_string(command) == command
+
+
+def test_full_mode_masks_canonical_body_secret_keys_plus_bearer():
+    from agent.redact import _SENSITIVE_BODY_KEYS
+    from gateway.run import _redact_full_progress_args
+
+    original: dict[str, object] = {
+        key: f"opaque-body-value-{index}"
+        for index, key in enumerate(sorted(_SENSITIVE_BODY_KEYS))
+    }
+    original["bearer"] = "opaque-body-bearer-extra"
+    original["safe_payload"] = {"path": "/tmp/visible", "count": 4}
+
+    redacted = _redact_full_progress_args(original)
+
+    for key in _SENSITIVE_BODY_KEYS | {"bearer"}:
+        assert redacted[key] == "***"
+        assert str(original[key]) not in json.dumps(redacted)
+    assert redacted["safe_payload"] == original["safe_payload"]
+
+
+def test_full_mode_masks_query_only_oauth_fragments():
+    from gateway.run import _redact_full_progress_string
+
+    value = (
+        "exchange ?client_id=public-client&code=opaque-oauth-code-111"
+        "&state=opaque-oauth-state-222#opaque-oauth-fragment then continue"
+    )
+
+    assert _redact_full_progress_string(value) == (
+        "exchange ?client_id=***&code=***&state=***#*** then continue"
+    )
+
+
+def test_full_mode_masks_relative_and_network_url_credentials():
+    from gateway.run import _redact_full_progress_string
+
+    assert _redact_full_progress_string(
+        "POST /callback?client_id=public-client&code=opaque-oauth-code"
+        "&state=opaque-state#opaque-fragment"
+    ) == "POST /callback?client_id=***&code=***&state=***#***"
+    assert _redact_full_progress_string(
+        "fetch //alice:opaque-password@example.test/path?token=opaque-token"
+        "&visible=public-value"
+    ) == "fetch //alice:***@example.test/path?token=***&visible=***"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("fetch //alice:opaque@host/path", "fetch //alice:***@host/path"),
+        ("redirect /callback#opaque", "redirect /callback#***"),
+        ("open callback?code=opaque", "open callback?code=***"),
+        ("open callback#opaque", "open callback#***"),
+    ],
+)
+def test_full_mode_masks_queryless_and_bare_relative_url_credentials(
+    value, expected
+):
+    from gateway.run import _redact_full_progress_string
+
+    assert _redact_full_progress_string(value) == expected
+
+
+def test_full_mode_keeps_noncredential_prose_and_invalid_query_syntax():
+    from gateway.run import _redact_full_progress_args
+
+    original = {
+        "monkey": "The monkey checks which code path handles state transitions.",
+        "question": "Ready? code = example and state = documented.",
+        "header_docs": "Authorization guide: public documentation",
+        "safe_headers": ["CookieJar: local.txt", "X-API-Version: 2026-07-16"],
+        "invalid_scheme": "1custom://user@example.test/path?visible=value",
+    }
+
+    assert _redact_full_progress_args(original) == original
+
+
+@pytest.mark.asyncio
+async def test_full_mode_terminal_shows_all_args_without_code_block(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        FullTerminalArgsAgent,
+        session_id="sess-full-terminal-all-fields",
+        config_data={
+            "display": {
+                "tool_progress": "off",
+                "tool_preview_length": 8,
+                "platforms": {"telegram": {"tool_progress": "full"}},
+            }
+        },
+        adapter_cls=CodeBlockProgressAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    content, rendered_args = _first_progress_json(adapter)
+    assert rendered_args == FullTerminalArgsAgent.ARGS
+    assert "```" not in content
+    all_progress = "\n".join(
+        call["content"] for call in adapter.sent + adapter.edits
+    )
+    assert FullTerminalArgsAgent.RESULT_MARKER not in all_progress
+    assert FullTerminalArgsAgent.THINKING_MARKER not in all_progress
+
+
+@pytest.mark.asyncio
+async def test_full_mode_ignores_tool_preview_length(monkeypatch, tmp_path):
+    adapter, _ = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        FullTerminalArgsAgent,
+        session_id="sess-full-ignores-preview-length",
+        config_data={
+            "display": {"tool_progress": "full", "tool_preview_length": 1}
+        },
+        adapter_cls=CodeBlockProgressAdapter,
+    )
+
+    _, rendered_args = _first_progress_json(adapter)
+    assert rendered_args["command"] == FullTerminalArgsAgent.ARGS["command"]
+    assert rendered_args["watch_patterns"] == ["ready", "finished"]
+
+
+@pytest.mark.asyncio
+async def test_full_mode_nonterminal_preserves_media_path_and_question(monkeypatch, tmp_path):
+    adapter, _ = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        FullMediaArgsAgent,
+        session_id="sess-full-media-args",
+        config_data={"display": {"tool_progress": "full", "tool_preview_length": 2}},
+    )
+
+    _, rendered_args = _first_progress_json(adapter)
+    assert rendered_args == FullMediaArgsAgent.ARGS
+
+
+@pytest.mark.asyncio
+async def test_full_mode_force_redacts_secret_and_preserves_structure(monkeypatch, tmp_path):
+    import agent.redact as redact
+
+    # Full-mode chat is a hard safety boundary: force=True must win even when
+    # the operator disabled ordinary global/log redaction.
+    monkeypatch.setattr(redact, "_REDACT_ENABLED", False)
+    adapter, _ = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        FullSecretArgsAgent,
+        session_id="sess-full-force-redaction",
+        config_data={"display": {"tool_progress": "full"}},
+    )
+
+    content, rendered_args = _first_progress_json(adapter)
+    assert FullSecretArgsAgent.SECRET not in content
+    assert rendered_args["token"] != FullSecretArgsAgent.SECRET
+    assert rendered_args["path"] == FullSecretArgsAgent.ARGS["path"]
+    assert rendered_args["nested"] == FullSecretArgsAgent.ARGS["nested"]
+    assert set(rendered_args) == set(FullSecretArgsAgent.ARGS)
+
+
+@pytest.mark.asyncio
+async def test_full_mode_cli_and_body_credentials_are_redacted_before_enqueue(
+    monkeypatch, tmp_path
+):
+    import agent.redact as redact
+
+    monkeypatch.setattr(redact, "_REDACT_ENABLED", False)
+    adapter, _ = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        FullCliCredentialAgent,
+        session_id="sess-full-cli-credential-redaction",
+        config_data={"display": {"tool_progress": "full"}},
+    )
+
+    content, rendered_args = _first_progress_json(adapter)
+    assert all(
+        secret not in content for secret in FullCliCredentialAgent.SECRETS.values()
+    )
+    assert rendered_args["command"] == (
+        "export MY_DATABASE_PASSWORD='***' "
+        "export MATRIX_RECOVERY_KEY='***' "
+        "curl -u *** --user=*** --password \"***\" "
+        "--token='***' https://example.test/health"
+    )
+    assert rendered_args["body"] == {"bearer": "***", "jwt": "***"}
+    assert rendered_args["safe"]["path"] == "/tmp/visible"
+
+
+@pytest.mark.asyncio
+async def test_full_mode_strict_redaction_happens_before_json_serialization(
+    monkeypatch, tmp_path
+):
+    import agent.redact as redact
+
+    monkeypatch.setattr(redact, "_REDACT_ENABLED", False)
+    adapter, _ = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        FullStrictRedactionAgent,
+        session_id="sess-full-strict-structured-redaction",
+        config_data={"display": {"tool_progress": "full"}},
+    )
+
+    content, rendered_args = _first_progress_json(adapter)
+    raw_secrets = {
+        FullStrictRedactionAgent.QUERY_SECRET,
+        FullStrictRedactionAgent.QUERY_VISIBLE_VALUE,
+        FullStrictRedactionAgent.URL_USER,
+        FullStrictRedactionAgent.URL_PASSWORD,
+        FullStrictRedactionAgent.URL_FRAGMENT,
+        FullStrictRedactionAgent.AUTHORIZATION,
+        FullStrictRedactionAgent.COOKIE,
+        FullStrictRedactionAgent.QUOTED_SECRET,
+        FullStrictRedactionAgent.TOKEN_PREFIX_VALUE,
+        FullStrictRedactionAgent.REDACTED_KEY_ONE,
+        FullStrictRedactionAgent.REDACTED_KEY_TWO,
+        "opaque-after-quote-371",
+    }
+    assert all(secret not in content for secret in raw_secrets)
+    assert rendered_args["headers"] == {
+        "Authorization": "***",
+        "Cookie": "***",
+    }
+    assert rendered_args["secret_value"] == "***"
+    assert rendered_args["tokenPrefixData"] == "***"
+    assert rendered_args["safe"] == {
+        "path": "/tmp/visible",
+        "items": ["alpha", ["beta"]],
+    }
+    assert rendered_args["request_url"] == (
+        "prefix https://***@api.example.test/v1/items"
+        "?access_token=***&visible=***#*** suffix"
+    )
+    assert "first-collision-value" in rendered_args.values()
+    assert "second-collision-value" in rendered_args.values()
+    assert len(rendered_args) == len(FullStrictRedactionAgent.ARGS)
+
+
+@pytest.mark.asyncio
+async def test_oversized_full_entry_splits_losslessly_in_separate_mode(
+    monkeypatch, tmp_path
+):
+    adapter, _ = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        OversizedSingleFullEntryAgent,
+        session_id="sess-full-overflow-separate",
+        config_data={
+            "display": {
+                "tool_progress": "full",
+                "tool_progress_grouping": "separate",
+            }
+        },
+        adapter_cls=SmallLimitProgressAdapter,
+    )
+
+    expected = _expected_full_message(
+        "full_payload_tool", OversizedSingleFullEntryAgent.ARGS
+    )
+    assert len(adapter.sent) > 1
+    assert adapter.oversized_sends == []
+    assert "".join(call["content"] for call in adapter.sent) == expected
+
+
+@pytest.mark.asyncio
+async def test_oversized_full_entry_splits_after_edit_failure(monkeypatch, tmp_path):
+    adapter, _ = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        EditFailureThenOversizedFullAgent,
+        session_id="sess-full-overflow-after-edit-failure",
+        config_data={"display": {"tool_progress": "full"}},
+        adapter_cls=FailFirstEditProgressAdapter,
+    )
+
+    expected = _expected_full_message(
+        "full_payload_tool", EditFailureThenOversizedFullAgent.BIG_ARGS
+    )
+    start = next(
+        idx
+        for idx, call in enumerate(adapter.sent)
+        if call["content"].startswith("⚙️ full_payload_tool\n")
+    )
+    assert adapter.failed_edit_ids
+    assert adapter.oversized_sends == []
+    assert "".join(call["content"] for call in adapter.sent[start:]) == expected
+
+
+@pytest.mark.asyncio
+async def test_full_split_uses_utf16_adapter_length_losslessly(monkeypatch, tmp_path):
+    original_args = OversizedSingleFullEntryAgent.ARGS
+    unicode_args = {"question": "astral-" + "🧪" * 150 + "-done"}
+    monkeypatch.setattr(OversizedSingleFullEntryAgent, "ARGS", unicode_args)
+    adapter, _ = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        OversizedSingleFullEntryAgent,
+        session_id="sess-full-overflow-utf16",
+        config_data={"display": {"tool_progress": "full"}},
+        adapter_cls=Utf16SmallLimitProgressAdapter,
+    )
+
+    expected = _expected_full_message("full_payload_tool", unicode_args)
+    assert original_args != unicode_args
+    assert len(adapter.sent) > 1
+    assert adapter.oversized_sends == []
+    assert all(
+        adapter.message_len_fn(call["content"]) <= adapter.MAX_MESSAGE_LENGTH
+        for call in adapter.sent
+    )
+    assert "".join(call["content"] for call in adapter.sent) == expected
+
+
+@pytest.mark.asyncio
+async def test_full_split_pathological_one_codepoint_over_limit_terminates(
+    monkeypatch, tmp_path
+):
+    adapter, _ = await asyncio.wait_for(
+        _run_with_agent(
+            monkeypatch,
+            tmp_path,
+            OversizedSingleFullEntryAgent,
+            session_id="sess-full-overflow-pathological-length",
+            config_data={"display": {"tool_progress": "full"}},
+            adapter_cls=PathologicalLengthProgressAdapter,
+        ),
+        timeout=3.0,
+    )
+
+    expected = _expected_full_message(
+        "full_payload_tool", OversizedSingleFullEntryAgent.ARGS
+    )
+    # Best effort: no non-empty chunk can satisfy this adapter, but advancing
+    # one code point at a time must terminate without losing or repeating text.
+    assert adapter.oversized_sends
+    assert "".join(call["content"] for call in adapter.sent) == expected
+
+
+@pytest.mark.asyncio
+async def test_full_split_finalizes_chunks_before_later_progress(monkeypatch, tmp_path):
+    adapter, _ = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        OversizedThenSmallFullAgent,
+        session_id="sess-full-overflow-state-reset",
+        config_data={"display": {"tool_progress": "full"}},
+        adapter_cls=TrackingSmallLimitProgressAdapter,
+    )
+
+    expected_big = _expected_full_message(
+        "full_payload_tool", OversizedThenSmallFullAgent.BIG_ARGS
+    )
+    expected_small = _expected_full_message(
+        "post_split_tool", OversizedThenSmallFullAgent.SMALL_ARGS
+    )
+    combined = "".join(call["content"] for call in adapter.sent)
+    assert combined == expected_big + expected_small
+    assert adapter.edited_message_ids == []
+
+
+@pytest.mark.asyncio
+async def test_separate_full_progress_finishes_inflight_send_once_after_cancellation(
+    monkeypatch, tmp_path
+):
+    ShieldedSeparateSendProgressAdapter.first_send_started.clear()
+    adapter, _ = await asyncio.wait_for(
+        _run_with_agent(
+            monkeypatch,
+            tmp_path,
+            CancelDuringShieldedSeparateSendAgent,
+            session_id="sess-full-separate-cancel-first-send",
+            config_data={
+                "display": {
+                    "tool_progress": "full",
+                    "tool_progress_grouping": "separate",
+                }
+            },
+            adapter_cls=ShieldedSeparateSendProgressAdapter,
+        ),
+        timeout=5.0,
+    )
+
+    expected = _expected_full_message(
+        "separate_cancel_tool", CancelDuringShieldedSeparateSendAgent.ARGS
+    )
+    assert adapter.send_attempts.count(expected) == 1
+    assert [call["content"] for call in adapter.sent].count(expected) == 1
+
+
+@pytest.mark.asyncio
+async def test_separate_full_progress_does_not_retry_acknowledged_payload_on_cleanup(
+    monkeypatch, tmp_path
+):
+    CompleteFirstSeparateSendProgressAdapter.first_send_finished.clear()
+    adapter, _ = await asyncio.wait_for(
+        _run_with_agent(
+            monkeypatch,
+            tmp_path,
+            CancelAfterSuccessfulSeparateSendAgent,
+            session_id="sess-full-separate-cancel-after-success",
+            config_data={
+                "display": {
+                    "tool_progress": "full",
+                    "tool_progress_grouping": "separate",
+                }
+            },
+            adapter_cls=CompleteFirstSeparateSendProgressAdapter,
+        ),
+        timeout=5.0,
+    )
+
+    expected = _expected_full_message(
+        "separate_ack_tool", CancelAfterSuccessfulSeparateSendAgent.ARGS
+    )
+    assert [call["content"] for call in adapter.sent].count(expected) == 1
+
+
+@pytest.mark.asyncio
+async def test_separate_full_progress_cancel_drain_sends_queued_entries_once(
+    monkeypatch, tmp_path
+):
+    QueuedSeparateSendProgressAdapter.first_send_started.clear()
+    adapter, _ = await asyncio.wait_for(
+        _run_with_agent(
+            monkeypatch,
+            tmp_path,
+            CancelWithQueuedSeparateProgressAgent,
+            session_id="sess-full-separate-cancel-two-queued",
+            config_data={
+                "display": {
+                    "tool_progress": "full",
+                    "tool_progress_grouping": "separate",
+                }
+            },
+            adapter_cls=QueuedSeparateSendProgressAdapter,
+        ),
+        timeout=5.0,
+    )
+
+    expected = [
+        _expected_full_message(tool_name, args)
+        for tool_name, args in CancelWithQueuedSeparateProgressAgent.ENTRIES
+    ]
+    assert adapter.send_attempts == expected
+    assert [call["content"] for call in adapter.sent] == expected
+
+
+@pytest.mark.asyncio
+async def test_full_split_finishes_all_chunks_when_sender_task_is_cancelled(
+    monkeypatch, tmp_path
+):
+    SlowFullChunkProgressAdapter.send_started.clear()
+    adapter, _ = await asyncio.wait_for(
+        _run_with_agent(
+            monkeypatch,
+            tmp_path,
+            CancelDuringFullSplitAgent,
+            session_id="sess-full-overflow-cancel-during-send",
+            config_data={"display": {"tool_progress": "full"}},
+            adapter_cls=SlowFullChunkProgressAdapter,
+        ),
+        timeout=5.0,
+    )
+
+    expected = _expected_full_message(
+        "full_payload_tool", CancelDuringFullSplitAgent.ARGS
+    )
+    assert adapter.oversized_sends == []
+    assert "".join(call["content"] for call in adapter.sent) == expected
+
+
+@pytest.mark.parametrize(
+    "adapter_cls, finalize_operation",
+    [
+        (BlockingFinalizeEditProgressAdapter, "edit"),
+        (BlockingFinalizeSendProgressAdapter, "send"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_full_split_finishes_same_pre_split_finalize_task_when_cancelled(
+    monkeypatch, tmp_path, adapter_cls, finalize_operation
+):
+    adapter_cls.initial_send_finished.clear()
+    adapter_cls.finalize_started.clear()
+    monkeypatch.setattr(CancelDuringPreSplitFinalizeAgent, "ADAPTER_CLS", adapter_cls)
+
+    adapter, _ = await asyncio.wait_for(
+        _run_with_agent(
+            monkeypatch,
+            tmp_path,
+            CancelDuringPreSplitFinalizeAgent,
+            session_id=f"sess-full-pre-split-cancel-{finalize_operation}",
+            config_data={"display": {"tool_progress": "full"}},
+            adapter_cls=adapter_cls,
+        ),
+        timeout=6.0,
+    )
+    assert isinstance(
+        adapter,
+        (BlockingFinalizeEditProgressAdapter, BlockingFinalizeSendProgressAdapter),
+    )
+
+    first = _expected_full_message(
+        "pending_first_tool", CancelDuringPreSplitFinalizeAgent.FIRST_ARGS
+    )
+    second = _expected_full_message(
+        "pending_second_tool", CancelDuringPreSplitFinalizeAgent.SECOND_ARGS
+    )
+    pending_buffer = f"{first}\n{second}"
+    oversized = _expected_full_message(
+        "full_payload_tool", CancelDuringPreSplitFinalizeAgent.BIG_ARGS
+    )
+    finalized = [
+        content
+        for operation, content in adapter.operations
+        if operation == finalize_operation and content == pending_buffer
+    ]
+    assert finalized == [pending_buffer]
+
+    finalize_index = adapter.operations.index((finalize_operation, pending_buffer))
+    chunk_contents = [
+        content
+        for operation, content in adapter.operations[finalize_index + 1:]
+        if operation == "send"
+    ]
+    assert len(chunk_contents) > 1
+    assert "".join(chunk_contents) == oversized
+    assert adapter.oversized_sends == []
+
+
+@pytest.mark.parametrize(
+    "adapter_cls",
+    [
+        pytest.param(
+            RepeatedCancelFinalizeEditProgressAdapter,
+            id="edit-finalization",
+        ),
+        pytest.param(
+            RepeatedCancelChunkSendProgressAdapter,
+            id="chunk-send",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_full_split_survives_two_parent_cancellations_without_retry(
+    monkeypatch, tmp_path, adapter_cls
+):
+    adapter_cls.initial_send_finished.clear()
+    adapter_cls.cancellation_point_started.clear()
+    adapter_cls.progress_task = None
+    RepeatedCancelDuringFullSplitAgent.release_agent.clear()
+    monkeypatch.setattr(RepeatedCancelDuringFullSplitAgent, "ADAPTER_CLS", adapter_cls)
+
+    run_task = asyncio.create_task(
+        _run_with_agent(
+            monkeypatch,
+            tmp_path,
+            RepeatedCancelDuringFullSplitAgent,
+            session_id=f"sess-full-repeated-cancel-{adapter_cls.__name__}",
+            config_data={"display": {"tool_progress": "full"}},
+            adapter_cls=adapter_cls,
+        )
+    )
+    try:
+        started = await asyncio.wait_for(
+            asyncio.to_thread(adapter_cls.cancellation_point_started.wait, 3.0),
+            timeout=4.0,
+        )
+        assert started is True
+        progress_task = adapter_cls.progress_task
+        assert progress_task is not None
+        assert progress_task.cancel() is True
+        await asyncio.sleep(0)
+        assert progress_task.done() is False
+        assert progress_task.cancel() is True
+        await asyncio.wait_for(asyncio.shield(progress_task), timeout=4.0)
+    finally:
+        RepeatedCancelDuringFullSplitAgent.release_agent.set()
+
+    adapter, _ = await asyncio.wait_for(run_task, timeout=4.0)
+    assert isinstance(
+        adapter,
+        (
+            RepeatedCancelFinalizeEditProgressAdapter,
+            RepeatedCancelChunkSendProgressAdapter,
+        ),
+    )
+    small = _expected_full_message(
+        "pending_tool", RepeatedCancelDuringFullSplitAgent.SMALL_ARGS
+    )
+    oversized = _expected_full_message(
+        "full_payload_tool", RepeatedCancelDuringFullSplitAgent.BIG_ARGS
+    )
+    sent_contents = [call["content"] for call in adapter.sent]
+    assert sent_contents[0] == small
+    assert len(sent_contents[1:]) > 1
+    assert "".join(sent_contents[1:]) == oversized
+    assert [call["content"] for call in adapter.edits].count(small) == 1
+    assert adapter.oversized_sends == []
+    if isinstance(adapter, RepeatedCancelFinalizeEditProgressAdapter):
+        assert adapter.edit_attempts == [small]
+    else:
+        assert adapter.chunk_attempts == sent_contents[1:]
+
+
+@pytest.mark.asyncio
+async def test_exact_child_awaiter_propagates_direct_child_cancellation():
+    from gateway.run import _await_exact_task_through_cancellation
+
+    attempts = 0
+
+    async def cancel_directly():
+        nonlocal attempts
+        attempts += 1
+        raise asyncio.CancelledError
+
+    child = asyncio.create_task(cancel_directly())
+    waiter = asyncio.create_task(_await_exact_task_through_cancellation(child))
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(waiter, timeout=1.0)
+
+    assert attempts == 1
+    assert child.cancelled() is True
+    assert waiter.cancelled() is True
+
+
+@pytest.mark.asyncio
+async def test_oversized_verbose_fence_keeps_upstream_single_entry_behavior(
+    monkeypatch, tmp_path
+):
+    adapter, _ = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        OversizedVerboseTerminalAgent,
+        session_id="sess-verbose-oversized-fence-unsplit",
+        config_data={"display": {"tool_progress": "verbose"}},
+        adapter_cls=SmallLimitCodeBlockProgressAdapter,
+    )
+
+    assert len(adapter.sent) == 1
+    assert adapter.oversized_sends == [adapter.sent[0]["content"]]
+    from agent.display import get_tool_emoji
+
+    expected = (
+        f"{get_tool_emoji('terminal', default='⚙️')} terminal\n```\n"
+        f"{OversizedVerboseTerminalAgent.COMMAND}\n```"
+    )
+    assert adapter.sent[0]["content"] == expected
+    assert all(call["content"] == expected for call in adapter.edits)
+
+
+@pytest.mark.asyncio
+async def test_oversized_single_full_entry_splits_losslessly(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        OversizedSingleFullEntryAgent,
+        session_id="sess-full-single-entry-overflow",
+        config_data={"display": {"tool_progress": "full"}},
+        adapter_cls=SmallLimitProgressAdapter,
+    )
+
+    expected = _expected_full_message(
+        "full_payload_tool", OversizedSingleFullEntryAgent.ARGS
+    )
+    assert result["final_response"] == "done"
+    assert isinstance(adapter, SmallLimitProgressAdapter)
+    assert len(adapter.sent) > 1
+    assert adapter.oversized_sends == []
+    assert adapter.oversized_edits == []
+    assert "".join(call["content"] for call in adapter.sent) == expected
+
+
 class TerminalCommandAgent:
     """Emits a terminal tool.started with a real, multi-line command arg."""
 
@@ -1520,3 +3742,131 @@ class TestSlackReplyInThreadProgressRouting:
             event_message_id="1700000000.000100",
             reply_in_thread=False,
         ) is None
+
+
+class CommentDescriptionProgressAdapter(ProgressCaptureAdapter):
+    all_progress_rendered = threading.Event()
+
+    @classmethod
+    def _mark_rendered(cls, content):
+        if "Analyze test results" in content:
+            cls.all_progress_rendered.set()
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        result = await super().send(
+            chat_id, content, reply_to=reply_to, metadata=metadata
+        )
+        self._mark_rendered(content)
+        return result
+
+    async def edit_message(self, chat_id, message_id, content) -> SendResult:
+        result = await super().edit_message(chat_id, message_id, content)
+        self._mark_rendered(content)
+        return result
+
+
+class CommentDescriptionAgent:
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        assert cb is not None
+        cb(
+            "tool.started",
+            "terminal",
+            "# Check branch and status #\ngit status",
+            {"command": "# Check branch and status #\ngit status"},
+        )
+        cb(
+            "tool.started",
+            "execute_code",
+            "# Analyze test results\nprint('ok')",
+            {"code": "# Analyze test results\nprint('ok')"},
+        )
+        assert CommentDescriptionProgressAdapter.all_progress_rendered.wait(timeout=3.0)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("grouping", ["accumulate", "separate"])
+async def test_platform_comment_description_override_reaches_real_turn_context(
+    monkeypatch,
+    tmp_path,
+    grouping,
+):
+    CommentDescriptionProgressAdapter.all_progress_rendered.clear()
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CommentDescriptionAgent,
+        session_id=f"sess-comment-description-{grouping}",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "tool_progress_grouping": grouping,
+                "tool_progress_comment_descriptions": False,
+                "interim_assistant_messages": False,
+                "platforms": {
+                    "mattermost": {
+                        "tool_progress_comment_descriptions": True,
+                    }
+                },
+            }
+        },
+        platform=Platform.MATTERMOST,
+        chat_id="channel-comment-description",
+        chat_type="channel",
+        thread_id="root-comment-description",
+        adapter_cls=CommentDescriptionProgressAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    contents = [call["content"] for call in adapter.sent] + [
+        call["content"] for call in adapter.edits
+    ]
+    combined = "\n".join(contents)
+    assert "Running: Check branch and status" in combined
+    assert "Running code: Analyze test results" in combined
+    assert "git status" not in combined
+    assert "print('ok')" not in combined
+
+
+@pytest.mark.asyncio
+async def test_platform_false_override_keeps_real_turn_on_legacy_preview(
+    monkeypatch,
+    tmp_path,
+):
+    CommentDescriptionProgressAdapter.all_progress_rendered.clear()
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CommentDescriptionAgent,
+        session_id="sess-comment-description-disabled",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "tool_progress_grouping": "separate",
+                "tool_progress_comment_descriptions": True,
+                "interim_assistant_messages": False,
+                "platforms": {
+                    "mattermost": {
+                        "tool_progress_comment_descriptions": False,
+                    }
+                },
+            }
+        },
+        platform=Platform.MATTERMOST,
+        chat_id="channel-comment-description-disabled",
+        chat_type="channel",
+        thread_id="root-comment-description-disabled",
+        adapter_cls=CommentDescriptionProgressAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    combined = "\n".join(call["content"] for call in adapter.sent)
+    assert "Running: Check branch and status" not in combined
+    assert "Running code: Analyze test results" not in combined
+    assert "# Check branch and status" in combined
+    assert "# Analyze test results" in combined

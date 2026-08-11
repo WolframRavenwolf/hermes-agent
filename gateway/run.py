@@ -48,6 +48,7 @@ from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union,
 
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
 from agent.conversation_compression import (
+    COMPACTION_DONE_STATUS,
     COMPACTION_STATUS,
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
     COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
@@ -60,6 +61,7 @@ from agent.conversation_compression import (
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
 from agent.interrupt_compat import request_hard_interrupt
+from agent.redact import _SENSITIVE_BODY_KEYS as _CENTRAL_SENSITIVE_BODY_KEYS
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 
@@ -84,6 +86,547 @@ _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
 
+# ``display.tool_progress: full`` sends complete tool arguments into human chat.
+# It therefore uses a stricter policy than ordinary logs/tool output: URL
+# credentials are never workflow inputs at this display boundary, and values
+# beneath secret-like keys are fully masked rather than partially fingerprinted.
+# RFC 3986 schemes start with an ASCII letter and may then contain letters,
+# digits, ``+``, ``-``, or ``.``.  Full progress must not assume that only web
+# schemes carry credentials: DSNs and tool/plugin-specific schemes are common.
+_FULL_PROGRESS_URL_RE = re.compile(
+    r"(?i)(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*://[^\s<>\"']+"
+)
+_FULL_PROGRESS_QUERY_FIELD = (
+    r"[A-Za-z0-9._~%+\-]+(?:=[^&\s#<>\"']*)?"
+)
+_FULL_PROGRESS_QUERY_ONLY_RE = re.compile(
+    rf"(?<![A-Za-z0-9_/?#])\?"
+    rf"(?P<query>(?=[^\s#<>\"']*=){_FULL_PROGRESS_QUERY_FIELD}"
+    rf"(?:&{_FULL_PROGRESS_QUERY_FIELD})*)"
+    rf"(?P<fragment>#[^\s<>\"']*)?"
+)
+_FULL_PROGRESS_RELATIVE_URL_RE = re.compile(
+    rf"(?P<prefix>(?<![A-Za-z0-9+.\-:/])(?:/{{1,2}}|\./|\.\./)[^\s?#<>\"']*)"
+    rf"(?:\?(?P<query>(?=[^\s#<>\"']*=){_FULL_PROGRESS_QUERY_FIELD}"
+    rf"(?:&{_FULL_PROGRESS_QUERY_FIELD})*))?"
+    rf"(?P<fragment>#[^\s<>\"']*)?"
+)
+_FULL_PROGRESS_BARE_RELATIVE_URL_RE = re.compile(
+    rf"(?P<prefix>(?<![A-Za-z0-9._~%!$&()*+,;=:@+\-/])"
+    rf"[A-Za-z0-9._~%!$&()*+,;=@+\-]+"
+    rf"(?:/[A-Za-z0-9._~%!$&()*+,;=:@+\-]+)*)"
+    rf"(?:"
+    rf"\?(?P<query>(?=[^\s#<>\"']*=){_FULL_PROGRESS_QUERY_FIELD}"
+    rf"(?:&{_FULL_PROGRESS_QUERY_FIELD})*)"
+    rf"(?P<fragment>#[^\s<>\"']*)?"
+    rf"|(?P<fragment_only>#[^\s<>\"']*)"
+    rf")"
+)
+_FULL_PROGRESS_SECRET_HEADER_NAME = (
+    r"(?:"
+    r"proxy[-_]authorization|authorization|"
+    r"set[-_]cookie|cookie|"
+    r"(?:x[-_](?:goog[-_])?)?api[-_]?key|"
+    r"(?:x[-_])?auth[-_]?token|"
+    r"(?:x[-_])?(?:csrf|xsrf)[-_]?token"
+    r")"
+)
+# Curl headers need quote-aware matching so masking a value cannot consume the
+# closing shell quote or any following option/URL.  Keep single- and
+# double-quoted alternatives separate so the opposite quote remains valid in a
+# cookie value.  The unquoted form deliberately covers one shell token; curl
+# requires quoting when a header value itself contains spaces.
+_FULL_PROGRESS_CURL_HEADER_RE = re.compile(
+    rf"(?P<option>(?<!\S)(?:-H(?![A-Za-z0-9])|--header\b)[ \t]*)"
+    rf"(?:"
+    rf"'(?P<sq_name>{_FULL_PROGRESS_SECRET_HEADER_NAME})"
+    rf"(?P<sq_sep>[ \t]*:[ \t]*)(?:\\.|[^'])*'|"
+    rf'"(?P<dq_name>{_FULL_PROGRESS_SECRET_HEADER_NAME})'
+    rf'(?P<dq_sep>[ \t]*:[ \t]*)(?:\\.|[^"])*"|'
+    rf"(?P<bare_name>{_FULL_PROGRESS_SECRET_HEADER_NAME})"
+    rf"(?P<bare_sep>[ \t]*:[ \t]*)(?P<bare_value>[^\s]+)"
+    rf")",
+    re.IGNORECASE,
+)
+# A string/list header is represented as one field per line.  Anchoring avoids
+# treating prose such as "the Authorization guide: ..." as a credential.  A
+# ``://`` guard keeps a same-named RFC scheme from being mistaken for a header.
+_FULL_PROGRESS_HEADER_LINE_RE = re.compile(
+    rf"^(?P<indent>[ \t]*)(?P<name>{_FULL_PROGRESS_SECRET_HEADER_NAME})"
+    rf"(?P<sep>[ \t]*:[ \t]*)(?!//)[^\r\n]*",
+    re.IGNORECASE | re.MULTILINE,
+)
+# Keep exact structured/CLI credential names aligned with the canonical body
+# redactor. ``bearer`` is already covered by the canonical JSON scanner but is
+# not yet a body key; full progress treats it as an opaque credential container
+# alongside ``jwt``.
+_FULL_PROGRESS_EXACT_SECRET_KEYS = (
+    _CENTRAL_SENSITIVE_BODY_KEYS | frozenset({"bearer"})
+)
+_FULL_PROGRESS_SECRET_KEY_PARTS = frozenset(
+    {
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "passphrase",
+        "credential",
+        "credentials",
+        "authorization",
+        "authentication",
+        "auth",
+        "cookie",
+        "signature",
+    }
+)
+_FULL_PROGRESS_SECRET_COMPACT_KEYS = frozenset(
+    {
+        "apikey",
+        "privatekey",
+        "keymaterial",
+        "accesstoken",
+        "refreshtoken",
+        "idtoken",
+        "clientsecret",
+        "bearertoken",
+        "accesskey",
+        "secretkey",
+        "signingkey",
+        "key",
+    }
+)
+_FULL_PROGRESS_CONNECTION_KEY_MARKERS = frozenset(
+    {
+        "connectionstring",
+        "connectionurl",
+        "connectionuri",
+        "connectiondsn",
+        "databaseurl",
+        "databaseuri",
+        "databasedsn",
+        "dburl",
+        "dburi",
+        "dbdsn",
+    }
+)
+_FULL_PROGRESS_REDACTED = "***"
+
+
+def _full_progress_shell_words(value: str) -> list[tuple[int, int, str, str, int]]:
+    """Return shell-like words with source spans for narrow CLI masking.
+
+    This is deliberately not a shell parser. It only distinguishes whitespace,
+    common command separators, quotes, and backslash escapes so credential value
+    spans can be replaced without re-quoting or otherwise rewriting the command.
+    The segment number prevents a flag at the end of one command from consuming
+    the first word of the next command as its value.
+    """
+    words: list[tuple[int, int, str, str, int]] = []
+    separators = ";|&()"
+    segment = 0
+    i = 0
+    while i < len(value):
+        while i < len(value) and (value[i].isspace() or value[i] in separators):
+            if value[i] in separators or value[i] in "\r\n":
+                segment += 1
+            i += 1
+        if i >= len(value):
+            break
+
+        start = i
+        quote = ""
+        while i < len(value):
+            char = value[i]
+            if quote:
+                if char == quote:
+                    quote = ""
+                    i += 1
+                    continue
+                if quote == '"' and char == "\\" and i + 1 < len(value):
+                    i += 2
+                    continue
+                i += 1
+                continue
+            if char in {"'", '"'}:
+                quote = char
+                i += 1
+                continue
+            if char == "\\" and i + 1 < len(value):
+                i += 2
+                continue
+            if char.isspace() or char in separators:
+                break
+            i += 1
+
+        raw = value[start:i]
+        try:
+            parsed = shlex.split(raw, posix=True)
+            decoded = parsed[0] if len(parsed) == 1 else raw
+        except ValueError:
+            # An unfinished command may still be shown in progress. Preserve it
+            # byte-for-byte and use a quote-trimmed view only for flag matching.
+            decoded = raw.strip("'\"")
+        words.append((start, i, raw, decoded, segment))
+
+    return words
+
+
+def _mask_full_progress_shell_word(raw: str) -> str:
+    """Fully mask one shell word while retaining a whole-word quote pair."""
+    if len(raw) >= 2 and raw[0] in {"'", '"'} and raw[-1] == raw[0]:
+        return f"{raw[0]}{_FULL_PROGRESS_REDACTED}{raw[-1]}"
+    return _FULL_PROGRESS_REDACTED
+
+
+def _mask_full_progress_inline_cli_value(raw: str) -> str:
+    """Mask the value in one ``--flag=value`` shell word quote-safely."""
+    equals = raw.find("=")
+    if equals < 0:
+        return _mask_full_progress_shell_word(raw)
+    prefix = raw[: equals + 1]
+    cli_value = raw[equals + 1 :]
+    # A quote can wrap the complete ``--flag=value`` word rather than just the
+    # value. Its opener is already in *prefix*, so retain only the closer here.
+    if raw[0:1] in {"'", '"'} and raw[-1:] == raw[0:1]:
+        return f"{prefix}{_FULL_PROGRESS_REDACTED}{raw[-1]}"
+    return prefix + _mask_full_progress_shell_word(cli_value)
+
+
+def _is_full_progress_cli_secret_flag(flag: str, value: str) -> bool:
+    """Return whether a normalized CLI flag/value pair carries credentials."""
+    if flag in {"-u", "--user"}:
+        # ``--user alice`` is ordinary identity metadata. Curl's credential
+        # form is unambiguous because it contains the ``user:password`` colon.
+        return ":" in value
+    if not flag.startswith("--"):
+        return False
+    normalized = flag[2:].casefold().replace("-", "_")
+    return normalized in _FULL_PROGRESS_EXACT_SECRET_KEYS
+
+
+def _redact_full_progress_cli_credentials(value: str) -> str:
+    """Mask common password/token CLI values without changing shell quoting."""
+    words = _full_progress_shell_words(value)
+    replacements: list[tuple[int, int, str]] = []
+    for index, (start, end, raw, decoded, segment) in enumerate(words):
+        assignment_name, assignment_equals, _assignment_value = decoded.partition("=")
+        if (
+            assignment_equals
+            and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", assignment_name)
+            and _is_full_progress_secret_env_name(assignment_name)
+        ):
+            replacements.append(
+                (start, end, _mask_full_progress_inline_cli_value(raw))
+            )
+            continue
+
+        flag, equals, inline_value = decoded.partition("=")
+        if equals:
+            if _is_full_progress_cli_secret_flag(flag, inline_value):
+                replacements.append(
+                    (start, end, _mask_full_progress_inline_cli_value(raw))
+                )
+            continue
+
+        if index + 1 >= len(words):
+            continue
+        next_start, next_end, next_raw, next_value, next_segment = words[index + 1]
+        if next_segment != segment:
+            continue
+        if _is_full_progress_cli_secret_flag(decoded, next_value):
+            replacements.append(
+                (next_start, next_end, _mask_full_progress_shell_word(next_raw))
+            )
+
+    redacted = value
+    for start, end, replacement in reversed(replacements):
+        redacted = redacted[:start] + replacement + redacted[end:]
+    return redacted
+
+
+def _protect_full_progress_masked_shell_words(
+    value: str,
+) -> tuple[str, dict[str, str]]:
+    """Shield structurally masked shell words from lossy generic rescanning."""
+    replacements: list[tuple[int, int, str]] = []
+    protected: dict[str, str] = {}
+    for index, (start, end, raw, _decoded, _segment) in enumerate(
+        _full_progress_shell_words(value)
+    ):
+        if _FULL_PROGRESS_REDACTED not in raw:
+            continue
+        placeholder = f"__HERMES_FULL_MASKED_WORD_{index}__"
+        protected[placeholder] = raw
+        replacements.append((start, end, placeholder))
+
+    shielded = value
+    for start, end, placeholder in reversed(replacements):
+        shielded = shielded[:start] + placeholder + shielded[end:]
+    return shielded, protected
+
+
+def _restore_full_progress_masked_shell_words(
+    value: str, protected: dict[str, str]
+) -> str:
+    """Restore byte-exact masked shell words after generic redaction."""
+    for placeholder, masked_word in protected.items():
+        value = value.replace(placeholder, masked_word)
+    return value
+
+
+def _redact_full_progress_query(query: str) -> str:
+    """Mask every value in an already-isolated full-progress query string."""
+    fields = []
+    for field in query.split("&") if query else []:
+        if "=" not in field:
+            # A flag-style parameter has no value to expose.
+            fields.append(field)
+            continue
+        key, _, _value = field.partition("=")
+        fields.append(f"{key}={_FULL_PROGRESS_REDACTED}")
+    return "&".join(fields)
+
+
+def _redact_full_progress_url(match: re.Match) -> str:
+    """Strictly mask credentials in one embedded RFC-scheme URL.
+
+    Every query value and the complete fragment are masked irrespective of
+    parameter name.  Userinfo is replaced as a unit, while scheme, host, port,
+    path, and query keys remain useful for debugging.  Parsing failures fail
+    closed for the matched URL rather than returning possible credentials.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    from agent.redact import redact_sensitive_text
+
+    raw_url = match.group(0)
+    try:
+        parts = urlsplit(raw_url)
+        netloc = parts.netloc
+        if "@" in netloc:
+            _, _, hostinfo = netloc.rpartition("@")
+            netloc = f"{_FULL_PROGRESS_REDACTED}@{hostinfo}"
+
+        # Userinfo, query values, and fragments are handled structurally.  Keep
+        # the authoritative generic scanner on the path too so a vendor-shaped
+        # credential used as a path segment does not become a regression while
+        # URL spans are protected from header/config false positives.
+        path = redact_sensitive_text(parts.path, force=True)
+        query = _redact_full_progress_query(parts.query)
+        fragment = _FULL_PROGRESS_REDACTED if parts.fragment else ""
+        return urlunsplit((parts.scheme, netloc, path, query, fragment))
+    except (TypeError, ValueError):
+        return _FULL_PROGRESS_REDACTED
+
+
+def _redact_full_progress_query_only(match: re.Match) -> str:
+    """Mask a standalone OAuth/API query fragment such as ``?code=...``."""
+    query = _redact_full_progress_query(match.group("query"))
+    fragment = f"#{_FULL_PROGRESS_REDACTED}" if match.group("fragment") else ""
+    return f"?{query}{fragment}"
+
+
+def _redact_full_progress_relative_url(match: re.Match) -> str:
+    """Mask credentials in relative and network-path URL references."""
+    prefix = match.group("prefix")
+    if prefix.startswith("//"):
+        slash = prefix.find("/", 2)
+        authority_end = len(prefix) if slash < 0 else slash
+        authority = prefix[2:authority_end]
+        if "@" in authority:
+            userinfo, _, hostinfo = authority.rpartition("@")
+            if ":" in userinfo:
+                username, _, _password = userinfo.partition(":")
+                masked_userinfo = f"{username}:{_FULL_PROGRESS_REDACTED}"
+            else:
+                masked_userinfo = _FULL_PROGRESS_REDACTED
+            prefix = f"//{masked_userinfo}@{hostinfo}{prefix[authority_end:]}"
+    raw_query = match.group("query")
+    query = (
+        f"?{_redact_full_progress_query(raw_query)}"
+        if raw_query is not None
+        else ""
+    )
+    groups = match.groupdict()
+    raw_fragment = groups.get("fragment") or groups.get("fragment_only")
+    fragment = f"#{_FULL_PROGRESS_REDACTED}" if raw_fragment else ""
+    return f"{prefix}{query}{fragment}"
+
+
+def _redact_full_progress_curl_header(match: re.Match) -> str:
+    """Fully mask one credential header while preserving curl shell syntax."""
+    option = match.group("option")
+    if match.group("sq_name") is not None:
+        return (
+            f"{option}'{match.group('sq_name')}{match.group('sq_sep')}"
+            f"{_FULL_PROGRESS_REDACTED}'"
+        )
+    if match.group("dq_name") is not None:
+        return (
+            f'{option}"{match.group("dq_name")}{match.group("dq_sep")}'
+            f'{_FULL_PROGRESS_REDACTED}"'
+        )
+    return (
+        f"{option}{match.group('bare_name')}{match.group('bare_sep')}"
+        f"{_FULL_PROGRESS_REDACTED}"
+    )
+
+
+def _redact_full_progress_headers(value: str) -> str:
+    """Fully mask sensitive string/list headers, including curl ``-H`` args."""
+    redacted = _FULL_PROGRESS_CURL_HEADER_RE.sub(
+        _redact_full_progress_curl_header, value
+    )
+    return _FULL_PROGRESS_HEADER_LINE_RE.sub(
+        lambda match: (
+            f"{match.group('indent')}{match.group('name')}{match.group('sep')}"
+            f"{_FULL_PROGRESS_REDACTED}"
+        ),
+        redacted,
+    )
+
+
+def _redact_full_progress_string(value: str) -> str:
+    """Apply force-enabled redaction plus full-mode's strict string scanners."""
+    from agent.redact import redact_sensitive_text
+
+    # Preserve shell-word boundaries before the generic scanner can consume an
+    # opening quote from assignments such as NAME='value with spaces'. This
+    # masks credential CLI flags and secret ENV assignments on the original
+    # byte layout; the later pass is intentionally idempotent defense-in-depth.
+    value = _redact_full_progress_cli_credentials(value)
+    value, protected_shell_words = _protect_full_progress_masked_shell_words(value)
+
+    # Keep URL spans out of the generic text scanner: RFC permits schemes such
+    # as ``authorization://``, which the ordinary header regex would otherwise
+    # misclassify and corrupt before the strict URL scanner can parse it.
+    redacted_parts = []
+    previous_end = 0
+    for match in _FULL_PROGRESS_URL_RE.finditer(value):
+        non_url = value[previous_end : match.start()]
+        redacted_parts.append(redact_sensitive_text(non_url, force=True))
+        redacted_parts.append(_redact_full_progress_url(match))
+        previous_end = match.end()
+
+    redacted_parts.append(redact_sensitive_text(value[previous_end:], force=True))
+    redacted = "".join(redacted_parts)
+    redacted = _FULL_PROGRESS_RELATIVE_URL_RE.sub(
+        _redact_full_progress_relative_url, redacted
+    )
+    redacted = _FULL_PROGRESS_BARE_RELATIVE_URL_RE.sub(
+        _redact_full_progress_relative_url, redacted
+    )
+    # Run strict header masking after the generic pass.  Otherwise the generic
+    # API-header scanner can consume a closing quote from the ``***`` value we
+    # just produced.  A header whose value was itself a URL is now masked as a
+    # whole, while ``authorization://`` remains protected by the ``://`` guard.
+    redacted = _redact_full_progress_headers(redacted)
+    redacted = _restore_full_progress_masked_shell_words(
+        redacted, protected_shell_words
+    )
+    redacted = _redact_full_progress_cli_credentials(redacted)
+    return _FULL_PROGRESS_QUERY_ONLY_RE.sub(
+        _redact_full_progress_query_only, redacted
+    )
+
+
+def _is_full_progress_secret_key(key: str) -> bool:
+    """Return whether an argument key denotes credential-bearing content."""
+    # Split separators and camelCase before comparing semantic key components.
+    separated = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", key)
+    parts = [
+        part
+        for part in re.split(r"[^a-z0-9]+", separated.casefold())
+        if part
+    ]
+    compact = "".join(parts)
+    exact = re.sub(r"[^a-z0-9]+", "_", separated.casefold()).strip("_")
+    return bool(
+        exact in _FULL_PROGRESS_EXACT_SECRET_KEYS
+        or set(parts) & _FULL_PROGRESS_SECRET_KEY_PARTS
+        or "dsn" in parts
+        or any(
+            marker in compact
+            for marker in _FULL_PROGRESS_CONNECTION_KEY_MARKERS
+        )
+        or any(name in compact for name in _FULL_PROGRESS_SECRET_KEY_PARTS)
+        or compact in _FULL_PROGRESS_SECRET_COMPACT_KEYS
+        or any(
+            name != "key" and name in compact
+            for name in _FULL_PROGRESS_SECRET_COMPACT_KEYS
+        )
+    )
+
+
+def _is_full_progress_secret_env_name(name: str) -> bool:
+    """Classify shell ENV assignment names more conservatively than JSON keys."""
+    normalized = name.strip().upper()
+    return _is_full_progress_secret_key(name) or normalized.endswith("_KEY")
+
+
+def _redact_full_progress_args(value: Any) -> Any:
+    """Copy and chat-strictly redact a complete full-mode argument structure.
+
+    Dicts, lists, and tuples are recursively rebuilt; caller-owned tool args
+    are never mutated.  Dict keys are themselves passed through the strict
+    string redactor.  If two distinct keys collapse to the same redacted key,
+    a deterministic collision marker keeps both fields instead of silently
+    overwriting one.  Values under secret-like keys are fully masked before
+    JSON serialization, preventing quote escaping from exposing a suffix.
+    """
+    if isinstance(value, dict):
+        redacted_dict: dict[str, Any] = {}
+        for raw_key, raw_value in value.items():
+            original_key = str(raw_key)
+            safe_key = _redact_full_progress_string(original_key)
+            if safe_key in redacted_dict:
+                collision = 2
+                base_key = safe_key
+                while safe_key in redacted_dict:
+                    safe_key = f"{base_key} «redacted-key-collision-{collision}»"
+                    collision += 1
+            redacted_dict[safe_key] = (
+                _FULL_PROGRESS_REDACTED
+                if _is_full_progress_secret_key(original_key)
+                else _redact_full_progress_args(raw_value)
+            )
+        return redacted_dict
+    if isinstance(value, list):
+        return [_redact_full_progress_args(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_full_progress_args(item) for item in value)
+    if isinstance(value, str):
+        return _redact_full_progress_string(value)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    # ``json.dumps(default=str)`` would stringify unknown objects only after the
+    # safety boundary.  Convert and redact them here so no raw representation
+    # can enter the queue.
+    return _redact_full_progress_string(str(value))
+
+
+async def _await_exact_task_through_cancellation(
+    task: asyncio.Task,
+) -> tuple[Any, bool]:
+    """Await one child despite repeated cancellation of its parent waiter.
+
+    Returns the child's result and whether parent cancellation was observed.
+    Every wait is shielded, so another cancellation cannot reach the exact
+    once-created child. A cancellation originating from the child itself is
+    propagated immediately rather than mistaken for a parent cancellation.
+    """
+    parent_cancelled = False
+    while True:
+        try:
+            return await asyncio.shield(task), parent_cancelled
+        except asyncio.CancelledError:
+            if task.cancelled():
+                raise
+            parent_cancelled = True
+            if task.done():
+                return task.result(), parent_cancelled
+
+
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
     r"auxiliary\s+.+\s+failed"
@@ -98,6 +641,7 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"|configured\s+auxiliary\s+compression\s+provider\s+.+\s+unavailable"
     r"|skipping\s+concurrent\s+compression"
     r"|compacting\s+context\s+[—-]\s+summarizing\s+earlier\s+conversation"
+    rf"|{re.escape(COMPACTION_DONE_STATUS)}"
     r"|resumed\s+after\s+\d+s\s+idle\s+[—-]\s+compacting"
     r"|preflight\s+compression"
     r"|pre[- ]api\s+compression"
@@ -169,6 +713,7 @@ _COMPRESSION_PROGRESS_STATUS_RE = re.compile(
         _status_template_to_regex(_template)
         for _template in (
             COMPACTION_STATUS,
+            COMPACTION_DONE_STATUS,
             PRE_API_COMPRESSION_STATUS_TEMPLATE,
             PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
             IDLE_COMPACTION_STATUS_TEMPLATE,
@@ -659,6 +1204,27 @@ async def _send_or_update_status_coro(adapter, chat_id, status_key, content, met
     if callable(sender):
         return await sender(chat_id, status_key, content, metadata=metadata)
     return await adapter.send(chat_id, content, metadata=metadata)
+
+
+def _adapter_supports_progress_message_editing(adapter: Any) -> bool:
+    """Return whether ``adapter`` can maintain one editable progress bubble.
+
+    The explicit capability flag wins when an adapter declares itself
+    non-editable. Otherwise preserve the gateway's historical duck-typing
+    contract: only a concrete ``edit_message`` override counts as support.
+    """
+    if adapter is None:
+        return False
+    try:
+        if getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True) is False:
+            return False
+    except Exception:
+        return False
+    adapter_edit = getattr(type(adapter), "edit_message", None)
+    return (
+        adapter_edit is not None
+        and adapter_edit is not BasePlatformAdapter.edit_message
+    )
 
 
 def _resolve_progress_thread_id(
@@ -3569,9 +4135,38 @@ class TurnRunner:
     def __init__(self, runner: "GatewayRunner", ctx: TurnContext) -> None:
         self._runner = runner
         self._ctx = ctx
+        self._progress_ingress_lock = threading.RLock()
+        self._progress_ingress_open = threading.Event()
+        self._progress_ingress_open.set()
+
+    def close_progress_ingress(self) -> None:
+        """Fence worker/status callbacks before the progress rail is drained."""
+        with self._progress_ingress_lock:
+            self._progress_ingress_open.clear()
+
+    def _enqueue_progress_if_open(self, raw: Any) -> None:
+        """Atomically admit one callback-owned event before cleanup closes."""
+        with self._progress_ingress_lock:
+            if not self._progress_ingress_open.is_set():
+                return
+            if self._ctx.progress_queue is not None:
+                self._ctx.progress_queue.put(raw)
 
     def progress_callback(self, event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
         """Callback invoked by agent on tool lifecycle events."""
+        with self._progress_ingress_lock:
+            if not self._progress_ingress_open.is_set():
+                return
+            return self._progress_callback_open(
+                event_type,
+                tool_name,
+                preview,
+                args,
+                **kwargs,
+            )
+
+    def _progress_callback_open(self, event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
+        """Render one callback already admitted through the ingress fence."""
         ctx = self._ctx
         # Live status line (Slack's assistant status): stash the current
         # tool phrase on the adapter; the _keep_typing refresh renders it
@@ -3726,7 +4321,6 @@ class TurnRunner:
             and isinstance(args.get("command"), str)
             and args["command"].strip()
         ):
-            from agent.display import get_tool_preview_max_len
             _cmd_full = args["command"].rstrip()
             # Consecutive terminal calls: drop the repeated
             # "💻 terminal" header so back-to-back commands render as
@@ -3736,7 +4330,7 @@ class TurnRunner:
             )
             _code_block_full = f"{_block_header}```\n{_cmd_full}\n```"
             # Single-line, capped preview for non-verbose modes.
-            _pl = get_tool_preview_max_len()
+            _pl = ctx.tool_preview_max_len
             _cap = _pl if _pl > 0 else 40
             _lines = _cmd_full.splitlines()
             _cmd_short = _lines[0] if _lines else _cmd_full
@@ -3746,6 +4340,20 @@ class TurnRunner:
             elif _multiline:
                 _cmd_short = _cmd_short + " ..."
             _code_block_short = f"{_block_header}```\n{_cmd_short}\n```"
+
+        # Full mode is an explicit gateway debugging surface. Build a new,
+        # recursively redacted argument structure before JSON escaping, never
+        # consult tool_preview_length, and mark the queue entry structurally
+        # so only this mode receives lossless continuation splitting.
+        if ctx.progress_mode == "full":
+            full_args = args if isinstance(args, dict) else {}
+            safe_args = _redact_full_progress_args(full_args)
+            args_str = json.dumps(safe_args, ensure_ascii=False, default=str)
+            safe_tool_name = _redact_full_progress_string(str(tool_name))
+            msg = f"{emoji} {safe_tool_name}\n{args_str}"
+            ctx.last_was_terminal_block[0] = False
+            ctx.progress_queue.put(("__full__", msg))
+            return
 
         # Verbose mode: show detailed arguments, respects tool_preview_length
         if ctx.progress_mode == "verbose":
@@ -3774,20 +4382,62 @@ class TurnRunner:
         # "all" / "new" modes: short preview, respects tool_preview_length
         # config (defaults to 40 chars when unset to keep gateway messages
         # compact — unlike CLI spinners, these persist as permanent messages).
+        # An opt-in first-line comment description takes precedence over the
+        # compact command/code preview. Detailed modes returned above, so the
+        # option cannot alter verbose/full/log output. The prepared description
+        # is inert untrusted text and never carries link metadata.
+        _comment_preview = None
+        _rendered_comment = None
+        if ctx.tool_progress_comment_descriptions and ctx.progress_mode in {
+            "all",
+            "new",
+        }:
+            from agent.display import prepare_tool_progress_comment_description
+
+            _pl = ctx.tool_preview_max_len
+            _cap = _pl if _pl > 0 else 40
+            _comment_preview = prepare_tool_progress_comment_description(
+                tool_name,
+                args,
+                max_len=_cap,
+            )
+            if _comment_preview is not None:
+                if _progress_adapter is not None:
+                    _rendered_comment = getattr(
+                        _progress_adapter, "format_tool_preview"
+                    )(_comment_preview)
+                else:
+                    _rendered_comment = _comment_preview.text
+
         # Terminal commands on markdown platforms get a single-line capped
-        # fenced block (built above) instead of the truncated preview.
-        if _code_block_short is not None:
+        # fenced block (built above) instead of the truncated preview when no
+        # valid opt-in comment description exists.
+        if _comment_preview is not None:
+            from agent.display import get_tool_verb
+
+            _verb = get_tool_verb(
+                tool_name,
+                friendly_labels=ctx.friendly_tool_labels,
+            )
+            if _verb:
+                msg = f"{emoji} {_verb}: {_rendered_comment}"
+            else:
+                msg = (
+                    f"{emoji} {tool_name}: "
+                    f"{json.dumps(_rendered_comment, ensure_ascii=False)}"
+                )
+            ctx.last_was_terminal_block[0] = False
+        elif _code_block_short is not None:
             msg = _code_block_short
             ctx.last_was_terminal_block[0] = True
         elif preview:
             from agent.display import (
-                get_tool_preview_max_len,
                 get_tool_verb,
                 prepare_tool_preview,
                 tool_verb_connector,
                 verb_drops_preview,
             )
-            _pl = get_tool_preview_max_len()
+            _pl = ctx.tool_preview_max_len
             _cap = _pl if _pl > 0 else 40
             _prepared_preview = prepare_tool_preview(
                 tool_name,
@@ -3804,7 +4454,10 @@ class TurnRunner:
             # onto the preview the callback already computed (so the
             # command/url/query is preserved).  Custom/plugin/MCP tools
             # have no verb and fall back to the raw "tool_name: ..." form.
-            _verb = get_tool_verb(tool_name)
+            _verb = get_tool_verb(
+                tool_name,
+                friendly_labels=ctx.friendly_tool_labels,
+            )
             if _verb:
                 if verb_drops_preview(tool_name):
                     msg = f"{emoji} {_verb}"
@@ -3846,8 +4499,7 @@ class TurnRunner:
         # getattr, not attribute access: duck-typed adapters (test fakes,
         # minimal plugin adapters) may not define edit_message at all —
         # "missing" means the same thing as "base no-op": can't edit.
-        _adapter_edit = getattr(type(adapter), "edit_message", None)
-        if _adapter_edit is None or _adapter_edit is BasePlatformAdapter.edit_message:
+        if not _adapter_supports_progress_message_editing(adapter):
             while not ctx.progress_queue.empty():
                 try:
                     ctx.progress_queue.get_nowait()
@@ -3916,14 +4568,92 @@ class TurnRunner:
                 kwargs["metadata"] = ctx._progress_metadata
             return await adapter.edit_message(**kwargs)
 
+        _LIFECYCLE_LINE = "__lifecycle_progress_line__"
+
+        def _lifecycle_line(
+            text: str,
+            *,
+            key: Optional[str] = None,
+            ack: Optional[asyncio.Future] = None,
+        ) -> tuple:
+            return (_LIFECYCLE_LINE, key, str(text), ack)
+
+        def _line_text(line: Any) -> str:
+            if (
+                isinstance(line, tuple)
+                and len(line) == 4
+                and line[0] == _LIFECYCLE_LINE
+            ):
+                return str(line[2])
+            return str(line)
+
+        def _line_key(line: Any) -> Optional[str]:
+            if (
+                isinstance(line, tuple)
+                and len(line) == 4
+                and line[0] == _LIFECYCLE_LINE
+            ):
+                return line[1]
+            return None
+
+        def _line_ack(line: Any) -> Optional[asyncio.Future]:
+            if (
+                isinstance(line, tuple)
+                and len(line) == 4
+                and line[0] == _LIFECYCLE_LINE
+            ):
+                ack = line[3]
+                return ack if isinstance(ack, asyncio.Future) else None
+            return None
+
+        def _resolve_progress_acks(lines: list, delivered: bool) -> None:
+            for line in lines:
+                ack = _line_ack(line)
+                if ack is not None and not ack.done():
+                    ack.set_result(bool(delivered))
+
+        def _resolve_raw_progress_ack(raw: Any, delivered: bool) -> None:
+            if (
+                isinstance(raw, tuple)
+                and raw
+                and raw[0] in {"__terminal__", "__flush__"}
+            ):
+                ack = raw[-1]
+                if isinstance(ack, asyncio.Future) and not ack.done():
+                    ack.set_result(bool(delivered))
+
         def _progress_text(lines: list) -> str:
-            return "\n".join(str(line) for line in lines)
+            return "\n".join(
+                text
+                for text in (_line_text(line) for line in lines)
+                if text
+            )
 
         def _split_progress_groups(lines: list) -> list[list]:
-            """Partition progress lines into platform-sized editable bubbles."""
+            """Partition progress while keeping keyed state mutable before barriers."""
+            ordered_lines: list = []
+            segment: list = []
+
+            def _append_mutable_segment() -> None:
+                ordered_lines.extend(
+                    line for line in segment if _line_key(line) is None
+                )
+                ordered_lines.extend(
+                    line for line in segment if _line_key(line) is not None
+                )
+                segment.clear()
+
+            for line in lines:
+                if _line_ack(line) is not None:
+                    _append_mutable_segment()
+                    ordered_lines.append(line)
+                else:
+                    segment.append(line)
+            _append_mutable_segment()
+
             groups: list[list] = []
             current: list = []
-            for line in lines:
+            for line in ordered_lines:
                 candidate = current + [line]
                 if current and _progress_len_fn(_progress_text(candidate)) > _PROGRESS_TEXT_LIMIT:
                     groups.append(current)
@@ -3933,6 +4663,33 @@ class TurnRunner:
             if current:
                 groups.append(current)
             return groups
+
+        def _split_full_entry(entry: str) -> list[str]:
+            """Losslessly split one marked full entry by adapter length."""
+            if _progress_len_fn(entry) <= _PROGRESS_TEXT_LIMIT:
+                return [entry]
+            chunks: list[str] = []
+            remaining = entry
+            while remaining:
+                if _progress_len_fn(remaining) <= _PROGRESS_TEXT_LIMIT:
+                    chunks.append(remaining)
+                    break
+                low, high, best = 1, len(remaining), 0
+                while low <= high:
+                    mid = (low + high) // 2
+                    if _progress_len_fn(remaining[:mid]) <= _PROGRESS_TEXT_LIMIT:
+                        best = mid
+                        low = mid + 1
+                    else:
+                        high = mid - 1
+                # Pathological adapters may report a single code point over
+                # their limit. Advancing one point guarantees termination and
+                # preserves the exact original text as documented best effort.
+                if best == 0:
+                    best = 1
+                chunks.append(remaining[:best])
+                remaining = remaining[best:]
+            return chunks
 
         def _track_progress_result(result) -> None:
             if (
@@ -3952,13 +4709,79 @@ class TurnRunner:
             _track_progress_result(result)
             return result
 
+        async def _send_separate_progress_text(text: str):
+            """Send one immutable bubble while retaining only unacknowledged text."""
+            nonlocal progress_lines
+            progress_lines = [text]
+            send_task = asyncio.create_task(_send_progress_text(text))
+            result, parent_cancelled = await _await_exact_task_through_cancellation(
+                send_task
+            )
+            if getattr(result, "success", False):
+                progress_lines = []
+            return result, parent_cancelled
+
+        async def _finalize_progress_before_full_split() -> None:
+            """Close the ordinary editable buffer before direct full chunks."""
+            nonlocal progress_msg_id, progress_lines, can_edit
+            if progress_lines:
+                buffered_text = _progress_text(progress_lines)
+                if can_edit and progress_msg_id is not None:
+                    try:
+                        result = await _edit_progress_message(
+                            progress_msg_id, buffered_text
+                        )
+                    except Exception:
+                        result = None
+                    if result is None or not result.success:
+                        can_edit = False
+                        await _send_progress_text(buffered_text)
+                elif can_edit and progress_msg_id is None:
+                    await _send_progress_text(buffered_text)
+                # With can_edit=False, ordinary lines were already sent one at
+                # a time by the fallback/separate path.
+            progress_msg_id = None
+            progress_lines = []
+
+        async def _send_oversized_full_entry(entry: str) -> bool:
+            """Direct-send one oversized marked full entry losslessly."""
+            nonlocal progress_msg_id, progress_lines
+            if _progress_len_fn(entry) <= _PROGRESS_TEXT_LIMIT:
+                return False
+
+            cancellation_requested = False
+            finalize_task = asyncio.create_task(
+                _finalize_progress_before_full_split()
+            )
+            _, finalize_cancelled = await _await_exact_task_through_cancellation(
+                finalize_task
+            )
+            cancellation_requested |= finalize_cancelled
+
+            for chunk in _split_full_entry(entry):
+                send_task = asyncio.create_task(_send_progress_text(chunk))
+                _, send_cancelled = await _await_exact_task_through_cancellation(
+                    send_task
+                )
+                cancellation_requested |= send_cancelled
+
+            # Continuations are immutable terminal bubbles. A later tool starts
+            # fresh and can never edit the final continuation chunk.
+            progress_msg_id = None
+            progress_lines = []
+            ctx.last_progress_msg[0] = None
+            ctx.repeat_count[0] = 0
+            if cancellation_requested:
+                raise asyncio.CancelledError
+            return True
+
         async def _roll_progress_overflow_if_needed() -> bool:
             """Start fresh editable progress bubbles before a bubble exceeds limit.
 
                 Returns True when it delivered/split the current buffer, or when
-                a transient edit failure left the buffer and message identity
-                intact for a later retry.  In either case the caller should skip
-                the normal send/edit path for this tick.
+                a delivery failure left the unacknowledged buffer intact for a
+                later retry.  In either case the caller should skip the normal
+                send/edit path for this tick.
                 """
             nonlocal progress_msg_id, progress_lines, can_edit
             if not progress_lines or not can_edit:
@@ -3980,28 +4803,50 @@ class TurnRunner:
                     can_edit = False
                     # Fall back to the existing non-edit behavior below.
                     return False
+                _resolve_progress_acks(groups[0], True)
             else:
                 result = await _send_progress_text(first_text)
-                if result.success and result.message_id:
-                    progress_msg_id = result.message_id
+                if not result.success:
+                    progress_msg_id = None
+                    progress_lines = [line for group in groups for line in group]
+                    return True
+                progress_msg_id = result.message_id
+                _resolve_progress_acks(groups[0], True)
 
-            for group in groups[1:]:
+            newest_group: list = []
+            newest_message_id = progress_msg_id
+            for index, group in enumerate(groups[1:], start=1):
                 result = await _send_progress_text(_progress_text(group))
-                if result.success and result.message_id:
-                    progress_msg_id = result.message_id
+                if not result.success:
+                    progress_lines = [
+                        line for pending in groups[index:] for line in pending
+                    ]
+                    progress_msg_id = None
+                    return True
+                _resolve_progress_acks(group, True)
+                newest_group = group if result.message_id else []
+                newest_message_id = result.message_id
 
-            # The newest continuation is now the only mutable bubble.  Keep
-            # just its lines so subsequent edits update it instead of
-            # replaying the full historical transcript into new messages.
-            progress_lines = groups[-1]
+            # Only an identified continuation remains mutable.  Successful
+            # sends without an ID are delivered immutable bubbles and must not
+            # remain retry/edit authority or inherit the prior bubble's ID.
+            progress_msg_id = newest_message_id
+            progress_lines = newest_group
+            if progress_msg_id is None:
+                can_edit = False
             return True
 
+        _cancelled_while_idle = False
         while True:
             try:
+                if _cancelled_while_idle:
+                    raise asyncio.CancelledError
                 if not ctx._run_still_current():
                     while not ctx.progress_queue.empty():
                         try:
-                            ctx.progress_queue.get_nowait()
+                            _resolve_raw_progress_ack(
+                                ctx.progress_queue.get_nowait(), False
+                            )
                         except Exception:
                             break
                     return
@@ -4019,17 +4864,82 @@ class TurnRunner:
                         _agent_for_interrupt, "is_interrupted", False
                     ):
                         # Drop this event and continue draining.
+                        _resolve_raw_progress_ack(raw, False)
                         await asyncio.sleep(0)
                         continue
                 except Exception:
                     pass
 
+                # Marked full entries alone receive mode-isolated direct
+                # splitting. Content is never inspected to infer the mode.
+                if (
+                    isinstance(raw, tuple)
+                    and len(raw) == 2
+                    and raw[0] == "__full__"
+                ):
+                    msg = str(raw[1])
+                    if await _send_oversized_full_entry(msg):
+                        _last_edit_ts = time.monotonic()
+                        await asyncio.sleep(0.3)
+                        if ctx._run_still_current():
+                            await adapter.send_typing(
+                                ctx.source.chat_id,
+                                metadata=ctx._progress_metadata,
+                            )
+                        continue
+                    progress_lines.append(msg)
+                elif (
+                    isinstance(raw, tuple)
+                    and len(raw) == 3
+                    and raw[0] == "__upsert__"
+                ):
+                    _, key, text = raw
+                    progress_lines = [
+                        line for line in progress_lines if _line_key(line) != key
+                    ]
+                    line = _lifecycle_line(str(text), key=str(key))
+                    progress_lines.append(line)
+                    msg = _line_text(line)
+                elif (
+                    isinstance(raw, tuple)
+                    and len(raw) == 3
+                    and raw[0] == "__terminal__"
+                ):
+                    _, text, ack = raw
+                    line = _lifecycle_line(str(text), ack=ack)
+                    progress_lines.append(line)
+                    msg = _line_text(line)
+                elif (
+                    isinstance(raw, tuple)
+                    and len(raw) == 2
+                    and raw[0] == "__flush__"
+                ):
+                    _, ack = raw
+                    if not progress_lines:
+                        if isinstance(ack, asyncio.Future) and not ack.done():
+                            ack.set_result(True)
+                        continue
+                    line = _lifecycle_line("", ack=ack)
+                    progress_lines.append(line)
+                    msg = _progress_text(progress_lines)
                 # Handle dedup messages: update last line with repeat counter
-                if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
+                elif isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                     _, base_msg, count = raw
-                    if progress_lines:
-                        progress_lines[-1] = f"{base_msg} (×{count + 1})"
-                    msg = progress_lines[-1] if progress_lines else base_msg
+                    replacement = f"{base_msg} (×{count + 1})"
+                    target_index = next(
+                        (
+                            index
+                            for index in range(len(progress_lines) - 1, -1, -1)
+                            if _line_text(progress_lines[index]) == base_msg
+                            or _line_text(progress_lines[index]).startswith(
+                                f"{base_msg} (×"
+                            )
+                        ),
+                        None,
+                    )
+                    if target_index is not None:
+                        progress_lines[target_index] = replacement
+                    msg = replacement
                 elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
                     # Content bubble just landed on the platform — close off
                     # the current tool-progress bubble so the next tool
@@ -4040,6 +4950,7 @@ class TurnRunner:
                     # on the content side. (Issue: tool + content
                     # linearization regression after PR #7885.)
                     progress_msg_id = None
+                    _resolve_progress_acks(progress_lines, False)
                     progress_lines = []
                     ctx.last_progress_msg[0] = None
                     ctx.repeat_count[0] = 0
@@ -4066,14 +4977,23 @@ class TurnRunner:
                     # drain any additional queued messages before sending
                     # a single batched edit.
                     await asyncio.sleep(_remaining)
-                    continue
+                    if not ctx.progress_queue.empty():
+                        continue
 
                 if not ctx._run_still_current():
+                    _resolve_progress_acks(progress_lines, False)
+                    while not ctx.progress_queue.empty():
+                        try:
+                            _resolve_raw_progress_ack(
+                                ctx.progress_queue.get_nowait(), False
+                            )
+                        except Exception:
+                            break
                     return
 
                 if can_edit and progress_msg_id is not None:
                     # Try to edit the existing progress message
-                    full_text = "\n".join(progress_lines)
+                    full_text = _progress_text(progress_lines)
                     result = await _edit_progress_message(progress_msg_id, full_text)
                     if not result.success:
                         _err = (getattr(result, "error", "") or "").lower()
@@ -4100,9 +5020,12 @@ class TurnRunner:
                             can_edit = False
                         _flood_result = await adapter.send(
                             chat_id=ctx.source.chat_id,
-                            content=msg,
+                            content=str(msg),
                             reply_to=ctx._progress_reply_to,
                             metadata=ctx._progress_metadata,
+                        )
+                        _resolve_raw_progress_ack(
+                            raw, bool(getattr(_flood_result, "success", False))
                         )
                         if (
                             ctx._cleanup_progress
@@ -4110,10 +5033,13 @@ class TurnRunner:
                             and getattr(_flood_result, "message_id", None)
                         ):
                             ctx._cleanup_msg_ids.append(str(_flood_result.message_id))
+                    else:
+                        _resolve_progress_acks(progress_lines, True)
                 else:
+                    parent_cancelled = False
                     if can_edit:
                         # First tool: send all accumulated text as new message
-                        full_text = "\n".join(progress_lines)
+                        full_text = _progress_text(progress_lines)
                         result = await adapter.send(
                             chat_id=ctx.source.chat_id,
                             content=full_text,
@@ -4121,17 +5047,31 @@ class TurnRunner:
                             metadata=ctx._progress_metadata,
                         )
                     else:
-                        # Editing unsupported: send just this line
-                        result = await adapter.send(
-                            chat_id=ctx.source.chat_id,
-                            content=msg,
-                            reply_to=ctx._progress_reply_to,
-                            metadata=ctx._progress_metadata,
+                        # Separate bubbles are immutable. Shield the exact send
+                        # so parent cancellation cannot make its acknowledgement
+                        # ambiguous and leave only unacknowledged text pending.
+                        result, parent_cancelled = (
+                            await _send_separate_progress_text(str(msg))
                         )
-                    if result.success and result.message_id:
-                        progress_msg_id = result.message_id
-                        if ctx._cleanup_progress:
+                    if result.success:
+                        if result.message_id:
+                            progress_msg_id = result.message_id
+                        if can_edit:
+                            _resolve_progress_acks(progress_lines, True)
+                            if not result.message_id:
+                                # The payload was delivered but cannot be
+                                # edited. Close this immutable bubble so
+                                # cleanup/future updates never resend it.
+                                can_edit = False
+                                progress_lines = []
+                        else:
+                            _resolve_raw_progress_ack(raw, True)
+                        if ctx._cleanup_progress and can_edit:
                             ctx._cleanup_msg_ids.append(str(result.message_id))
+                    elif not result.success:
+                        _resolve_raw_progress_ack(raw, False)
+                    if parent_cancelled:
+                        raise asyncio.CancelledError
 
                 _last_edit_ts = time.monotonic()
 
@@ -4141,16 +5081,122 @@ class TurnRunner:
                     await adapter.send_typing(ctx.source.chat_id, metadata=ctx._progress_metadata)
 
             except queue.Empty:
-                await asyncio.sleep(0.3)
+                try:
+                    await asyncio.sleep(0.3)
+                except asyncio.CancelledError:
+                    # A sibling ``except asyncio.CancelledError`` cannot catch
+                    # cancellation raised inside this queue.Empty handler.
+                    # Re-enter the protected try and raise there so the single
+                    # lossless drain below handles already-admitted events.
+                    _cancelled_while_idle = True
+                    continue
             except asyncio.CancelledError:
-                # Drain remaining queued messages
-                while not ctx.progress_queue.empty():
+                # In separate mode, ``progress_lines`` is only the current
+                # unacknowledged payload. Finish it before draining later queue
+                # entries; every exact send remains shielded from repeated
+                # parent cancellation.
+                pending_retry_failed = False
+                if not can_edit and progress_lines:
+                    try:
+                        pending_text = _progress_text(progress_lines)
+                        result, _ = await _send_separate_progress_text(pending_text)
+                        if result.success and result.message_id:
+                            progress_msg_id = result.message_id
+                        elif not result.success:
+                            pending_retry_failed = True
+                    except Exception:
+                        pending_retry_failed = True
+
+                # Drain remaining queued messages only after the prior payload
+                # is acknowledged; otherwise a later item would overwrite the
+                # sole retained unacknowledged payload.
+                while not pending_retry_failed and not ctx.progress_queue.empty():
                     try:
                         raw = ctx.progress_queue.get_nowait()
-                        if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
+                        if (
+                            isinstance(raw, tuple)
+                            and len(raw) == 2
+                            and raw[0] == "__full__"
+                        ):
+                            full_msg = str(raw[1])
+                            if not await _send_oversized_full_entry(full_msg):
+                                if can_edit:
+                                    progress_lines.append(full_msg)
+                                    await _roll_progress_overflow_if_needed()
+                                    if progress_msg_id is None:
+                                        result = await _send_progress_text(
+                                            _progress_text(progress_lines)
+                                        )
+                                        if result.success and result.message_id:
+                                            progress_msg_id = result.message_id
+                                else:
+                                    result, _ = await _send_separate_progress_text(
+                                        full_msg
+                                    )
+                                    if result.success and result.message_id:
+                                        progress_msg_id = result.message_id
+                                    elif not result.success:
+                                        break
+                        elif (
+                            isinstance(raw, tuple)
+                            and len(raw) == 3
+                            and raw[0] == "__upsert__"
+                        ):
+                            _, key, text = raw
+                            progress_lines = [
+                                line
+                                for line in progress_lines
+                                if _line_key(line) != key
+                            ]
+                            progress_lines.append(
+                                _lifecycle_line(str(text), key=str(key))
+                            )
+                            await _roll_progress_overflow_if_needed()
+                        elif (
+                            isinstance(raw, tuple)
+                            and len(raw) == 3
+                            and raw[0] == "__terminal__"
+                        ):
+                            _, text, ack = raw
+                            progress_lines.append(
+                                _lifecycle_line(str(text), ack=ack)
+                            )
+                            await _roll_progress_overflow_if_needed()
+                        elif (
+                            isinstance(raw, tuple)
+                            and len(raw) == 2
+                            and raw[0] == "__flush__"
+                        ):
+                            _, ack = raw
+                            if not progress_lines:
+                                if (
+                                    isinstance(ack, asyncio.Future)
+                                    and not ack.done()
+                                ):
+                                    ack.set_result(True)
+                            else:
+                                progress_lines.append(
+                                    _lifecycle_line("", ack=ack)
+                                )
+                                await _roll_progress_overflow_if_needed()
+                        elif isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                             _, base_msg, count = raw
-                            if progress_lines:
-                                progress_lines[-1] = f"{base_msg} (×{count + 1})"
+                            replacement = f"{base_msg} (×{count + 1})"
+                            target_index = next(
+                                (
+                                    index
+                                    for index in range(
+                                        len(progress_lines) - 1, -1, -1
+                                    )
+                                    if _line_text(progress_lines[index]) == base_msg
+                                    or _line_text(progress_lines[index]).startswith(
+                                        f"{base_msg} (×"
+                                    )
+                                ),
+                                None,
+                            )
+                            if target_index is not None:
+                                progress_lines[target_index] = replacement
                                 await _roll_progress_overflow_if_needed()
                         elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
                             # Content-bubble marker during drain: close off
@@ -4164,23 +5210,61 @@ class TurnRunner:
                                 except Exception:
                                     pass
                             progress_msg_id = None
+                            _resolve_progress_acks(progress_lines, False)
                             progress_lines = []
                             ctx.last_progress_msg[0] = None
                             ctx.repeat_count[0] = 0
-                        else:
+                        elif can_edit:
                             progress_lines.append(raw)
                             await _roll_progress_overflow_if_needed()
+                        else:
+                            result, _ = await _send_separate_progress_text(str(raw))
+                            if result.success and result.message_id:
+                                progress_msg_id = result.message_id
+                            elif not result.success:
+                                break
                     except Exception:
                         break
-                # Final edit with all remaining tools (only if editing works)
-                if can_edit and progress_lines and progress_msg_id:
-                    await _roll_progress_overflow_if_needed()
-                if can_edit and progress_lines and progress_msg_id:
+                # Finalize any buffered progress exactly once. A cancellation
+                # may arrive after the queue item was consumed but before the
+                # first send, so ``progress_msg_id`` can legitimately be absent.
+                if progress_lines:
                     full_text = _progress_text(progress_lines)
-                    try:
-                        await _edit_progress_message(progress_msg_id, full_text)
-                    except Exception:
-                        pass
+                    if can_edit:
+                        await _roll_progress_overflow_if_needed()
+                        if progress_msg_id:
+                            try:
+                                result = await _edit_progress_message(
+                                    progress_msg_id, full_text
+                                )
+                                _resolve_progress_acks(
+                                    progress_lines,
+                                    bool(getattr(result, "success", False)),
+                                )
+                            except Exception:
+                                _resolve_progress_acks(progress_lines, False)
+                        else:
+                            try:
+                                result = await _send_progress_text(full_text)
+                                if result.success:
+                                    if result.message_id:
+                                        progress_msg_id = result.message_id
+                                    _resolve_progress_acks(progress_lines, True)
+                                else:
+                                    _resolve_progress_acks(progress_lines, False)
+                            except Exception:
+                                _resolve_progress_acks(progress_lines, False)
+                    else:
+                        try:
+                            result, _ = await _send_separate_progress_text(full_text)
+                            if result.success:
+                                if result.message_id:
+                                    progress_msg_id = result.message_id
+                                _resolve_progress_acks(progress_lines, True)
+                            else:
+                                _resolve_progress_acks(progress_lines, False)
+                        except Exception:
+                            _resolve_progress_acks(progress_lines, False)
                 return
             except Exception as e:
                 logger.error("Progress message error: %s", e)
@@ -4245,8 +5329,18 @@ class TurnRunner:
             logger.debug("event_callback hook error: %s", _e)
 
     def _status_callback_sync(self, event_type: str, message: str) -> None:
+        with self._progress_ingress_lock:
+            if not self._progress_ingress_open.is_set():
+                return
+            return self._status_callback_open(event_type, message)
+
+    def _status_callback_open(self, event_type: str, message: str) -> None:
+        """Handle one status callback already admitted through the fence."""
         ctx = self._ctx
-        if not ctx._status_adapter or not ctx._run_still_current():
+        if (
+            not ctx._status_adapter
+            or not ctx._run_still_current()
+        ):
             return
         prepared_message = _prepare_gateway_status_message(
             ctx.source.platform,
@@ -4260,6 +5354,22 @@ class TurnRunner:
                 event_type,
                 _redact_gateway_user_facing_secrets(str(message or ""))[:160],
             )
+            return
+        # Routine automatic compaction is part of the same per-turn working
+        # transcript as tool progress. On an editable, accumulated chat
+        # surface, enqueue it so the start creates an immediate bubble and the
+        # completion plus later tool calls edit that SAME bubble. Explicit
+        # ``separate`` mode, raw/programmatic surfaces, non-editable adapters,
+        # failures, and manual /compress feedback retain the standalone status
+        # path below.
+        if (
+            ctx.progress_queue is not None
+            and ctx.progress_grouping != "separate"
+            and not _gateway_surface_passes_raw_text(ctx.source.platform)
+            and _COMPRESSION_PROGRESS_STATUS_RE.search(prepared_message)
+            and _adapter_supports_progress_message_editing(ctx._status_adapter)
+        ):
+            ctx.progress_queue.put(prepared_message)
             return
         _fut = safe_schedule_threadsafe(
             _send_or_update_status_coro(ctx._status_adapter, ctx._status_chat_id, event_type, prepared_message, ctx._status_thread_metadata),
@@ -4401,7 +5511,11 @@ class TurnRunner:
                         config=_consumer_cfg,
                         metadata=ctx._status_thread_metadata,
                         on_new_message=(
-                            (lambda: ctx.progress_queue.put(("__reset__",)))
+                            (
+                                lambda: self._enqueue_progress_if_open(
+                                    ("__reset__",)
+                                )
+                            )
                             if ctx.progress_queue is not None
                             else None
                         ),
@@ -5616,6 +6730,10 @@ class TurnRunner:
             "partial": ctx.result_holder[0].get("partial", False) if ctx.result_holder[0] else False,
             "error": ctx.result_holder[0].get("error") if ctx.result_holder[0] else None,
             "interrupt_message": ctx.result_holder[0].get("interrupt_message") if ctx.result_holder[0] else None,
+            "compression_exhausted": (
+                ctx.result_holder[0].get("compression_exhausted", False)
+                if ctx.result_holder[0] else False
+            ),
             # Soft lock-contention defer (#69870 consumer): distinct from
             # compression_exhausted so the gateway never auto-resets a
             # session that a concurrent compressor is about to shrink.
@@ -16156,6 +17274,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
+        _complete_lifecycle_progress = None
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
         _reply_id = getattr(event, "reply_to_message_id", None)
@@ -17403,6 +18522,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=event.message_type,
+                defer_terminal_lifecycle_progress=True,
+            )
+            _complete_lifecycle_progress = agent_result.get(
+                "_complete_lifecycle_progress"
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -17786,6 +18909,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "maximum context size and could not be compressed further. "
                     "Your next message will start a fresh session."
                 )
+                if callable(_complete_lifecycle_progress):
+                    try:
+                        _terminal_delivered = bool(
+                            await _complete_lifecycle_progress(response)
+                        )
+                        # The callback returned, so it owns a closed/drained
+                        # rail regardless of delivery success. Do not invoke it
+                        # a second time from the handler finally block.
+                        _complete_lifecycle_progress = None
+                    except Exception:
+                        _terminal_delivered = False
+                        logger.warning(
+                            "Terminal lifecycle progress delivery failed for "
+                            "session %s; preserving assistant fallback.",
+                            session_entry.session_id,
+                            exc_info=True,
+                        )
+                    if _terminal_delivered:
+                        # The exact terminal text (including reset outcome) is
+                        # already visible in the progress rail. Suppress only
+                        # this duplicate assistant fallback; all persistence and
+                        # reset bookkeeping above remains unchanged.
+                        response = ""
 
             ts = time.time()  # Unix epoch float — consistent with DB storage
             
@@ -18133,6 +19279,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Try again or use /reset to start a fresh session."
             )
         finally:
+            if callable(_complete_lifecycle_progress):
+                try:
+                    await _complete_lifecycle_progress()
+                except Exception:
+                    logger.debug(
+                        "Terminal lifecycle progress close failed",
+                        exc_info=True,
+                    )
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
 
@@ -23879,6 +25033,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        defer_terminal_lifecycle_progress: bool = False,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -23898,6 +25053,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                defer_terminal_lifecycle_progress=defer_terminal_lifecycle_progress,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -23910,6 +25066,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                defer_terminal_lifecycle_progress=defer_terminal_lifecycle_progress,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -24032,6 +25189,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        defer_terminal_lifecycle_progress: bool = False,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -24083,19 +25241,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # display.<key> global, then built-in platform defaults.
         from gateway.display_config import resolve_display_setting
 
-        # Apply tool preview length config (0 = no limit)
+        # Apply tool preview length config (0 = no limit). Keep a turn-local
+        # snapshot for concurrency-safe comment-description rendering; the
+        # module setting remains for legacy display paths.
+        tool_preview_max_len = 0
         try:
             from agent.display import set_tool_preview_max_len
             _tpl = resolve_display_setting(user_config, platform_key, "tool_preview_length", 0)
-            set_tool_preview_max_len(int(_tpl) if _tpl else 0)
+            tool_preview_max_len = int(_tpl) if _tpl else 0
+            set_tool_preview_max_len(tool_preview_max_len)
         except Exception:
             pass
 
-        # Apply friendly tool labels config (default on) — per-platform aware
+        # Apply friendly tool labels config (default on) — per-platform aware.
+        # The turn-local snapshot prevents concurrent platform turns from
+        # changing comment-description chrome through the legacy module global.
+        friendly_tool_labels = True
         try:
             from agent.display import set_friendly_tool_labels
             _ftl = resolve_display_setting(user_config, platform_key, "friendly_tool_labels", True)
-            set_friendly_tool_labels(bool(_ftl))
+            friendly_tool_labels = bool(_ftl)
+            set_friendly_tool_labels(friendly_tool_labels)
         except Exception:
             pass
 
@@ -24124,6 +25290,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         # Tool progress grouping: "accumulate" (edit one bubble) or "separate" (one msg per tool)
         progress_grouping = resolve_display_setting(user_config, platform_key, "tool_progress_grouping") or "accumulate"
+        tool_progress_comment_descriptions = bool(
+            resolve_display_setting(
+                user_config,
+                platform_key,
+                "tool_progress_comment_descriptions",
+                False,
+            )
+        )
         from gateway.status_phrases import choose_status_phrase, resolve_status_phrase_catalog
         _generic_status_recent: List[str] = []
         _generic_status_catalog = resolve_status_phrase_catalog(user_config, platform_key)
@@ -24165,6 +25339,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as _phrase_err:
                 logger.debug("generic status phrase selection failed: %s", _phrase_err)
                 return "still on it" if kind in {"heartbeat", "waiting", "long_running", "status"} else "one sec"
+
+        # Resolve long-running notification visibility before deciding whether
+        # this turn needs the shared progress consumer. A heartbeat-only turn
+        # must still have a queue ready before its first interval fires.
+        _NOTIFY_INTERVAL_RAW = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
+        _NOTIFY_INTERVAL = (
+            _NOTIFY_INTERVAL_RAW if _NOTIFY_INTERVAL_RAW > 0 else None
+        )
+        _long_running_mode = _display_surface_mode(
+            "long_running_notifications",
+            default=True,
+            allow_generic=True,
+        )
+        if _long_running_mode == "off":
+            _NOTIFY_INTERVAL = None
         # Disable tool progress for webhooks - they don't support message editing,
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform
@@ -24210,7 +25399,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             require_platform_override_for={Platform.MATTERMOST},
         )
         _thinking_enabled = _thinking_mode != "off"
-        needs_progress_queue = tool_progress_enabled or _thinking_enabled
+        # Automatic compaction can begin before the model emits any thinking
+        # or tool event. When notices are opted in and the chat can maintain an
+        # accumulated editable bubble, create the shared queue proactively so
+        # the lifecycle start is visible immediately.
+        _compression_progress_queue_enabled = (
+            progress_grouping != "separate"
+            and not _gateway_surface_passes_raw_text(source.platform)
+            and _gateway_compression_progress_notices_enabled()
+            and _adapter_supports_progress_message_editing(
+                self._adapter_for_source(source)
+            )
+        )
+        _editable_accumulated_progress = (
+            progress_grouping != "separate"
+            and not _gateway_surface_passes_raw_text(source.platform)
+            and _adapter_supports_progress_message_editing(
+                self._adapter_for_source(source)
+            )
+        )
+        _long_running_progress_queue_enabled = (
+            _NOTIFY_INTERVAL is not None and _editable_accumulated_progress
+        )
+        _terminal_lifecycle_progress_queue_enabled = (
+            defer_terminal_lifecycle_progress
+            and _editable_accumulated_progress
+        )
+        needs_progress_queue = (
+            tool_progress_enabled
+            or _thinking_enabled
+            or _compression_progress_queue_enabled
+            or _long_running_progress_queue_enabled
+            or _terminal_lifecycle_progress_queue_enabled
+        )
 
 
         # Queue for progress messages (thread-safe)
@@ -24283,6 +25504,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             progress_mode=progress_mode,
             progress_grouping=progress_grouping,
             tool_progress_enabled=tool_progress_enabled,
+            tool_progress_comment_descriptions=tool_progress_comment_descriptions,
+            friendly_tool_labels=friendly_tool_labels,
+            tool_preview_max_len=tool_preview_max_len,
             progress_queue=progress_queue,
             log_queue=log_queue,
             last_progress_msg=last_progress_msg,
@@ -24586,15 +25810,93 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # on turn_ctx; `nonlocal message` rebinds became ctx.message writes.
         run_sync = turn_runner.run_sync
         
-        # Start progress message sender if enabled. Gate on needs_progress_queue
-        # (tool_progress OR thinking_progress), not tool_progress alone: the
-        # sender drains BOTH tool-progress lines and _thinking scratch bubbles.
-        # With the old tool_progress-only gate, a thinking_progress:true /
-        # tool_progress:off user had the callback queue _thinking messages that
-        # no task ever drained — so they silently never appeared.
+        # Start the shared progress sender when any producer needs its queue:
+        # tool progress, thinking scratch, or automatic compaction lifecycle.
+        # The task drains every producer in FIFO order; starting it before the
+        # executor also lets pre-model compaction seed the editable bubble.
         progress_task = None
+        _progress_consumer_started = asyncio.Event()
+
+        async def _run_progress_sender() -> None:
+            # A very fast terminal failure can finish the executor before this
+            # task receives its first event-loop slice. Publish an explicit
+            # start barrier so the post-reset completion bridge never cancels
+            # an unstarted coroutine whose cancellation handler cannot drain.
+            _progress_consumer_started.set()
+            await send_progress_messages()
+
         if needs_progress_queue:
-            progress_task = asyncio.create_task(send_progress_messages())
+            progress_task = asyncio.create_task(_run_progress_sender())
+
+        _lifecycle_progress_closed = False
+        _lifecycle_progress_result = False
+        _lifecycle_progress_lock = asyncio.Lock()
+
+        async def _complete_lifecycle_progress(
+            terminal_text: Optional[str] = None,
+        ) -> bool:
+            """Optionally enqueue one terminal status, then close the rail.
+
+            The terminal acknowledgement belongs to this exact queue event.
+            Earlier successful tool/heartbeat sends never count as delivery.
+            Cancellation invokes the consumer's existing lossless drain, so
+            the callback returns only after the final edit/send outcome is
+            known.
+            """
+            nonlocal progress_task
+            nonlocal _lifecycle_progress_closed
+            nonlocal _lifecycle_progress_result
+
+            async with _lifecycle_progress_lock:
+                if _lifecycle_progress_closed:
+                    return _lifecycle_progress_result
+
+                ack: Optional[asyncio.Future] = None
+                if (
+                    (terminal_text or _heartbeat_progress_enqueued[0])
+                    and
+                    progress_task is not None
+                    and not progress_task.done()
+                    and progress_queue is not None
+                ):
+                    await _progress_consumer_started.wait()
+                    if not progress_task.done():
+                        ack = asyncio.get_running_loop().create_future()
+                        if terminal_text:
+                            progress_queue.put(
+                                ("__terminal__", terminal_text, ack)
+                            )
+                        else:
+                            progress_queue.put(("__flush__", ack))
+
+                # Let the live consumer process and acknowledge this exact
+                # terminal event before cancellation. Cancelling immediately
+                # can land in the queue.Empty sleep (outside the sibling
+                # CancelledError handler) and strand the just-enqueued event.
+                if ack is not None:
+                    try:
+                        _lifecycle_progress_result = bool(
+                            await asyncio.wait_for(
+                                asyncio.shield(ack), timeout=5.0
+                            )
+                        )
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        _lifecycle_progress_result = False
+
+                if progress_task is not None:
+                    progress_task.cancel()
+                    try:
+                        await progress_task
+                    except asyncio.CancelledError:
+                        pass
+                    progress_task = None
+
+                if ack is not None and not ack.done():
+                    ack.set_result(False)
+                if ack is not None and ack.done() and not ack.cancelled():
+                    _lifecycle_progress_result = bool(ack.result())
+                _lifecycle_progress_closed = True
+                return _lifecycle_progress_result
 
         # Start the tool-call log writer when tool_progress == "log".
         log_task = None
@@ -24715,20 +26017,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         interrupt_monitor = asyncio.create_task(monitor_for_interrupt())
 
         # Periodic "still working" notifications for long-running tasks.
-        # Fires every N seconds so the user knows the agent hasn't died.
-        # Config: agent.gateway_notify_interval in config.yaml, or
-        # HERMES_AGENT_NOTIFY_INTERVAL env var.  Default 180s (3 min).
-        # 0 = disable notifications.
-        _NOTIFY_INTERVAL_RAW = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
-        _NOTIFY_INTERVAL = _NOTIFY_INTERVAL_RAW if _NOTIFY_INTERVAL_RAW > 0 else None
-        _long_running_mode = _display_surface_mode(
-            "long_running_notifications",
-            default=True,
-            allow_generic=True,
-        )
-        if _long_running_mode == "off":
-            _NOTIFY_INTERVAL = None
+        # The interval and visibility mode were resolved before progress-queue
+        # creation so heartbeat-only turns can start the shared consumer.
         _notify_start = time.time()
+        _heartbeat_progress_enqueued = [False]
 
         async def _notify_long_running():
             if _NOTIFY_INTERVAL is None:
@@ -24793,6 +26085,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if _long_running_mode == "generic"
                     else f"⏳ Working — {_elapsed_mins} min{_status_detail}"
                 )
+                if _long_running_progress_queue_enabled and progress_queue is not None:
+                    _heartbeat_progress_enqueued[0] = True
+                    progress_queue.put(
+                        (
+                            "__upsert__",
+                            "long_running_heartbeat",
+                            _heartbeat_text,
+                        )
+                    )
+                    continue
                 try:
                     _notify_res = None
                     if _heartbeat_msg_id:
@@ -25229,7 +26531,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Use session_key (not source.chat_id) to match adapter's storage keys.
             pending_event = None
             pending = None
-            if result and adapter and session_key:
+            if (
+                result
+                and adapter
+                and session_key
+                and not result.get("compression_exhausted")
+            ):
                 pending_event = _dequeue_pending_event(adapter, session_key)
                 # /queue overflow: after consuming the adapter's "next-up"
                 # slot, promote the next queued event into it so the
@@ -25527,16 +26834,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
+                    defer_terminal_lifecycle_progress=(
+                        defer_terminal_lifecycle_progress
+                    ),
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
+
+            # Arm the post-reset handoff only on the normal fall-through path.
+            # Any early return above must close its own progress consumer in
+            # ``finally`` because no caller-visible completion callback exists.
+            _defer_progress_completion = bool(
+                defer_terminal_lifecycle_progress
+                and _terminal_lifecycle_progress_queue_enabled
+                and isinstance(response, dict)
+                and response.get("compression_exhausted")
+                and progress_task is not None
+            )
         finally:
-            # Stop progress sender, interrupt monitor, and notification task
-            if progress_task:
-                progress_task.cancel()
+            # Fence every worker/status callback before stopping producers or
+            # draining the progress consumer. The terminal reset handoff below
+            # publishes directly and remains allowed after this fence closes.
+            turn_runner.close_progress_ingress()
+
+            # Stop the heartbeat producer before closing/draining the shared
+            # progress consumer. Otherwise it can enqueue one last upsert after
+            # the drain and silently strand it.
+            _notify_task.cancel()
+            try:
+                await _notify_task
+            except asyncio.CancelledError:
+                pass
+
+            # A compression-exhausted chat turn hands the live consumer to the
+            # outer reset path. Every other path closes it here, including all
+            # early returns and exceptions.
+            if not locals().get("_defer_progress_completion", False):
+                try:
+                    await _complete_lifecycle_progress()
+                except Exception:
+                    logger.debug(
+                        "Lifecycle progress cleanup failed",
+                        exc_info=True,
+                    )
             if log_task:
                 log_task.cancel()
             interrupt_monitor.cancel()
-            _notify_task.cancel()
 
             # Wait for stream consumer to finish its final edit
             if stream_task:
@@ -25592,12 +26934,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._update_runtime_status("draining")
             
             # Wait for cancelled tasks
-            for task in [progress_task, log_task, interrupt_monitor, tracking_task, _notify_task]:
+            for task in [log_task, interrupt_monitor, tracking_task, _notify_task]:
                 if task:
                     try:
                         await task
                     except asyncio.CancelledError:
                         pass
+
+        if locals().get("_defer_progress_completion", False) and isinstance(
+            response, dict
+        ):
+            response["_complete_lifecycle_progress"] = (
+                _complete_lifecycle_progress
+            )
 
         # If streaming already delivered the response, mark it so the
         # caller's send() is skipped (avoiding duplicate messages).
