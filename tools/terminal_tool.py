@@ -2664,11 +2664,12 @@ def terminal_tool(
                     )
 
             def _read_script_in_env(script_path: str) -> Optional[str]:
-                """Best-effort script read; uses env.execute only when local read fails.
+                """Read a small local script, or fall back when the path is remote.
 
-                For local backends the script path is on the host filesystem. For
-                SSH/Modal/Daytona the same path is remote; the local read misses, so we
-                fall back to ``env.execute('cat ...')``.
+                Local paths are handled authoritatively through a bounded,
+                descriptor-bound read. Only a path that is genuinely absent from
+                the host filesystem may use ``env.execute('cat ...')`` for an
+                SSH/Modal/Daytona backend.
                 """
                 if env is None:
                     return None
@@ -2676,18 +2677,57 @@ def terminal_tool(
                     local_path = Path(script_path).expanduser()
                     if not local_path.is_absolute():
                         local_path = Path(guard_cwd) / local_path
-                    if local_path.is_file():
-                        metadata = local_path.stat()
-                        if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 1024 * 1024:
-                            data = local_path.read_bytes()
-                            if len(data) <= 1024 * 1024:
-                                if b"\x00" in data:
-                                    # A binary is not shell source. This empty authoritative
-                                    # read prevents a second pass through the remote fallback.
-                                    return ""
-                                return data.decode("utf-8", errors="replace")
-                except Exception:
-                    pass
+                except (OSError, RuntimeError, ValueError):
+                    return ""
+
+                descriptor: Optional[int] = None
+                try:
+                    descriptor = os.open(
+                        local_path,
+                        os.O_RDONLY | getattr(os, "O_NONBLOCK", 0),
+                    )
+                except FileNotFoundError:
+                    # A broken local symlink is still locally present and must
+                    # not be reinterpreted as a remote path.
+                    try:
+                        local_path.lstat()
+                    except FileNotFoundError:
+                        pass
+                    except (OSError, ValueError):
+                        return ""
+                    else:
+                        return ""
+                except (OSError, ValueError):
+                    return ""
+
+                if descriptor is not None:
+                    try:
+                        metadata = os.fstat(descriptor)
+                        if (
+                            not stat.S_ISREG(metadata.st_mode)
+                            or metadata.st_size > 1024 * 1024
+                        ):
+                            return ""
+                        chunks: list[bytes] = []
+                        remaining = 1024 * 1024 + 1
+                        while remaining:
+                            chunk = os.read(descriptor, remaining)
+                            if not chunk:
+                                break
+                            chunks.append(chunk)
+                            remaining -= len(chunk)
+                        data = b"".join(chunks)
+                    except OSError:
+                        return ""
+                    finally:
+                        try:
+                            os.close(descriptor)
+                        except OSError:
+                            pass
+                    if len(data) > 1024 * 1024 or b"\x00" in data:
+                        return ""
+                    return data.decode("utf-8", errors="replace")
+
                 # Remote / sandboxed backend: read via the environment's shell.
                 try:
                     result = env.execute(f"cat {shlex.quote(script_path)}")

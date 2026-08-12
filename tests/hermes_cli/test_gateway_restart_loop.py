@@ -317,6 +317,111 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert result["exit_code"] == 1
         assert "referenced script" in result["error"]
 
+    def test_oversized_local_script_does_not_fall_back_to_remote_cat(
+        self, monkeypatch, tmp_path
+    ):
+        import tools.terminal_tool as tt
+
+        script = tmp_path / "oversized.bin"
+        script.write_bytes(b"\x00" + b"x" * (1024 * 1024))
+        script.chmod(0o700)
+        calls = []
+
+        class _FakeEnv:
+            env = {}
+
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                return {"output": "", "returncode": 0}
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
+
+        result = json.loads(tt.terminal_tool(command=str(script)))
+
+        assert calls == [str(script)], result
+
+    def test_local_script_growth_does_not_fall_back_to_remote_cat(
+        self, monkeypatch, tmp_path
+    ):
+        import cron.lifecycle_guard as lifecycle_guard
+        import tools.terminal_tool as tt
+
+        script = tmp_path / "growing.bin"
+        script.write_bytes(b"\x00")
+        command = "printf ok"
+        calls = []
+        read_sizes = []
+
+        class _FakeEnv:
+            env = {}
+
+            def execute(self, executed_command, **kwargs):
+                calls.append(executed_command)
+                return {"output": "", "returncode": 0}
+
+        def _growing_read(descriptor, size):
+            read_sizes.append(size)
+            return b"\x00" + b"x" * (1024 * 1024)
+
+        def _scan_command(*args, read_remote_script, **kwargs):
+            assert read_remote_script(str(script)) == ""
+            return False
+
+        monkeypatch.setattr(tt.os, "read", _growing_read)
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        monkeypatch.setattr(
+            lifecycle_guard,
+            "contains_gateway_lifecycle_command_or_referenced_script",
+            _scan_command,
+        )
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
+
+        result = json.loads(tt.terminal_tool(command=command))
+
+        assert read_sizes == [1024 * 1024 + 1]
+        assert calls == [command], result
+
+    def test_non_regular_local_path_does_not_fall_back_to_remote_cat(
+        self, monkeypatch, tmp_path
+    ):
+        import cron.lifecycle_guard as lifecycle_guard
+        import tools.terminal_tool as tt
+
+        local_directory = tmp_path / "local-directory"
+        local_directory.mkdir()
+        command = "printf ok"
+        calls = []
+
+        class _FakeEnv:
+            env = {}
+
+            def execute(self, executed_command, **kwargs):
+                calls.append(executed_command)
+                return {"output": "", "returncode": 0}
+
+        def _scan_command(*args, read_remote_script, **kwargs):
+            assert read_remote_script(str(local_directory)) == ""
+            return False
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        monkeypatch.setattr(
+            lifecycle_guard,
+            "contains_gateway_lifecycle_command_or_referenced_script",
+            _scan_command,
+        )
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
+
+        result = json.loads(tt.terminal_tool(command=command))
+
+        assert calls == [command], result
+
     def test_blocks_launchctl_submit_inside_gateway(self, monkeypatch, tmp_path):
         import tools.terminal_tool as tt
 
