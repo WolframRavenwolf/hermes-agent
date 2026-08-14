@@ -37,6 +37,7 @@ from gateway.config import HomeChannel, Platform, PlatformConfig, persist_home_c
 from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType
 from gateway.session import (
     AsyncSessionStore,
+    COMPRESSION_EXHAUSTED_METADATA_KEY,
     SessionSource,
     build_session_key,
 )
@@ -4197,6 +4198,12 @@ class GatewaySlashCommandsMixin:
                 await self.async_session_store.update_session(
                     session_entry.session_key, last_prompt_tokens=0
                 )
+                if rotated or _in_place:
+                    await self.async_session_store.set_session_metadata(
+                        session_entry.session_key,
+                        COMPRESSION_EXHAUSTED_METADATA_KEY,
+                        False,
+                    )
                 finalize_context_engine_compression_notification(
                     tmp_agent,
                     committed=True,

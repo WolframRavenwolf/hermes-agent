@@ -752,6 +752,11 @@ def build_session_context_prompt(
 # runner re-resolves credentials via the normal runtime provider resolution.
 PERSISTABLE_MODEL_OVERRIDE_KEYS = ("model", "provider", "base_url")
 
+# Durable routing-entry marker used to stop repeatedly invoking the model after
+# a preserved session has exhausted every safe compression attempt. Manual
+# compression clears it only after a compacted transcript is committed.
+COMPRESSION_EXHAUSTED_METADATA_KEY = "compression_exhausted"
+
 
 def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
     """Return a copy of *override* containing only persistable, non-secret keys.

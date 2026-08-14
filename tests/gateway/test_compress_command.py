@@ -219,6 +219,9 @@ async def test_compress_command_in_place_skips_destructive_rewrite():
     # The destructive rewrite must NOT run — archive_and_compact() already
     # persisted, and rewrite_transcript would wipe the archived rows.
     runner.session_store.rewrite_transcript.assert_not_called()
+    runner.session_store.set_session_metadata.assert_called_once_with(
+        session_entry.session_key, "compression_exhausted", False
+    )
     assert session_entry.session_id == "sess-1"
     agent_instance.shutdown_memory_provider.assert_called_once()
     agent_instance.close.assert_called_once()
