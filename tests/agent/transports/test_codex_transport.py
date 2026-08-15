@@ -512,6 +512,42 @@ class TestCodexTransportTimeout:
 
 
 
+class TestCodexTransportXaiGrok46ReasoningEffort:
+    def test_grok_46_preserves_xhigh(self, transport):
+        kw = transport.build_kwargs(
+            model="grok-4.6",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            is_xai_responses=True,
+            reasoning_config={"effort": "xhigh"},
+        )
+
+        assert kw["reasoning"]["effort"] == "xhigh"
+
+    @pytest.mark.parametrize("effort", ["max", "ultra"])
+    def test_grok_46_clamps_hermes_aliases_to_high(self, transport, effort):
+        kw = transport.build_kwargs(
+            model="x-ai/grok-4.6-latest",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            is_xai_responses=True,
+            reasoning_config={"effort": effort},
+        )
+
+        assert kw["reasoning"]["effort"] == "high"
+
+    def test_older_grok_still_clamps_xhigh_to_high(self, transport):
+        kw = transport.build_kwargs(
+            model="grok-4.5",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            is_xai_responses=True,
+            reasoning_config={"effort": "xhigh"},
+        )
+
+        assert kw["reasoning"]["effort"] == "high"
+
+
 class TestCodexTransportXaiServiceTierStrip:
     """xAI Responses API rejects ``service_tier`` (#28490).
 
@@ -529,11 +565,12 @@ class TestCodexTransportXaiServiceTierStrip:
         from agent.transports.codex import ResponsesApiTransport
         return ResponsesApiTransport()
 
-    def test_xai_strips_service_tier_from_request_overrides(self, transport):
+    @pytest.mark.parametrize("model", ["grok-4.3", "grok-4.6"])
+    def test_xai_strips_service_tier_from_request_overrides(self, transport, model):
         """Headline #28490 case: service_tier=priority leaks through
         request_overrides, must not reach the xAI request body."""
         kw = transport.build_kwargs(
-            model="grok-4.3",
+            model=model,
             messages=[{"role": "user", "content": "hi"}],
             tools=[],
             is_xai_responses=True,

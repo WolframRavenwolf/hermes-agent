@@ -1166,6 +1166,58 @@ class TestGrok43StaleCacheGuard:
             assert ctx == 256_000, f"{slug} should stay 256000, got {ctx}"
 
 
+class TestGrok46Metadata:
+    """Grok 4.6 has a 500K window and accepts xAI's xhigh effort dial."""
+
+    def test_family_and_reasoning_effort_detection(self):
+        from agent.model_metadata import (
+            grok_supports_reasoning_effort,
+            is_grok_46_family,
+        )
+
+        for slug in (
+            "grok-4.6",
+            "grok-4.6-latest",
+            "xai/grok-4.6",
+            "x-ai/grok-4.6-preview",
+            "openrouter/x-ai/grok-4.6",
+        ):
+            assert is_grok_46_family(slug)
+            assert grok_supports_reasoning_effort(slug)
+
+        for slug in ("grok-4", "grok-4.5", "grok-4.60", "grok-4.6beta"):
+            assert not is_grok_46_family(slug)
+
+        assert grok_supports_reasoning_effort("grok-4.5")
+        for slug in ("grok-4", "grok-4.60", "grok-4.6beta"):
+            assert not grok_supports_reasoning_effort(slug)
+
+    @pytest.mark.parametrize("slug", ["grok-4.60", "grok-4.6beta"])
+    def test_near_matches_keep_generic_context_fallback(
+        self, slug, monkeypatch
+    ):
+        import agent.model_metadata as mm
+
+        monkeypatch.setattr(mm, "fetch_model_metadata", lambda: {})
+
+        assert mm.get_model_context_length(slug) == 256_000
+
+    def test_stale_256k_cache_entry_reresolves_to_500k(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        import importlib
+        import agent.model_metadata as mm
+
+        importlib.reload(mm)
+        base = "https://api.x.ai/v1"
+        mm.save_context_length("grok-4.6", base, 256_000)
+
+        ctx = mm.get_model_context_length(
+            "grok-4.6", base_url=base, api_key="", provider="xai-oauth"
+        )
+
+        assert ctx == 500_000
+
+
 class TestMoAContextLength:
     """MoA virtual provider resolves context from the aggregator slot, not 256K default."""
 

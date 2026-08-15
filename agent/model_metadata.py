@@ -510,6 +510,7 @@ DEFAULT_CONTEXT_LENGTHS = {
     "grok-2-vision": 8192,      # grok-2-vision, -1212, -latest
     "grok-4-fast": 2000000,     # grok-4-fast-(non-)reasoning, also matches -reasoning
     "grok-4.20": 2000000,       # grok-4.20-0309-(non-)reasoning, -multi-agent-0309
+    "grok-4.6": 500000,         # grok-4.6 - 500K context per docs.x.ai
     "grok-4.5": 500000,         # grok-4.5, grok-4.5-latest — 500K context per docs.x.ai
     "grok-4.3": 1000000,        # grok-4.3, grok-4.3-latest — 1M context per docs.x.ai
     "grok-4": 256000,           # grok-4, grok-4-0709
@@ -590,10 +591,10 @@ _GROK_EFFORT_CAPABLE_PREFIXES = (
 def grok_supports_reasoning_effort(model: str) -> bool:
     """Return True when an xAI Grok model accepts ``reasoning.effort``.
 
-    Allowlist by substring (matches both bare ``grok-3-mini`` and
-    aggregator-prefixed ``x-ai/grok-3-mini``). Conservative by design:
-    if a future Grok model isn't listed, we send no effort dial rather
-    than 400.
+    The older allowlist entries retain prefix matching (for both bare and
+    aggregator-prefixed names); Grok 4.6 uses boundary-aware family matching.
+    Conservative by design: if a future Grok model isn't listed, we send no
+    effort dial rather than 400.
     """
     name = (model or "").strip().lower()
     if not name:
@@ -602,7 +603,17 @@ def grok_supports_reasoning_effort(model: str) -> bool:
     for sep in ("/",):
         if sep in name:
             name = name.rsplit(sep, 1)[-1]
+    if is_grok_46_family(name):
+        return True
     return any(name.startswith(prefix) for prefix in _GROK_EFFORT_CAPABLE_PREFIXES)
+
+
+def is_grok_46_family(model: str) -> bool:
+    """Return whether *model* is a Grok 4.6 family identifier."""
+    name = (model or "").strip().lower().replace("_", "-")
+    if "/" in name:
+        name = name.rsplit("/", 1)[-1]
+    return name == "grok-4.6" or name.startswith("grok-4.6-")
 
 
 _CONTEXT_LENGTH_KEYS = (
@@ -2617,6 +2628,15 @@ def get_model_context_length(
                     model, base_url, f"{cached:,}",
                 )
                 _invalidate_cached_context_length(model, base_url)
+            # Pre-catalog builds could persist the generic grok-4 fallback
+            # (256K) for grok-4.6 before its 500K entry existed.
+            elif cached <= 256_000 and is_grok_46_family(model):
+                logger.info(
+                    "Dropping stale Grok-4.6 cache entry %s@%s -> %s (pre-catalog value); "
+                    "re-resolving via hardcoded defaults",
+                    model, base_url, f"{cached:,}",
+                )
+                _invalidate_cached_context_length(model, base_url)
             # Nous Portal: the portal /v1/models endpoint is authoritative.
             # Bypass the persistent cache so step 5b can always reconcile
             # against it — this corrects pre-fix entries seeded from the
@@ -2946,6 +2966,10 @@ def get_model_context_length(
     for default_model, length in sorted(
         DEFAULT_CONTEXT_LENGTHS.items(), key=lambda x: len(x[0]), reverse=True
     ):
+        if default_model == "grok-4.6":
+            if is_grok_46_family(model):
+                return length
+            continue
         if default_model in model_lower:
             return length
 

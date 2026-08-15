@@ -226,8 +226,13 @@ class ResponsesApiTransport(ProviderTransport):
             # Ultra is the Codex product tier; the Responses API wire value is max.
             _effort_clamp["ultra"] = "max"
         if params.get("is_xai_responses", False):
-            # xAI Responses tops out at high; keep generic stronger values usable.
-            _effort_clamp.update({"xhigh": "high", "max": "high", "ultra": "high"})
+            from agent.model_metadata import is_grok_46_family
+
+            # Grok 4.6 accepts xhigh. Older Grok models top out at high;
+            # max and ultra remain Hermes aliases for every xAI model.
+            if not is_grok_46_family(model):
+                _effort_clamp["xhigh"] = "high"
+            _effort_clamp.update({"max": "high", "ultra": "high"})
         reasoning_effort = _effort_clamp.get(reasoning_effort, reasoning_effort)
 
         response_tools = _responses_tools(tools)
