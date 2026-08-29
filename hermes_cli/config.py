@@ -2483,7 +2483,7 @@ def _strip_dotted_keys(cfg: dict, dotted_keys: set) -> Tuple[dict, set]:
     return cfg, stripped
 
 
-def _env_expand_match(m: re.Match) -> str:
+def _env_expand_match(m: re.Match, env_getter=None) -> str:
     """Expand one ``${...}`` config reference.
 
     Two accepted shapes, matching what MCP server config already resolves
@@ -2501,13 +2501,15 @@ def _env_expand_match(m: re.Match) -> str:
     ref only ever needs the env shape.  Unknown prefixes warn once and stay
     verbatim so callers can detect them.
     """
+    if env_getter is None:
+        env_getter = os.environ.get
     raw = m.group(0)
     inner = m.group(1).strip()
     if inner.startswith("env:"):
         name = inner[len("env:"):].strip()
         if not name:
             return raw
-        val = os.environ.get(name)
+        val = env_getter(name)
         if val is not None:
             return val
         logger.warning(
@@ -2528,7 +2530,8 @@ def _env_expand_match(m: re.Match) -> str:
         )
         return raw
     # Legacy ``${VAR}`` — bare name.
-    return os.environ.get(inner, raw)
+    val = env_getter(inner)
+    return raw if val is None else val
 
 
 def _env_ref_var_name(ref: str) -> Optional[str]:
@@ -2543,20 +2546,31 @@ def _env_ref_var_name(ref: str) -> Optional[str]:
     return ref
 
 
-def _expand_env_vars(obj):
+def _expand_env_vars(obj, *, env_getter=None):
     """Recursively expand ``${VAR}`` / ``${env:VAR}`` references in config
     values.
 
     Only string values are processed; dict keys, numbers, booleans, and
     None are left untouched.  Unresolved references (variable not in
-    ``os.environ``) are kept verbatim so callers can detect them.
+    ``os.environ``) are kept verbatim so callers can detect them.  Callers
+    that operate inside an isolated profile may supply ``env_getter`` without
+    changing the process-environment default used everywhere else.
     """
+    if env_getter is None:
+        env_getter = os.environ.get
     if isinstance(obj, str):
-        return re.sub(r"\${([^}]+)}", _env_expand_match, obj)
+        return re.sub(
+            r"\${([^}]+)}",
+            lambda match: _env_expand_match(match, env_getter),
+            obj,
+        )
     if isinstance(obj, dict):
-        return {k: _expand_env_vars(v) for k, v in obj.items()}
+        return {
+            k: _expand_env_vars(v, env_getter=env_getter)
+            for k, v in obj.items()
+        }
     if isinstance(obj, list):
-        return [_expand_env_vars(item) for item in obj]
+        return [_expand_env_vars(item, env_getter=env_getter) for item in obj]
     return obj
 
 

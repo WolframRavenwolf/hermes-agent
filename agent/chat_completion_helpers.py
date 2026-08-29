@@ -1777,9 +1777,21 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         model=getattr(agent, "model", ""),
         base_url=str(getattr(agent, "base_url", "") or ""),
     )
+    fb_identity_model = fb_model
+    try:
+        from hermes_cli.model_normalize import normalize_model_for_provider
+
+        fb_identity_model = normalize_model_for_provider(fb_model, fb_provider)
+    except Exception as _norm_err:
+        logger.warning(
+            "Could not normalize fallback model %r for backend identity %r: %s",
+            fb_model,
+            fb_provider,
+            _norm_err,
+        )
     fb_ident = BackendIdentity.build(
         provider=fb_provider,
-        model=fb_model,
+        model=fb_identity_model,
         base_url=(fb.get("base_url") or ""),
     )
     if should_skip_candidate(fb_ident, current_ident):

@@ -386,3 +386,32 @@ This ledger documents the downstream patches maintained on `amy/patches`. Detail
   - `RELEASE_amy-patches.md`
 - **Verification:** Reconciled P1-P27 entries against the actual commit order and changed-path manifests.
 - **Session reference:** Local documentation session, 2026-08-15.
+
+## P29 - gateway: add session-scoped manual fallback controls
+
+- **Problem:** Sessions could use automatic provider fallback, but users could not enable, disable, or inspect fallback policy for one session without changing global configuration. Named-provider expansion also had to remain bound to the active profile secret scope.
+- **Solution:** Add `/fallback on`, `/fallback off`, and `/fallback status`; persist only the session policy marker and selected fallback index; preserve routing and cancellation invariants; validate provider endpoints, API modes, and credential sources before mutation; redact display labels; and resolve runtime configuration through the active profile secret resolver.
+- **Affected files:**
+  - `RELEASE_amy-patches.md`
+  - `agent/agent_init.py`
+  - `agent/chat_completion_helpers.py`
+  - `gateway/run.py`
+  - `gateway/session.py`
+  - `gateway/slash_commands.py`
+  - `hermes_cli/commands.py`
+  - `hermes_cli/config.py`
+  - `hermes_cli/fallback_config.py`
+  - `hermes_cli/runtime_provider.py`
+  - `run_agent.py`
+  - `tests/gateway/test_fallback_command.py`
+  - `tests/gateway/test_session_hygiene.py`
+  - `tests/gateway/test_session_store_prune.py`
+  - `tests/hermes_cli/test_config_env_expansion.py`
+  - `tests/hermes_cli/test_fallback_config.py`
+  - `tests/run_agent/test_provider_fallback.py`
+- **Verification:**
+  - 175 P29-owned and directly related tests passed.
+  - 180 security, profile, and provider-resolution tests passed.
+  - 401 affected tests passed.
+  - 244 adjacent tests passed.
+- **Session reference:** Local implementation session, 2026-08-28 to 2026-08-29.

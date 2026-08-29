@@ -224,6 +224,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("fast", "Toggle fast mode — OpenAI Priority Processing / Anthropic Fast Mode (Normal/Fast)", "Configuration",
                args_hint="[normal|fast|status] [--global]",
                subcommands=("normal", "fast", "status", "on", "off", "--global")),
+    CommandDef("fallback", "Route this session through fallback entry 1", "Configuration",
+               args_hint="[on|off|status]", gateway_only=True,
+               busy_policy="reject"),
     CommandDef("skin", "Show or change the display skin/theme", "Configuration",
                cli_only=True, args_hint="[name]"),
     CommandDef("indicator", "Pick the TUI busy-indicator style", "Configuration",
@@ -1257,7 +1260,13 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     /hermes update on Slack. Demoted to free the native slot /approvals now
 #     claims — without this entry /approvals tips the registry past the 50-cap
 #     and silently clamps /update off, breaking Telegram parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update"})
+#   - fallback: low-frequency break-glass route selector; reached via
+#     /hermes fallback on Slack so adding it does not silently displace the
+#     existing native /platform slash at Slack's fixed 50-command cap.
+_SLACK_VIA_HERMES_ONLY = frozenset({
+    "topup", "moa", "debug", "egress", "init", "version", "diff", "update",
+    "fallback",
+})
 
 
 def _sanitize_slack_name(raw: str) -> str:

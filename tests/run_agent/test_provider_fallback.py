@@ -87,6 +87,47 @@ class TestFallbackChainAdvancement:
             assert agent.model == "gpt-4o"
             assert agent._fallback_activated is True
 
+    def test_manual_entry_alias_is_skipped_before_advancing_to_next_fallback(self):
+        fbs = [
+            {"provider": "openrouter", "model": "claude-sonnet-4.6"},
+            {"provider": "openai", "model": "gpt-4o"},
+        ]
+        agent = _make_agent(fallback_model=fbs)
+        agent.provider = "openrouter"
+        agent.model = "anthropic/claude-sonnet-4.6"
+        agent.base_url = "https://openrouter.ai/api/v1"
+        resolver = MagicMock(
+            return_value=(_mock_client(base_url="https://api.openai.com/v1"), "gpt-4o")
+        )
+
+        def _normalize(model, provider):
+            if provider == "openrouter" and model == "claude-sonnet-4.6":
+                return "anthropic/claude-sonnet-4.6"
+            return model
+
+        with (
+            patch(
+                "agent.chat_completion_helpers._fallback_entry_unavailable_without_network",
+                return_value=None,
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                resolver,
+            ),
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=_normalize,
+            ),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        resolver.assert_called_once()
+        assert resolver.call_args.args[:2] == ("openai",)
+        assert resolver.call_args.kwargs["model"] == "gpt-4o"
+        assert agent._fallback_index == 2
+        assert agent.provider == "openai"
+        assert agent.model == "gpt-4o"
+
     def test_successful_entry_activates_normal_service_tier_override(self):
         fbs = [
             {

@@ -62,6 +62,20 @@ def _clean_str(value: Any) -> str:
     return value.strip() if isinstance(value, str) and value.strip() else ""
 
 
+def _fallback_display_label(value: Any, fallback: str) -> str:
+    """Render one route label without leaking secrets or forging extra lines."""
+    from agent.redact import redact_sensitive_text
+
+    label = str(value or "").strip() or fallback
+    label = redact_sensitive_text(
+        label,
+        force=True,
+        redact_url_credentials=True,
+    )
+    label = " ".join(label.replace("\x00", " ").split())
+    return label[:160] or fallback
+
+
 def _int_value(value: Any) -> int:
     """Safely coerce to int."""
     try:
@@ -3703,6 +3717,222 @@ class GatewaySlashCommandsMixin:
             return t("gateway.fast.status", mode=status)
 
         return _apply_fast_selection(args, persist=persist_global)
+
+    async def _handle_fallback_command(self, event: MessageEvent) -> str:
+        """Route this session through configured fallback entry 1."""
+        profile = str(getattr(event.source, "profile", "") or "").strip()
+        if profile:
+            from gateway.run import _profile_runtime_scope
+            from hermes_constants import get_hermes_home
+
+            target_home = getattr(self, "_resolve_profile_home_for_source")(event.source)
+            current_home = get_hermes_home()
+            if target_home.expanduser().resolve() != current_home.expanduser().resolve():
+                with _profile_runtime_scope(target_home):
+                    return await self._handle_fallback_command(event)
+
+        from gateway.run import (
+            _AGENT_PENDING_SENTINEL,
+            _resolve_fallback_entry_agent_kwargs,
+        )
+        from gateway.session import MANUAL_FALLBACK_METADATA_KEY
+
+        action = event.get_command_args().strip().lower() or "status"
+        if action not in {"on", "off", "status"}:
+            return "Usage: /fallback [on|off|status]"
+
+        source = self._normalize_source_for_session_key(event.source)
+        session_entry = await self.async_session_store.get_or_create_session(source)
+        session_key = session_entry.session_key
+
+        def _busy_response() -> str | None:
+            if action not in {"on", "off"}:
+                return None
+            if session_key in self._running_agents:
+                return (
+                    f"⏳ Agent is running - `/fallback {action}` can't run "
+                    "mid-turn. Wait for the current response or `/stop` first."
+                )
+            route_rejection = getattr(self, "_routing_mutation_rejection")(
+                session_key
+            )
+            if route_rejection is not None:
+                return route_rejection
+            return None
+
+        busy_response = _busy_response()
+        if busy_response is not None:
+            return busy_response
+
+        def _reserve_mutation() -> bool:
+            claim = getattr(self, "_try_claim_routing_mutation")
+            return bool(claim(session_key))
+
+        def _release_mutation() -> None:
+            getattr(self, "_release_routing_mutation")(session_key)
+
+        mutation_release_deferred = False
+
+        async def _persist_and_evict_under_claim(operation) -> bool:
+            """Let cancellation return while the in-flight store task owns the claim."""
+            nonlocal mutation_release_deferred
+            task = asyncio.create_task(operation)
+            try:
+                persisted = await asyncio.shield(task)
+            except asyncio.CancelledError:
+                mutation_release_deferred = True
+
+                def _finish_cancelled_mutation(done_task: asyncio.Task) -> None:
+                    try:
+                        finished = done_task.result()
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as exc:
+                        logger.warning(
+                            "Cancelled fallback persistence failed (%s)",
+                            type(exc).__name__,
+                        )
+                    else:
+                        if finished:
+                            self._evict_cached_agent(session_key)
+                    finally:
+                        _release_mutation()
+
+                task.add_done_callback(_finish_cancelled_mutation)
+                raise
+            if persisted:
+                self._evict_cached_agent(session_key)
+            return bool(persisted)
+
+        def _mutation_rejection(action_name: str) -> str:
+            return (
+                _busy_response()
+                or getattr(self, "_routing_mutation_rejection")(session_key)
+                or (
+                    f"⏳ Session routing is busy - `/fallback {action_name}` "
+                    "cannot run right now. Please retry in a moment."
+                )
+            )
+
+        if action == "on":
+            chain = self._refresh_fallback_model() or []
+            if not chain:
+                return "No fallback provider is configured."
+            first = chain[0]
+            try:
+                await self._run_in_executor_with_context(
+                    _resolve_fallback_entry_agent_kwargs,
+                    first,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Manual fallback entry 1 could not be resolved (%s)",
+                    type(exc).__name__,
+                )
+                return (
+                    "Manual fallback could not be enabled because the configured "
+                    "provider is unavailable."
+                )
+            if not _reserve_mutation():
+                return _mutation_rejection("on")
+            try:
+                try:
+                    stored = await _persist_and_evict_under_claim(
+                        self.async_session_store.set_session_metadata(
+                            session_key,
+                            MANUAL_FALLBACK_METADATA_KEY,
+                            0,
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Manual fallback marker could not be persisted (%s)",
+                        type(exc).__name__,
+                    )
+                    stored = False
+                if not stored:
+                    return "Manual fallback could not be persisted for this session."
+                provider = _fallback_display_label(first.get("provider"), "unknown")
+                model = _fallback_display_label(first.get("model"), "unknown")
+                return f"Manual fallback: ON - entry 1, {model} via {provider}."
+            finally:
+                if not mutation_release_deferred:
+                    _release_mutation()
+
+        if action == "off":
+            existing = await self.async_session_store.get_session_metadata(
+                session_key,
+                MANUAL_FALLBACK_METADATA_KEY,
+            )
+            if existing is None:
+                return "Manual fallback: OFF. The existing /model override is preserved."
+            if not _reserve_mutation():
+                return _mutation_rejection("off")
+            try:
+                try:
+                    removed = await _persist_and_evict_under_claim(
+                        self.async_session_store.delete_session_metadata(
+                            session_key,
+                            MANUAL_FALLBACK_METADATA_KEY,
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Manual fallback marker could not be removed (%s)",
+                        type(exc).__name__,
+                    )
+                    removed = False
+                if not removed:
+                    return "Manual fallback could not be persisted for this session."
+                return "Manual fallback: OFF. The existing /model override is preserved."
+            finally:
+                if not mutation_release_deferred:
+                    _release_mutation()
+
+        manual_index = await self.async_session_store.get_session_metadata(
+            session_key,
+            MANUAL_FALLBACK_METADATA_KEY,
+        )
+        chain = self._refresh_fallback_model() or []
+        lines: list[str] = []
+        if type(manual_index) is int and 0 <= manual_index < len(chain):
+            entry = chain[manual_index]
+            model = _fallback_display_label(entry.get("model"), "unknown")
+            provider = _fallback_display_label(entry.get("provider"), "unknown")
+            lines.append(
+                "Manual fallback: ON - "
+                f"entry {manual_index + 1}, {model} via {provider}."
+            )
+        elif manual_index is not None:
+            lines.append(
+                "Manual fallback: ON, but its configured entry is unavailable; "
+                "run /fallback off to recover."
+            )
+        else:
+            lines.append("Manual fallback: OFF.")
+
+        agent = self._running_agents.get(session_key)
+        if agent is _AGENT_PENDING_SENTINEL:
+            agent = None
+        if agent is None:
+            cache_lock = getattr(self, "_agent_cache_lock", None)
+            cache = getattr(self, "_agent_cache", None)
+            if cache_lock is not None and cache is not None:
+                with cache_lock:
+                    cached = cache.get(session_key)
+                if cached:
+                    agent = cached[0]
+        if agent is not None and bool(getattr(agent, "_fallback_activated", False)):
+            model = _fallback_display_label(getattr(agent, "model", None), "unknown")
+            provider = _fallback_display_label(
+                getattr(agent, "provider", None), "unknown"
+            )
+            lines.append(
+                f"Automatic fallback: ACTIVE - {model} via {provider}."
+            )
+        else:
+            lines.append("Automatic fallback: inactive.")
+        return "\n".join(lines)
 
     async def _handle_approvals_command(self, event: MessageEvent) -> str:
         """Show or persist the profile-wide dangerous-command approval mode."""

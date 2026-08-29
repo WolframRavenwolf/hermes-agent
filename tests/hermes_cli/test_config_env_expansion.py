@@ -10,6 +10,18 @@ class TestExpandEnvVars:
             mp.setenv("MY_KEY", "secret123")
             assert _expand_env_vars("${MY_KEY}") == "secret123"
 
+    def test_explicit_env_getter_overrides_process_environment_recursively(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("PROFILE_KEY", "wrong-process-value")
+
+        expanded = _expand_env_vars(
+            {"fallback": [{"api_key": "prefix-${PROFILE_KEY}"}]},
+            env_getter=lambda name: {"PROFILE_KEY": "scoped-value"}.get(name),
+        )
+
+        assert expanded == {"fallback": [{"api_key": "prefix-scoped-value"}]}
+
 
 
 

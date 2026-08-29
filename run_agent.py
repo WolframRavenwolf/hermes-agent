@@ -506,6 +506,7 @@ class AIAgent:
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
         requested_provider: str = None,
+        fallback_service_tier_override: Optional[str] = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         if tool_delay is not None:
@@ -583,6 +584,7 @@ class AIAgent:
             parent_session_id=parent_session_id,
             iteration_budget=iteration_budget,
             fallback_model=fallback_model,
+            fallback_service_tier_override=fallback_service_tier_override,
             credential_pool=credential_pool,
             checkpoints_enabled=checkpoints_enabled,
             checkpoint_max_snapshots=checkpoint_max_snapshots,

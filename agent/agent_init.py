@@ -519,6 +519,7 @@ def init_agent(
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
     requested_provider: str = None,
+    fallback_service_tier_override: Optional[str] = None,
 ):
     """
     Initialize the AI Agent.
@@ -1404,11 +1405,18 @@ def init_agent(
         agent._fallback_chain = []
     agent._fallback_index = 0
     agent._fallback_activated = getattr(agent, "_fallback_activated", False)
-    agent._active_fallback_service_tier_override = getattr(
-        agent,
-        "_active_fallback_service_tier_override",
-        None,
-    )
+    if fallback_service_tier_override is not None:
+        activate_fallback_service_tier_override(
+            agent,
+            {"service_tier_override": fallback_service_tier_override},
+            log=logger,
+        )
+    else:
+        agent._active_fallback_service_tier_override = getattr(
+            agent,
+            "_active_fallback_service_tier_override",
+            None,
+        )
     # Legacy attribute kept for backward compat (tests, external callers)
     agent._fallback_model = agent._fallback_chain[0] if agent._fallback_chain else None
     if agent._fallback_chain and not agent.quiet_mode:

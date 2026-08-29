@@ -3030,6 +3030,9 @@ def _resolve_runtime_agent_kwargs() -> dict:
 def _resolve_runtime_agent_kwargs_for_provider(
     provider: str,
     target_model: Optional[str] = None,
+    explicit_base_url: Optional[str] = None,
+    explicit_api_key: Optional[str] = None,
+    runtime_config: Optional[dict] = None,
 ) -> dict:
     """Resolve runtime credentials for a provider and optional target model."""
     from hermes_cli.runtime_provider import (
@@ -3037,10 +3040,17 @@ def _resolve_runtime_agent_kwargs_for_provider(
         format_runtime_provider_error,
     )
     try:
-        runtime = resolve_runtime_provider(
-            requested=provider,
-            target_model=target_model,
-        )
+        resolve_kwargs = {
+            "requested": provider,
+            "target_model": target_model,
+        }
+        if explicit_base_url is not None:
+            resolve_kwargs["explicit_base_url"] = explicit_base_url
+        if explicit_api_key is not None:
+            resolve_kwargs["explicit_api_key"] = explicit_api_key
+        if runtime_config is not None:
+            resolve_kwargs["runtime_config"] = runtime_config
+        runtime = resolve_runtime_provider(**resolve_kwargs)
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
     return {
@@ -3052,7 +3062,111 @@ def _resolve_runtime_agent_kwargs_for_provider(
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool"),
+        # Header values may carry credentials; project only the capability bit.
+        "has_header_auth": bool(runtime.get("extra_headers")),
     }
+
+
+def _runtime_kwargs_for_agent_constructor(runtime: dict) -> dict:
+    """Remove gateway-only routing metadata before constructing an AIAgent."""
+    projected = dict(runtime)
+    projected.pop("manual_fallback_index", None)
+    projected.pop("has_header_auth", None)
+    return projected
+
+
+def _resolve_fallback_entry_agent_kwargs(
+    entry: dict,
+    runtime_config: Optional[dict] = None,
+) -> tuple[str, dict]:
+    """Resolve one configured fallback entry into gateway agent runtime data."""
+    from hermes_cli.fallback_config import resolve_entry_api_key
+    from hermes_cli.model_normalize import normalize_model_for_provider
+
+    provider = str(entry.get("provider") or "").strip()
+    model = str(entry.get("model") or "").strip()
+    if not provider or not model:
+        raise RuntimeError("Fallback entry 1 must define both provider and model")
+
+    if runtime_config is None:
+        runtime_config = _load_gateway_runtime_config()
+    try:
+        explicit_api_key = resolve_entry_api_key(entry)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+    runtime = _resolve_runtime_agent_kwargs_for_provider(
+        provider,
+        target_model=model,
+        explicit_base_url=(str(entry.get("base_url") or "").strip() or None),
+        explicit_api_key=explicit_api_key,
+        runtime_config=runtime_config,
+    )
+    model = normalize_model_for_provider(model, provider)
+    configured_api_mode = str(entry.get("api_mode") or "").strip()
+    if configured_api_mode:
+        from hermes_cli.runtime_provider import _parse_api_mode
+
+        validated_api_mode = _parse_api_mode(configured_api_mode)
+        if validated_api_mode is None:
+            raise RuntimeError("Fallback entry 1 has an invalid api_mode")
+        runtime["api_mode"] = validated_api_mode
+
+    runtime_provider = str(runtime.get("provider") or "").strip()
+    if not runtime_provider:
+        raise RuntimeError("Fallback entry 1 did not resolve to a provider")
+    requested_provider = str(runtime.get("requested_provider") or provider).strip()
+    api_mode = str(runtime.get("api_mode") or "").strip()
+    native_mode_providers = {
+        "bedrock_converse": {"bedrock"},
+        "codex_app_server": {"openai", "openai-codex"},
+    }
+    allowed_native_providers = native_mode_providers.get(api_mode)
+    if allowed_native_providers and runtime_provider not in allowed_native_providers:
+        raise RuntimeError("Fallback entry 1 has an incompatible api_mode")
+    command = str(runtime.get("command") or "").strip()
+    uses_external_http_transport = (
+        not command
+        and runtime_provider != "moa"
+        and api_mode not in {"bedrock_converse", "codex_app_server"}
+    )
+    if uses_external_http_transport:
+        from urllib.parse import urlparse
+
+        from agent.azure_identity_adapter import is_token_provider
+        from hermes_cli.auth import has_usable_secret
+
+        api_key = runtime.get("api_key")
+        has_api_key = (
+            has_usable_secret(api_key)
+            and str(api_key).strip() != "no-key-required"
+            and not re.search(r"\$\{[^}]+\}", str(api_key))
+        )
+        if not (
+            has_api_key
+            or is_token_provider(api_key)
+            or runtime.get("has_header_auth") is True
+        ):
+            raise RuntimeError("Fallback entry 1 did not resolve to a usable API key")
+        base_url = str(runtime.get("base_url") or "").strip()
+        try:
+            parsed = urlparse(base_url)
+            _ = parsed.port
+        except ValueError:
+            parsed = None
+        if (
+            parsed is None
+            or re.search(r"\$\{[^}]+\}", base_url)
+            or parsed.scheme not in {"http", "https"}
+            or not parsed.netloc
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise RuntimeError("Fallback entry 1 did not resolve to a valid base URL")
+
+    return model, runtime
 
 
 def _credential_pool_for_provider(provider: Optional[str]):
@@ -3701,9 +3815,10 @@ def _load_gateway_runtime_config() -> dict:
     cfg = _load_gateway_config()
     if not isinstance(cfg, dict) or not cfg:
         return {}
+    from agent.secret_scope import get_secret
     from hermes_cli.config import _expand_env_vars
 
-    expanded = _expand_env_vars(cfg)
+    expanded = _expand_env_vars(cfg, env_getter=get_secret)
     return expanded if isinstance(expanded, dict) else {}
 
 
@@ -5768,7 +5883,7 @@ class TurnRunner:
         # serialization (_running_agents) keeps this safe post-lock.
         if reused_cached_agent and agent is not None:
             self._runner._apply_fallback_chain_to_agent(
-                agent, self._runner._refresh_fallback_model(),
+                agent, self._runner._fallback_chain_for_runtime(runtime_kwargs),
             )
 
         # Lock released — now schedule cleanup of any cross-process-evicted
@@ -5824,8 +5939,10 @@ class TurnRunner:
                 thread_id=ctx.source.thread_id,
                 gateway_session_key=ctx.session_key,
                 session_db=getattr(self._runner._session_db, "_db", self._runner._session_db),
-                # Reload from disk — do not reuse the startup snapshot (#60955).
-                fallback_model=self._runner._refresh_fallback_model(),
+                # Reload from disk and skip the entry already activated manually.
+                fallback_model=self._runner._refresh_fallback_model()
+                if type(runtime_kwargs.get("manual_fallback_index")) is not int
+                else runtime_kwargs["fallback_model"],
                 skip_context_files=skip_context_files,
                 # Keep the persona even with minimal context: soul identity is
                 # a single small file, not part of the expensive walk.
@@ -6856,6 +6973,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         state = self._peek_session_state(session_key)
         return state is not None and state.turn.agent is not None
 
+    def _routing_mutation_keys(self) -> set[str]:
+        """Return the event-loop-owned set of sessions changing route metadata."""
+        keys = self.__dict__.get("_routing_mutations")
+        if not isinstance(keys, set):
+            keys = set()
+            self.__dict__["_routing_mutations"] = keys
+        return keys
+
+    def _is_routing_mutation_active(self, session_key: str) -> bool:
+        return session_key in self._routing_mutation_keys()
+
+    def _try_claim_routing_mutation(self, session_key: str) -> bool:
+        """Atomically claim a route mutation against the normal turn claim."""
+        if self._is_session_running(session_key):
+            return False
+        keys = self._routing_mutation_keys()
+        if session_key in keys:
+            return False
+        keys.add(session_key)
+        return True
+
+    def _release_routing_mutation(self, session_key: str) -> None:
+        self._routing_mutation_keys().discard(session_key)
+
+    @staticmethod
+    def _manual_fallback_tail_offset(runtime_kwargs: dict) -> int | None:
+        """Return the first chain index not already activated manually."""
+        manual_index = runtime_kwargs.get("manual_fallback_index")
+        if type(manual_index) is int:
+            return manual_index + 1
+        return None
+
+    def _fallback_chain_for_runtime(self, runtime_kwargs: dict) -> list | None:
+        """Use the resolved manual-route snapshot, or refresh automatic fallback."""
+        if type(runtime_kwargs.get("manual_fallback_index")) is int:
+            return runtime_kwargs.get("fallback_model")
+        return self._refresh_fallback_model()
+
+    def _routing_mutation_rejection(self, session_key: str) -> Optional[str]:
+        if not self._is_routing_mutation_active(session_key):
+            return None
+        return (
+            "⏳ Session routing is being updated - "
+            "please resend your message in a moment."
+        )
+
     def _running_agent_items(self) -> List[tuple]:
         """(session_key, agent) pairs for sessions with a running turn
         (including pending sentinels), matching the old ``_running_agents``
@@ -6902,19 +7065,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._warn_if_docker_media_delivery_is_risky()
         _gateway_runner_ref = _weakref.ref(self)
 
-        # Load ephemeral config from config.yaml / env vars.
-        # Both are injected at API-call time only and never persisted.
-        self._prefill_messages = self._load_prefill_messages()
-        self._ephemeral_system_prompt = self._load_ephemeral_system_prompt()
-        self._reasoning_config = self._load_reasoning_config()
-        self._service_tier = self._load_service_tier()
-        self._show_reasoning = self._load_show_reasoning()
-        self._busy_input_mode = self._load_busy_input_mode()
-        self._busy_text_mode = self._load_busy_text_mode()
-        self._restart_drain_timeout = self._load_restart_drain_timeout()
-        self._restart_after_turn_timeout = self._load_restart_after_turn_timeout()
-        self._provider_routing = self._load_provider_routing()
-        self._fallback_model = self._load_fallback_model()
+        # Load runtime config under the default profile's credential scope when
+        # multiplexing is active. Single-profile startup remains unscoped.
+        from contextlib import nullcontext
+
+        startup_scope = (
+            _profile_runtime_scope(_hermes_home)
+            if bool(getattr(self.config, "multiplex_profiles", False))
+            else nullcontext()
+        )
+        with startup_scope:
+            self._prefill_messages = self._load_prefill_messages()
+            self._ephemeral_system_prompt = self._load_ephemeral_system_prompt()
+            self._reasoning_config = self._load_reasoning_config()
+            self._service_tier = self._load_service_tier()
+            self._show_reasoning = self._load_show_reasoning()
+            self._busy_input_mode = self._load_busy_input_mode()
+            self._busy_text_mode = self._load_busy_text_mode()
+            self._restart_drain_timeout = self._load_restart_drain_timeout()
+            self._restart_after_turn_timeout = self._load_restart_after_turn_timeout()
+            self._provider_routing = self._load_provider_routing()
+            self._fallback_model = self._load_fallback_model()
+        self._fallback_models_by_home = {
+            str(_hermes_home.expanduser().resolve()): self._fallback_model
+        }
+        self._fallback_model_refresh_lock = threading.RLock()
 
         # Wire process registry into session store for reset protection.
         # A background process older than the configured threshold (default 24h,
@@ -7945,9 +8120,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> tuple[str, dict]:
         """Resolve model/runtime for a session.
 
-        Priority (highest first): session ``/model`` → ``channel_overrides`` →
-        global config/env (``_resolve_gateway_model(user_config)`` and default
-        provider resolution).
+        Priority (highest first): manual ``/fallback`` → session ``/model`` →
+        ``channel_overrides`` → global config/env
+        (``_resolve_gateway_model(user_config)`` and default provider resolution).
         """
         resolved_session_key = session_key
         if not resolved_session_key and source is not None:
@@ -7955,6 +8130,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 resolved_session_key = self._session_key_for_source(source)
             except Exception:
                 resolved_session_key = None
+
+        from gateway.session import MANUAL_FALLBACK_METADATA_KEY
+
+        store = getattr(self, "session_store", None)
+        metadata_reader = getattr(type(store), "get_session_metadata", None)
+        manual_index = None
+        if resolved_session_key and callable(metadata_reader):
+            manual_index = metadata_reader(
+                store,
+                resolved_session_key,
+                MANUAL_FALLBACK_METADATA_KEY,
+            )
+        if manual_index is not None:
+            if type(manual_index) is not int or manual_index < 0:
+                raise RuntimeError(
+                    "Manual fallback state is invalid; run /fallback off to recover"
+                )
+            chain = self._refresh_fallback_model() or []
+            if manual_index >= len(chain):
+                raise RuntimeError(
+                    "Manual fallback entry is no longer configured; "
+                    "run /fallback off to recover"
+                )
+            fallback_entry = chain[manual_index]
+            model, runtime = _resolve_fallback_entry_agent_kwargs(fallback_entry)
+            try:
+                from agent.fallback_policy import (
+                    normalize_fallback_service_tier_override,
+                )
+
+                policy = normalize_fallback_service_tier_override(
+                    fallback_entry.get("service_tier_override")
+                )
+            except ValueError as exc:
+                logger.warning("Ignoring invalid manual fallback tier policy: %s", exc)
+                policy = None
+            if policy is not None:
+                runtime["fallback_service_tier_override"] = policy
+            runtime["manual_fallback_index"] = manual_index
+            runtime["fallback_model"] = chain[manual_index + 1 :]
+            return model, runtime
 
         model = _resolve_gateway_model(user_config)
         if resolved_session_key:
@@ -8125,6 +8341,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "args": list(runtime_kwargs.get("args") or []),
             "credential_pool": runtime_kwargs.get("credential_pool"),
             "max_tokens": runtime_kwargs.get("max_tokens"),
+            "fallback_service_tier_override": runtime_kwargs.get(
+                "fallback_service_tier_override"
+            ),
         }
         route = {
             "model": model,
@@ -8137,6 +8356,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 runtime["api_mode"],
                 runtime["command"],
                 tuple(runtime["args"]),
+                runtime["fallback_service_tier_override"],
             ),
         }
 
@@ -9420,7 +9640,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return None
 
     def _refresh_fallback_model(self) -> list | None:
-        """Re-read fallback_providers from disk for the next agent create/reuse.
+        """Re-read fallback providers with a last-known-good cache per profile.
 
         Cron already does this per job via ``get_fallback_chain``; the gateway
         previously froze ``self._fallback_model`` at process start, so a chain
@@ -9428,43 +9648,73 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         reached messaging sessions even though the same process's cron jobs
         fell back correctly. Fixes #60955.
 
-        A TRANSIENT read/parse failure (user mid-edit of config.yaml with a
-        non-atomic write) keeps the last known-good chain instead of wiping a
-        cached agent's working fallback for that turn.  Only a successful read
-        that genuinely lacks the key clears the chain.
+        A transient read/parse failure keeps only this profile's last known-good
+        chain. Another multiplexed profile's route must never cross that boundary.
+        A successful read that genuinely lacks the key clears this profile.
         """
+        lock = getattr(self, "_fallback_model_refresh_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._fallback_model_refresh_lock = lock
+        with lock:
+            return GatewayRunner._refresh_fallback_model_locked(self)
+
+    def _refresh_fallback_model_locked(self) -> list | None:
+        """Reload and publish one fallback chain under the refresh lock."""
+        from hermes_constants import get_hermes_home_override
+
+        scoped_home = get_hermes_home_override()
+        cfg_home = (Path(scoped_home) if scoped_home else _hermes_home).expanduser().resolve()
+        process_home = _hermes_home.expanduser().resolve()
+        cache_key = str(cfg_home)
+        process_cache_key = str(process_home)
+        cache = getattr(self, "_fallback_models_by_home", None)
+        if not isinstance(cache, dict):
+            cache = {process_cache_key: getattr(self, "_fallback_model", None)}
+            self._fallback_models_by_home = cache
+
         try:
             from hermes_cli.config import read_user_config_raw
-            cfg_path = _hermes_home / "config.yaml"
+
+            cfg_path = cfg_home / "config.yaml"
             if not cfg_path.exists():
-                self._fallback_model = None
-                return self._fallback_model
+                cache[cache_key] = None
+                if cache_key == process_cache_key:
+                    self._fallback_model = None
+                return None
             # Raw primitive (raises on parse failure) is required here: the
             # canonical fail-open loader would return {} on a torn mid-edit
-            # write and WIPE the last known-good chain. The overlay/expansion
+            # write and wipe the last known-good chain. The overlay/expansion
             # below fixes the managed-scope/${VAR} drift without losing that.
             cfg = read_user_config_raw(cfg_path)
             try:
                 from hermes_cli import managed_scope
+
                 cfg = managed_scope.apply_managed_overlay(cfg)
             except Exception:
                 pass
             try:
+                from agent.secret_scope import get_secret
                 from hermes_cli.config import _expand_env_vars
-                expanded = _expand_env_vars(cfg)
+
+                expanded = _expand_env_vars(cfg, env_getter=get_secret)
                 if isinstance(expanded, dict):
                     cfg = expanded
             except Exception:
                 pass
         except Exception:
-            # Transient failure — keep last known-good chain.
             logger.debug(
                 "fallback_providers refresh: config.yaml read failed; "
-                "keeping last known-good chain", exc_info=True,
+                "keeping this profile's last known-good chain",
+                exc_info=True,
             )
-            return self._fallback_model
-        self._fallback_model = get_fallback_chain(cfg) or None
-        return self._fallback_model
+            return cache.get(cache_key)
+
+        chain = get_fallback_chain(cfg) or None
+        cache[cache_key] = chain
+        if cache_key == process_cache_key:
+            self._fallback_model = chain
+        return chain
 
     @staticmethod
     def _apply_fallback_chain_to_agent(agent: Any, chain: list | None) -> None:
@@ -9538,6 +9788,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: SessionSource,
     ) -> tuple[Any, Optional[str]]:
         """Claim a cross-process active-session slot for a new gateway turn."""
+        routing_rejection = self._routing_mutation_rejection(session_key)
+        if routing_rejection is not None:
+            return None, routing_rejection
         if self._is_session_running(session_key):
             return None, None
         local_limit_message = self._active_session_limit_message(session_key)
@@ -15647,6 +15900,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # itself will produce the next user-facing message.
                     return ""
 
+        routing_rejection = self._routing_mutation_rejection(_quick_key)
+        if routing_rejection is not None:
+            return routing_rejection
+
         # Intercept messages that are responses to a pending /reload-mcp
         # (or future) slash-confirm prompt.  Recognized confirm replies are
         # /approve, /always, /cancel (plus short aliases).  Anything else
@@ -16187,6 +16444,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "fast":
             return await self._handle_fast_command(event)
+
+        if canonical == "fallback":
+            return await self._handle_fallback_command(event)
 
         if canonical == "verbose":
             return await self._handle_verbose_command(event)
@@ -17973,7 +18233,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     )
                                 _hyg_session_db = getattr(self._session_db, "_db", self._session_db)
                                 _hyg_agent = AIAgent(
-                                    **_hyg_runtime,
+                                    **_runtime_kwargs_for_agent_constructor(_hyg_runtime),
                                     model=_hyg_model,
                                     max_iterations=4,
                                     quiet_mode=True,
@@ -20593,8 +20853,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
                     session_db=getattr(self._session_db, "_db", self._session_db),
-                    # Reload from disk — do not reuse the startup snapshot (#60955).
-                    fallback_model=self._refresh_fallback_model(),
+                    # Reload from disk and skip the entry already activated manually.
+                    fallback_model=self._refresh_fallback_model()
+                    if type(runtime_kwargs.get("manual_fallback_index")) is not int
+                    else runtime_kwargs["fallback_model"],
                 )
                 try:
                     return agent.run_conversation(
@@ -23677,6 +23939,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 runtime.get("provider", ""),
                 runtime.get("requested_provider", ""),
                 runtime.get("api_mode", ""),
+                runtime.get("fallback_service_tier_override", ""),
                 sorted(enabled_toolsets) if enabled_toolsets else [],
                 # reasoning_config excluded — it's set per-message on the
                 # cached agent and doesn't affect system prompt or tools.

@@ -721,7 +721,10 @@ def _lift_extra_headers(entry: Dict[str, Any], result: Dict[str, Any]) -> None:
         result["extra_headers"] = extra_headers
 
 
-def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, Any]]:
+def _get_named_custom_provider(
+    requested_provider: str,
+    config: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
     requested_norm = _normalize_custom_provider_name(requested_provider or "")
     if not requested_norm:
         return None
@@ -760,7 +763,10 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
             if (canonical or "").strip().lower() == requested_norm:
                 return None
 
-    config = load_config()
+    if config is None:
+        config = load_config()
+    if not isinstance(config, dict):
+        return None
     
     # First check providers: dict (new-style user-defined providers)
     providers = config.get("providers")
@@ -1106,6 +1112,7 @@ def _resolve_named_custom_runtime(
     requested_provider: str,
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
+    runtime_config: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     # Bare `provider="custom"` with an explicit base_url (e.g. propagated
     # from a `model_aliases:` direct-alias resolution) — build a runtime
@@ -1158,7 +1165,13 @@ def _resolve_named_custom_runtime(
             "requested_provider": requested_provider,
         }
 
-    custom_provider = _get_named_custom_provider(requested_provider)
+    if runtime_config is None:
+        custom_provider = _get_named_custom_provider(requested_provider)
+    else:
+        custom_provider = _get_named_custom_provider(
+            requested_provider,
+            config=runtime_config,
+        )
     if not custom_provider:
         return None
 
@@ -1721,6 +1734,7 @@ def resolve_runtime_provider(
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
     target_model: Optional[str] = None,
+    runtime_config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Resolve runtime provider credentials for agent execution.
 
@@ -1745,7 +1759,7 @@ def resolve_runtime_provider(
     # Fail fast with a typed error so the fallback chain can advance to
     # the next provider instead of using a disabled one.
     from hermes_cli.config import is_provider_enabled, load_config
-    _full_cfg = load_config()
+    _full_cfg = runtime_config if runtime_config is not None else load_config()
     _provs_cfg = _full_cfg.get("providers") if isinstance(_full_cfg, dict) else None
     if isinstance(_provs_cfg, dict):
         _block = _provs_cfg.get(requested_provider)
@@ -1837,6 +1851,7 @@ def resolve_runtime_provider(
         requested_provider=requested_provider,
         explicit_api_key=explicit_api_key,
         explicit_base_url=explicit_base_url,
+        runtime_config=runtime_config,
     )
     if custom_runtime:
         custom_runtime["requested_provider"] = requested_provider
