@@ -15,6 +15,7 @@ import logging
 import mimetypes
 import os
 import re
+import time
 from pathlib import Path
 from urllib.request import url2pathname
 from typing import Any, Dict, List, Optional, Tuple
@@ -187,6 +188,9 @@ class MattermostAdapter(BasePlatformAdapter):
             config.extra.get("reply_mode", "") or _get_scoped_secret("MATTERMOST_REPLY_MODE", "off")).lower()
         self._last_post_status: Optional[int] = None  # POST-only, read by the broken-thread-root fallback
         self._last_post_error: str = ""
+        # Bounded pending seeds created by the handoff hook. The first send
+        # replaces the placeholder through the native edit/receipt path.
+        self._empty_handoff_seeds: Dict[str, float] = {}
         self._dedup = MessageDeduplicator()
 
     # --- HTTP helpers ---
@@ -411,6 +415,32 @@ class MattermostAdapter(BasePlatformAdapter):
         data = await self._api_get(f"posts/{post_id}")
         return data["root_id"] if data and data.get("root_id") else post_id
 
+    async def create_handoff_thread(self, parent_chat_id: str, name: str) -> Optional[str]:
+        """Open a placeholder for callers that need a thread ID before content.
+
+        The first send replaces the seed so the report itself becomes the root.
+        Adapted from Joshua J. Scott's Mattermost handoff contribution.
+        """
+        if not self._session:
+            return None
+        seed_text = f":thread: {(name or 'Hermes session').strip()[:80]}"
+        payload = _with_mentions_disabled({"channel_id": parent_chat_id, "message": seed_text})
+        try:
+            data = await self._api_post("posts", payload)
+        except Exception as exc:
+            logger.warning("[%s] Handoff thread: seed-post failed for channel %s: %s",
+                           self.name, parent_chat_id, exc)
+            return None
+        post_id = (data or {}).get("id")
+        if not post_id:
+            logger.warning("[%s] Handoff thread: seed-post returned no id for channel %s: %s",
+                           self.name, parent_chat_id, self._last_post_error)
+            return None
+        self._empty_handoff_seeds[str(post_id)] = time.monotonic()
+        while len(self._empty_handoff_seeds) > 64:
+            self._empty_handoff_seeds.pop(next(iter(self._empty_handoff_seeds)))
+        return str(post_id)
+
     def _source_chunks(self, content: str) -> List[str]:
         """Slice before rendering; never recover source positions from wire chunks."""
         if len(self.format_message(content)) <= self.MAX_MESSAGE_LENGTH:
@@ -433,6 +463,14 @@ class MattermostAdapter(BasePlatformAdapter):
         """Send a message (or multiple chunks) to a channel; reply_to / metadata["thread_id"] is the root post."""
         if not content:
             return SendResult(success=True)
+        candidate = (metadata or {}).get("thread_id") or (metadata or {}).get("root_id")
+        if self._reply_mode == "thread":
+            candidate = reply_to or candidate
+        if candidate and str(candidate) in self._empty_handoff_seeds:
+            self._empty_handoff_seeds.pop(str(candidate))
+            return await self.edit_message(
+                chat_id, str(candidate), content,
+                metadata={**(metadata or {}), "mattermost_explicit_thread": True})
         ids = []
         data: Dict[str, Any] = {}
         confirmed = attempted = 0

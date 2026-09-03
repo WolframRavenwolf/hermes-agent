@@ -1711,3 +1711,90 @@ class TestMultiplexProfileScope:
             # os.environ.
             assert "MATTERMOST_REQUIRE_MENTION" not in os.environ
 
+
+
+class TestMattermostHandoffThread:
+    """``create_handoff_thread`` anchors a continuable session on a seed post."""
+
+    def setup_method(self):
+        self.adapter = _make_adapter()
+        self.adapter._session = MagicMock()
+
+    def _post_returning(self, body, status=200):
+        mock_resp = AsyncMock()
+        mock_resp.status = status
+        mock_resp.json = AsyncMock(return_value=body)
+        mock_resp.text = AsyncMock(return_value="" if status < 400 else "server error")
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+        self.adapter._session.post = MagicMock(return_value=mock_resp)
+
+    @pytest.mark.asyncio
+    async def test_seed_post_id_becomes_the_thread_id(self):
+        """Without the seed post id every cron send lands flat in the channel."""
+        self._post_returning({"id": "seed_post"})
+        thread_id = await self.adapter.create_handoff_thread("channel_1", "Inbox Triage")
+        assert thread_id == "seed_post"
+        call_args = self.adapter._session.post.call_args
+        assert "/api/v4/posts" in call_args[0][0]
+        payload = call_args[1]["json"]
+        assert payload["channel_id"] == "channel_1"
+        assert "Inbox Triage" in payload["message"]
+        assert "root_id" not in payload
+
+    @pytest.mark.asyncio
+    async def test_failed_seed_post_yields_no_thread(self):
+        """Callers fall back to the flat DM on ``None``; never raise."""
+        self._post_returning({}, status=500)
+        assert await self.adapter.create_handoff_thread("channel_1", "review") is None
+
+    @pytest.mark.asyncio
+    async def test_no_session_yields_no_thread(self):
+        self.adapter._session = None
+        assert await self.adapter.create_handoff_thread("channel_1", "review") is None
+
+
+class TestMattermostSeedReplacement:
+    """The first send into a create_handoff_thread thread replaces the seed post."""
+
+    def setup_method(self):
+        self.adapter = _make_adapter()
+        self.adapter._session = MagicMock()
+        self.adapter._api_get = AsyncMock(return_value={"id": "seed_post", "root_id": ""})
+
+    def _http(self, method, body):
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(return_value=body)
+        mock_resp.text = AsyncMock(return_value="")
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+        setattr(self.adapter._session, method, MagicMock(return_value=mock_resp))
+
+    @pytest.mark.asyncio
+    async def test_first_send_replaces_seed_then_later_sends_nest(self):
+        """The brief must be the thread root, not a reply under a placeholder."""
+        self._http("post", {"id": "seed_post"})
+        self._http("put", {"id": "seed_post"})
+        assert await self.adapter.create_handoff_thread("channel_1", "Inbox Triage") == "seed_post"
+
+        first = await self.adapter.send("channel_1", "The brief", metadata={"thread_id": "seed_post", "mattermost_explicit_thread": True})
+        assert first.success and first.message_id == "seed_post"
+        put_args = self.adapter._session.put.call_args
+        assert put_args[0][0].endswith("/api/v4/posts/seed_post/patch")
+        assert put_args[1]["json"]["message"] == "The brief"
+        assert self.adapter._session.post.call_count == 1  # only the seed itself
+
+        self._http("post", {"id": "reply_post"})
+        second = await self.adapter.send("channel_1", "Applied.", metadata={"thread_id": "seed_post", "mattermost_explicit_thread": True})
+        assert second.message_id == "reply_post"
+        assert self.adapter._session.post.call_args[1]["json"]["root_id"] == "seed_post"
+
+    @pytest.mark.asyncio
+    async def test_unknown_thread_is_never_replaced(self):
+        """Only seeds this adapter created are replaced; any other root gets a reply."""
+        self._http("post", {"id": "reply_post"})
+        self._http("put", {"id": "should_not_happen"})
+        result = await self.adapter.send("channel_1", "Hi", metadata={"thread_id": "seed_post", "mattermost_explicit_thread": True})
+        assert result.message_id == "reply_post"
+        assert not self.adapter._session.put.called
