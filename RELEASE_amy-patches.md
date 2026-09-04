@@ -415,3 +415,17 @@ This ledger documents the downstream patches maintained on `amy/patches`. Detail
   - 401 affected tests passed.
   - 244 adjacent tests passed.
 - **Session reference:** Local implementation session, 2026-08-28 to 2026-08-29.
+
+## P31 - fix(terminal): restore verified gateway self-restart
+
+- **Problem:** The trusted canonical restart-helper digest drifted after a reviewed helper update. On macOS systems where the Hermes home lives on an external ownership-disabled APFS volume, launchd also rejected the one-shot worker's control plist and later denied its unsigned interpreter access to the external worker, while the helper could still report only that submission had been attempted.
+- **Solution:** Refresh the exact trusted-helper digest after hardening the canonical helper's external handoff: keep launchd's temporary plist, initial standard I/O, and working directory on the ownership-enabled home volume; reuse the already installed and signed gateway app wrapper with only its required Python runtime environment; retain SHA-256 and file-descriptor binding for the frozen worker; and require an atomic worker-started handshake before reporting a successful submission. Arbitrary gateway lifecycle commands remain blocked.
+- **Affected files:**
+  - `RELEASE_amy-patches.md`
+  - `tools/terminal_tool.py`
+- **Verification:**
+  - 134 focused gateway-lifecycle and terminal-tool tests passed in an isolated Hermes test home.
+  - Four canonical-helper contract tests and Bash syntax validation passed in the private runtime repository.
+  - A live gateway-hosted dry-run produced both worker-started and success receipts, preserved the gateway PID, and removed the one-shot launchd job.
+- **Rollback:** Revert this patch together with the matching private canonical-helper hardening commit; the generic in-gateway lifecycle guard remains the fail-closed fallback.
+- **Session reference:** Local implementation session, 2026-09-04.

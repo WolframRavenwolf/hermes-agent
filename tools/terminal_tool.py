@@ -54,7 +54,7 @@ from utils import env_var_enabled
 logger = logging.getLogger(__name__)
 
 _CANONICAL_RESTART_HELPER_SHA256 = (
-    "2b701ed6fd77970df01ef2a8eb7cebab1bc3e8cda76fbe31abae0d17b3602236"
+    "18f2175f7b146b942ed2b10ac516ea2af975e09d0b4fcaf4d66d19625ef2860f"
 )
 _RESTART_BROKER_FIXED_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 _RESTART_BROKER_HANDOFF_ENV = ("HOME", "HERMES_HOME", "_HERMES_GATEWAY")
