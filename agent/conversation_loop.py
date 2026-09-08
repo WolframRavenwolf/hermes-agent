@@ -304,8 +304,7 @@ _HANDOFF_SKIP_FINAL_RESPONSE = (
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
 
-def _should_rearm_compression_budget(
-    compression_attempts: int,
+def _provider_confirms_completed_compaction(
     *,
     completed_compaction_pending: bool,
     prompt_tokens: int,
@@ -319,10 +318,35 @@ def _should_rearm_compression_budget(
     count below the threshold from the next successful provider response.
     """
     return bool(
-        compression_attempts
-        and completed_compaction_pending
+        completed_compaction_pending
         and threshold_tokens > 0
         and 0 < prompt_tokens < threshold_tokens
+    )
+
+
+def _should_rearm_compression_budget(
+    compression_attempts: int,
+    *,
+    completed_compaction_pending: bool,
+    prompt_tokens: int,
+    threshold_tokens: int,
+) -> bool:
+    """Return True when provider-confirmed recovery has a spent budget."""
+    return bool(
+        compression_attempts
+        and _provider_confirms_completed_compaction(
+            completed_compaction_pending=completed_compaction_pending,
+            prompt_tokens=prompt_tokens,
+            threshold_tokens=threshold_tokens,
+        )
+    )
+
+
+def _preserve_completed_history_compaction_verdict(pending: bool, compressor: Any) -> bool:
+    """Retain a completed boundary across model resets and subsequent no-ops."""
+    return bool(
+        pending
+        or getattr(compressor, "_verify_compaction_cleared_threshold", False)
     )
 
 
@@ -2044,6 +2068,13 @@ def run_conversation(
     # agent_init); default 3 preserves the prior hardcoded behavior for
     # objects without the attribute (older pickles / minimal stubs).
     max_compression_attempts = getattr(agent, "max_compression_attempts", 3)
+    # update_model() clears model-scoped effectiveness state on fallback.
+    # Keep a completed history boundary (including the turn prologue's) until
+    # its next successful response, even if an intervening attempt no-ops.
+    # No-usage / non-fitting feedback consumes this turn-local verdict too.
+    _pending_history_compaction_verdict = _preserve_completed_history_compaction_verdict(
+        False, agent.context_compressor
+    )
     _last_preflight_pressure: Optional[int] = None
     _preflight_compression_blocked = _ctx.preflight_compression_blocked
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
@@ -2847,6 +2878,9 @@ def run_conversation(
                 system_message,
                 approx_tokens=request_pressure_tokens,
                 task_id=effective_task_id,
+            )
+            _pending_history_compaction_verdict = _preserve_completed_history_compaction_verdict(
+                _pending_history_compaction_verdict, agent.context_compressor
             )
             if messages is _pre_api_input and (
                 compression_skipped_due_to_lock(agent)
@@ -4291,18 +4325,14 @@ def run_conversation(
                         "cache_write_tokens": canonical_usage.cache_write_tokens,
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                     }
-                    # Capture the boundary latch before update_from_response()
-                    # consumes it. Only a real provider prompt count for the
-                    # request immediately following a completed compaction can
-                    # prove that attempt effective and rearm the shared budget.
-                    _completed_compaction_pending = bool(
-                        getattr(
-                            agent.context_compressor,
-                            "_verify_compaction_cleared_threshold",
-                            False,
-                        )
+                    # Merge before update_from_response() consumes the model
+                    # latch. A fallback may have cleared that latch already;
+                    # the turn still owns exactly this next response's verdict.
+                    _completed_compaction_pending = _preserve_completed_history_compaction_verdict(
+                        _pending_history_compaction_verdict, agent.context_compressor
                     )
                     agent.context_compressor.update_from_response(usage_dict)
+                    _pending_history_compaction_verdict = False
                     # Usage-anchored context accounting: snapshot this
                     # response's exact provider-reported usage against the
                     # durable transcript. Later context-size checks anchor on
@@ -4326,20 +4356,25 @@ def run_conversation(
                         getattr(agent.context_compressor, "threshold_tokens", 0)
                         or 0
                     )
-                    if _should_rearm_compression_budget(
-                        compression_attempts,
+                    if _provider_confirms_completed_compaction(
                         completed_compaction_pending=_completed_compaction_pending,
                         prompt_tokens=prompt_tokens,
                         threshold_tokens=_compression_threshold,
                     ):
-                        logger.info(
-                            "Compression budget rearmed after provider-confirmed "
-                            "recovery: prompt=%s < threshold=%s (attempts were %s/%s)",
-                            f"{prompt_tokens:,}",
-                            f"{_compression_threshold:,}",
+                        if _should_rearm_compression_budget(
                             compression_attempts,
-                            max_compression_attempts,
-                        )
+                            completed_compaction_pending=_completed_compaction_pending,
+                            prompt_tokens=prompt_tokens,
+                            threshold_tokens=_compression_threshold,
+                        ):
+                            logger.info(
+                                "Compression budget rearmed after provider-confirmed "
+                                "recovery: prompt=%s < threshold=%s (attempts were %s/%s)",
+                                f"{prompt_tokens:,}",
+                                f"{_compression_threshold:,}",
+                                compression_attempts,
+                                max_compression_attempts,
+                            )
                         compression_attempts = 0
                         # Provider-confirmed recovery also invalidates the
                         # insufficient-progress preflight state: with the
@@ -4352,6 +4387,8 @@ def run_conversation(
                         # though the attempt budget was just rearmed, so a
                         # later pressure spike would grow unchecked until the
                         # provider's overflow handler fired.
+                        # This also applies when fallback already reset the
+                        # counter, or only the prologue has compacted so far.
                         _preflight_compression_blocked = False
                         _last_preflight_pressure = None
 
@@ -4362,10 +4399,18 @@ def run_conversation(
                     # of interest is the cost/size of the latest assembled
                     # request, so we keep the most recent call's usage.
                     agent._last_turn_usage = dict(usage_dict)
-                elif getattr(
-                    agent.context_compressor,
-                    "awaiting_real_usage_after_compression",
-                    False,
+                elif (
+                    _pending_history_compaction_verdict
+                    or getattr(
+                        agent.context_compressor,
+                        "awaiting_real_usage_after_compression",
+                        False,
+                    )
+                    or getattr(
+                        agent.context_compressor,
+                        "_verify_compaction_cleared_threshold",
+                        False,
+                    )
                 ):
                     # A response with no usage cannot adjudicate whether the
                     # prior compaction cleared the threshold. Consume the pending
@@ -4373,6 +4418,7 @@ def run_conversation(
                     # charged to that old compaction, and so preflight deferral
                     # does not remain latched indefinitely.
                     agent.context_compressor.update_from_response({})
+                    _pending_history_compaction_verdict = False
 
                 if hasattr(response, 'usage') and response.usage:
                     # Cache discovered context length after successful call.
@@ -5532,6 +5578,9 @@ def run_conversation(
                             approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
                             task_id=effective_task_id,
                         )
+                        _pending_history_compaction_verdict = _preserve_completed_history_compaction_verdict(
+                            _pending_history_compaction_verdict, agent.context_compressor
+                        )
                         conversation_history = conversation_history_after_compression(
                             agent, messages, conversation_history
                         )
@@ -5828,6 +5877,9 @@ def run_conversation(
                         approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
                         task_id=effective_task_id,
                     )
+                    _pending_history_compaction_verdict = _preserve_completed_history_compaction_verdict(
+                        _pending_history_compaction_verdict, agent.context_compressor
+                    )
                     if messages is _overflow_input and compression_skipped_due_to_lock(agent):
                         # #69870 lock-skip: the provider proved the request
                         # does not fit, but this compression pass no-oped only
@@ -6004,6 +6056,9 @@ def run_conversation(
                                 approx_tokens=request_input_estimate,
                                 task_id=effective_task_id,
                             )
+                            _pending_history_compaction_verdict = _preserve_completed_history_compaction_verdict(
+                                _pending_history_compaction_verdict, agent.context_compressor
+                            )
                             if messages is _overflow_input and compression_skipped_due_to_lock(agent):
                                 compression_attempts -= 1
                                 agent._persist_session(messages, conversation_history)
@@ -6166,6 +6221,9 @@ def run_conversation(
                         messages, system_message,
                         approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
                         task_id=effective_task_id,
+                    )
+                    _pending_history_compaction_verdict = _preserve_completed_history_compaction_verdict(
+                        _pending_history_compaction_verdict, agent.context_compressor
                     )
                     if messages is _overflow_input and compression_skipped_due_to_lock(agent):
                         # #69870 lock-skip: the provider proved the request
@@ -7791,6 +7849,9 @@ def run_conversation(
                         messages, system_message,
                         approx_tokens=_real_tokens,
                         task_id=effective_task_id,
+                    )
+                    _pending_history_compaction_verdict = _preserve_completed_history_compaction_verdict(
+                        _pending_history_compaction_verdict, agent.context_compressor
                     )
                     if (
                         messages is _post_tool_input
