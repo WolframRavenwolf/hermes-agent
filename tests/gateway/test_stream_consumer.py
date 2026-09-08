@@ -228,6 +228,96 @@ class TestSendOrEditMediaStripping:
         assert result is True
         adapter.send.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_minimum_platform_limit_includes_streaming_cursor(self):
+        adapter = MagicMock()
+        adapter.MAX_MESSAGE_LENGTH = 500
+        adapter.send = AsyncMock(
+            side_effect=lambda **_kw: SimpleNamespace(
+                success=True,
+                message_id=f"msg-{adapter.send.await_count}",
+            )
+        )
+        adapter.edit_message = AsyncMock(
+            return_value=SimpleNamespace(success=True)
+        )
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(
+                edit_interval=0.01,
+                buffer_threshold=1,
+                cursor="▉",
+            ),
+        )
+
+        consumer.on_delta("x" * 500)
+        task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.08)
+        consumer.finish()
+        await task
+
+        payloads = [
+            call.kwargs["content"]
+            for call in (*adapter.send.call_args_list, *adapter.edit_message.call_args_list)
+        ]
+        assert payloads
+        assert all(len(payload) <= 500 for payload in payloads)
+
+    @pytest.mark.asyncio
+    async def test_oversized_cursor_keeps_one_preview_post_under_platform_cap(self):
+        """A configured cursor must never force a nested adapter split."""
+        visible = {}
+        posted_payloads = []
+        edited_payloads = []
+        send_chunk_counts = []
+
+        async def fake_send(*, content, **_kwargs):
+            chunks = [content[index:index + 500] for index in range(0, len(content), 500)]
+            send_chunk_counts.append(len(chunks))
+            last_id = None
+            for chunk in chunks:
+                last_id = f"post-{len(posted_payloads) + 1}"
+                posted_payloads.append({"message": chunk})
+                visible[last_id] = chunk
+            return SimpleNamespace(success=True, message_id=last_id)
+
+        async def fake_edit(*, message_id, content, **_kwargs):
+            edited_payloads.append({"message": content})
+            visible[message_id] = content
+            return SimpleNamespace(success=True, message_id=message_id)
+
+        adapter = SimpleNamespace(
+            MAX_MESSAGE_LENGTH=500,
+            send=AsyncMock(side_effect=fake_send),
+            edit_message=AsyncMock(side_effect=fake_edit),
+            truncate_message=lambda text, limit: [
+                text[index:index + limit] for index in range(0, len(text), limit)
+            ],
+        )
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(
+                edit_interval=0.01,
+                buffer_threshold=1,
+                cursor="C" * 500,
+            ),
+        )
+
+        streamed_text = "x" * 467 + "`"
+        consumer.on_delta(streamed_text)
+        task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.08)
+        consumer.finish()
+        await task
+
+        wire_payloads = posted_payloads + edited_payloads
+        assert wire_payloads
+        assert all(len(payload["message"]) <= 500 for payload in wire_payloads)
+        assert send_chunk_counts and all(count == 1 for count in send_chunk_counts)
+        assert "".join(visible.values()) == streamed_text + "`"
+
 
 # ── Integration: full stream run ─────────────────────────────────────────
 

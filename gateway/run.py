@@ -31789,6 +31789,209 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return get_hermes_home()
 
+    @staticmethod
+    def _stream_confirmed_final_delivery(
+        consumer,
+        final_text: str,
+        *,
+        previewed: bool = False,
+    ) -> bool:
+        """Return True only when the actual final reply reached the user."""
+        if consumer is None:
+            return False
+        if getattr(consumer, "final_response_sent", False):
+            # A successful finalize call is not proof the *content* was
+            # final: the edit may have carried only the last preview
+            # snapshot while the tail generated between that snapshot and
+            # stream completion never reached any API call (#71643).
+            # Reconcile the recorded turn-final payload against the
+            # completed response; only a demonstrable mismatch (False)
+            # overrides the flag — including payload-less multi-message
+            # split delivery (#78541). None (no record on a non-split
+            # legacy path) keeps the legacy trust so ambiguous-timeout
+            # dedup is not regressed.
+            matcher = getattr(consumer, "delivered_final_matches", None)
+            if callable(matcher):
+                try:
+                    if matcher(final_text) is False:
+                        return False
+                except Exception:
+                    pass
+            return True
+        if previewed:
+            has_delivered_text = getattr(consumer, "has_delivered_text", None)
+            if callable(has_delivered_text):
+                try:
+                    return bool(has_delivered_text(final_text))
+                except Exception:
+                    return False
+        return False
+
+
+    async def _run_agent_mark_streamed_delivery(self, response, turn_ctx) -> None:
+        """Reconcile streamed text before the normal final-delivery fallback."""
+        _sc = turn_ctx.stream_consumer_holder[0]
+        source, session_key = turn_ctx.source, turn_ctx.session_key
+        if isinstance(response, dict) and not response.get("failed"):
+            _final = response.get("final_response") or ""
+            _is_empty_sentinel = not _final or _final == "(empty)"
+            # Source-aware lost acknowledgements own their attempted spans,
+            # before stale/split/plugin-transformed paths can replay the body.
+            if (not _is_empty_sentinel and _sc is not None
+                    and getattr(_sc, "source_delivery_pending", False) is True):
+                if await _sc.reconcile_source_final(_final):
+                    response["already_sent"] = True
+                # A stale/stopped source owner must not enter the legacy
+                # transformed/stale edit paths after declining reconciliation.
+                return
+            # response_previewed means the interim_assistant_callback already
+            # saw the final text, but only suppress the normal send if that
+            # exact final text was delivered. Unrelated commentary/progress
+            # must not be mistaken for the final response (#14238).
+            _previewed = bool(response.get("response_previewed"))
+            _content_delivered = bool(
+                _sc and getattr(_sc, "final_content_delivered", False)
+            )
+            # #71643: a *successful* finalize edit can still carry only the
+            # last preview snapshot — deltas generated between that edit and
+            # stream completion never reach any API call, and both suppression
+            # flags are set from the call's success rather than its content.
+            # Reconcile the consumer's recorded turn-final payload against the
+            # completed response: on a demonstrable mismatch (False) neither
+            # final_response_sent nor final_content_delivered may suppress the
+            # normal final send. False also covers payload-less multi-message
+            # split delivery (#78541). None (no record on a non-split legacy
+            # path) keeps legacy trust; the failed-finalize family
+            # (#51828 / #33793) is unaffected because those paths leave the
+            # flags False or record the complete fallback payload.
+            _stale_finalized = False
+            if _content_delivered and not _is_empty_sentinel:
+                _matcher = getattr(_sc, "delivered_final_matches", None)
+                if callable(_matcher):
+                    try:
+                        _stale_finalized = _matcher(_final) is False
+                    except Exception:
+                        _stale_finalized = False
+                if _stale_finalized:
+                    _content_delivered = False
+            # Plugin hooks (e.g. transform_llm_output) may have appended content
+            # after streaming finished — when the response was transformed, always
+            # send the final version so the appended content reaches the client.
+            _transformed = bool(response.get("response_transformed"))
+            # Only suppress the normal send when the actual final reply reached
+            # the user: the stream consumer streamed it (final_response_sent /
+            # final_content_delivered), or the interim preview delivered that
+            # *exact* final text. Unrelated commentary/progress shown during a
+            # compression/session split must not be mistaken for the final
+            # response (#14238).
+            _streamed = self._stream_confirmed_final_delivery(
+                _sc,
+                _final,
+                previewed=_previewed,
+            )
+            if not _is_empty_sentinel and not _transformed and (_streamed or _content_delivered):
+                logger.info(
+                    "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).",
+                    session_key or "?",
+                    _streamed,
+                    _previewed,
+                    _content_delivered,
+                )
+                response["already_sent"] = True
+            elif not _is_empty_sentinel and not _transformed and _stale_finalized and _sc is not None:
+                # Stale finalize (#71643): the streamed message holds only the
+                # last preview snapshot. Prefer editing it up to the complete
+                # response (same shape as the transformed branch below) so the
+                # user gets one corrected message; on edit failure fall through
+                # with already_sent unset so the normal final send delivers the
+                # complete text.
+                #
+                # Not valid for a multi-message split delivery: there
+                # ``message_id`` is only the LAST chunk, so editing it with the
+                # complete response would repeat every sealed head chunk's text
+                # inside the tail message. Fall through to the normal final send
+                # instead (#78541).
+                _sc_msg_id = _sc.message_id
+                _sc_adapter = getattr(_sc, "adapter", None)
+                if getattr(_sc, "_turn_split_delivery", False):
+                    logger.info(
+                        "Stale streamed finalize detected for session %s on a multi-message split; skipping the in-place reconciliation edit and delivering the complete response via normal final send (#78541).",
+                        session_key or "?",
+                    )
+                elif _sc_msg_id and _sc_msg_id != "__no_edit__" and _sc_adapter is not None:
+                    try:
+                        _reconcile_res = await _sc_adapter.edit_message(
+                            chat_id=source.chat_id,
+                            message_id=_sc_msg_id,
+                            content=_final,
+                            finalize=True,
+                        )
+                        if getattr(_reconcile_res, "success", True):
+                            response["already_sent"] = True
+                            logger.info(
+                                "Reconciled stale streamed finalize for session %s: edited message %s with the complete response (#71643).",
+                                session_key or "?", _sc_msg_id,
+                            )
+                        else:
+                            logger.warning(
+                                "Stale-finalize reconciliation edit failed for session %s (%s); sending complete response via normal final send.",
+                                session_key or "?",
+                                getattr(_reconcile_res, "error", None),
+                            )
+                    except Exception as _edit_err:
+                        logger.warning(
+                            "Stale-finalize reconciliation edit failed for session %s: %s; sending complete response via normal final send.",
+                            session_key or "?", _edit_err,
+                        )
+                else:
+                    logger.info(
+                        "Stale streamed finalize detected for session %s with no editable message; delivering complete response via normal final send (#71643).",
+                        session_key or "?",
+                    )
+            elif not _is_empty_sentinel and _transformed and _sc is not None:
+                # Plugin hooks transformed the response after streaming — edit the
+                # existing streamed message instead of sending a duplicate.
+                _sc_msg_id = _sc.message_id
+                if _sc_msg_id:
+                    try:
+                        await _sc.adapter.edit_message(
+                            chat_id=source.chat_id,
+                            message_id=_sc_msg_id,
+                            content=response["final_response"],
+                            finalize=True,
+                        )
+                        response["already_sent"] = True
+                        logger.info(
+                            "Edited streamed message %s for session %s to include plugin-transformed content.",
+                            _sc_msg_id, session_key or "?",
+                        )
+                    except Exception as _edit_err:
+                        logger.warning(
+                            "Failed to edit streamed message for session %s: %s",
+                            session_key or "?", _edit_err,
+                        )
+            elif _sc is not None and not _is_empty_sentinel:
+                # DUPLICATE-RISK DIAGNOSTIC: a stream consumer existed for this
+                # turn but suppression did NOT fire, so the gateway's normal
+                # final-send is about to run. On WeCom this is the exact window
+                # that produced "回复了两条" — a final-frame ack still in flight
+                # (final_content_delivered not yet set) while this send races
+                # ahead. Log the decision inputs so a recurrence can be pinned to
+                # "signal never set" vs "ack-pending race".
+                # See docs/rca-wecom-stream-final-ack-timeout-duplicate.md.
+                logger.warning(
+                    "Normal final-send NOT suppressed despite active stream "
+                    "consumer for session %s: streamed=%s previewed=%s "
+                    "content_delivered=%s transformed=%s final_len=%d — "
+                    "possible duplicate send (see wecom ack-timeout RCA).",
+                    session_key or "?",
+                    _streamed,
+                    _previewed,
+                    _content_delivered,
+                    _transformed,
+                    len(_final),
+                )
+
     async def _run_agent_inner(
         self,
         message: str,
@@ -32795,42 +32998,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         _notify_task = asyncio.create_task(_notify_long_running())
 
-        def _stream_confirmed_final_delivery(
-            consumer,
-            final_text: str,
-            *,
-            previewed: bool = False,
-        ) -> bool:
-            """Return True only when the actual final reply reached the user."""
-            if consumer is None:
-                return False
-            if getattr(consumer, "final_response_sent", False):
-                # A successful finalize call is not proof the *content* was
-                # final: the edit may have carried only the last preview
-                # snapshot while the tail generated between that snapshot and
-                # stream completion never reached any API call (#71643).
-                # Reconcile the recorded turn-final payload against the
-                # completed response; only a demonstrable mismatch (False)
-                # overrides the flag — including payload-less multi-message
-                # split delivery (#78541). None (no record on a non-split
-                # legacy path) keeps the legacy trust so ambiguous-timeout
-                # dedup is not regressed.
-                matcher = getattr(consumer, "delivered_final_matches", None)
-                if callable(matcher):
-                    try:
-                        if matcher(final_text) is False:
-                            return False
-                    except Exception:
-                        pass
-                return True
-            if previewed:
-                has_delivered_text = getattr(consumer, "has_delivered_text", None)
-                if callable(has_delivered_text):
-                    try:
-                        return bool(has_delivered_text(final_text))
-                    except Exception:
-                        return False
-            return False
 
         try:
             # Run in thread pool to not block.  Use an *inactivity*-based
@@ -33342,7 +33509,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _delivery_result = response if isinstance(response, dict) else (result or {})
                     _previewed = bool(_delivery_result.get("response_previewed"))
                     first_response = _delivery_result.get("final_response", "")
-                    _already_streamed = _stream_confirmed_final_delivery(
+                    _already_streamed = self._stream_confirmed_final_delivery(
                         _sc,
                         first_response,
                         previewed=_previewed,
@@ -33651,157 +33818,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # tool call, setting already_sent=True, but that text is NOT the
         # final answer.  Suppressing delivery here leaves the user staring
         # at silence.  (#10xxx — "agent stops after web search")
-        _sc = stream_consumer_holder[0]
-        if isinstance(response, dict) and not response.get("failed"):
-            _final = response.get("final_response") or ""
-            _is_empty_sentinel = not _final or _final == "(empty)"
-            # response_previewed means the interim_assistant_callback already
-            # saw the final text, but only suppress the normal send if that
-            # exact final text was delivered. Unrelated commentary/progress
-            # must not be mistaken for the final response (#14238).
-            _previewed = bool(response.get("response_previewed"))
-            _content_delivered = bool(
-                _sc and getattr(_sc, "final_content_delivered", False)
-            )
-            # #71643: a *successful* finalize edit can still carry only the
-            # last preview snapshot — deltas generated between that edit and
-            # stream completion never reach any API call, and both suppression
-            # flags are set from the call's success rather than its content.
-            # Reconcile the consumer's recorded turn-final payload against the
-            # completed response: on a demonstrable mismatch (False) neither
-            # final_response_sent nor final_content_delivered may suppress the
-            # normal final send. False also covers payload-less multi-message
-            # split delivery (#78541). None (no record on a non-split legacy
-            # path) keeps legacy trust; the failed-finalize family
-            # (#51828 / #33793) is unaffected because those paths leave the
-            # flags False or record the complete fallback payload.
-            _stale_finalized = False
-            if _content_delivered and not _is_empty_sentinel:
-                _matcher = getattr(_sc, "delivered_final_matches", None)
-                if callable(_matcher):
-                    try:
-                        _stale_finalized = _matcher(_final) is False
-                    except Exception:
-                        _stale_finalized = False
-                if _stale_finalized:
-                    _content_delivered = False
-            # Plugin hooks (e.g. transform_llm_output) may have appended content
-            # after streaming finished — when the response was transformed, always
-            # send the final version so the appended content reaches the client.
-            _transformed = bool(response.get("response_transformed"))
-            # Only suppress the normal send when the actual final reply reached
-            # the user: the stream consumer streamed it (final_response_sent /
-            # final_content_delivered), or the interim preview delivered that
-            # *exact* final text. Unrelated commentary/progress shown during a
-            # compression/session split must not be mistaken for the final
-            # response (#14238).
-            _streamed = _stream_confirmed_final_delivery(
-                _sc,
-                _final,
-                previewed=_previewed,
-            )
-            if not _is_empty_sentinel and not _transformed and (_streamed or _content_delivered):
-                logger.info(
-                    "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).",
-                    session_key or "?",
-                    _streamed,
-                    _previewed,
-                    _content_delivered,
-                )
-                response["already_sent"] = True
-            elif not _is_empty_sentinel and not _transformed and _stale_finalized and _sc is not None:
-                # Stale finalize (#71643): the streamed message holds only the
-                # last preview snapshot. Prefer editing it up to the complete
-                # response (same shape as the transformed branch below) so the
-                # user gets one corrected message; on edit failure fall through
-                # with already_sent unset so the normal final send delivers the
-                # complete text.
-                #
-                # Not valid for a multi-message split delivery: there
-                # ``message_id`` is only the LAST chunk, so editing it with the
-                # complete response would repeat every sealed head chunk's text
-                # inside the tail message. Fall through to the normal final send
-                # instead (#78541).
-                _sc_msg_id = _sc.message_id
-                _sc_adapter = getattr(_sc, "adapter", None)
-                if getattr(_sc, "_turn_split_delivery", False):
-                    logger.info(
-                        "Stale streamed finalize detected for session %s on a multi-message split; skipping the in-place reconciliation edit and delivering the complete response via normal final send (#78541).",
-                        session_key or "?",
-                    )
-                elif _sc_msg_id and _sc_msg_id != "__no_edit__" and _sc_adapter is not None:
-                    try:
-                        _reconcile_res = await _sc_adapter.edit_message(
-                            chat_id=source.chat_id,
-                            message_id=_sc_msg_id,
-                            content=_final,
-                            finalize=True,
-                        )
-                        if getattr(_reconcile_res, "success", True):
-                            response["already_sent"] = True
-                            logger.info(
-                                "Reconciled stale streamed finalize for session %s: edited message %s with the complete response (#71643).",
-                                session_key or "?", _sc_msg_id,
-                            )
-                        else:
-                            logger.warning(
-                                "Stale-finalize reconciliation edit failed for session %s (%s); sending complete response via normal final send.",
-                                session_key or "?",
-                                getattr(_reconcile_res, "error", None),
-                            )
-                    except Exception as _edit_err:
-                        logger.warning(
-                            "Stale-finalize reconciliation edit failed for session %s: %s; sending complete response via normal final send.",
-                            session_key or "?", _edit_err,
-                        )
-                else:
-                    logger.info(
-                        "Stale streamed finalize detected for session %s with no editable message; delivering complete response via normal final send (#71643).",
-                        session_key or "?",
-                    )
-            elif not _is_empty_sentinel and _transformed and _sc is not None:
-                # Plugin hooks transformed the response after streaming — edit the
-                # existing streamed message instead of sending a duplicate.
-                _sc_msg_id = _sc.message_id
-                if _sc_msg_id:
-                    try:
-                        await _sc.adapter.edit_message(
-                            chat_id=source.chat_id,
-                            message_id=_sc_msg_id,
-                            content=response["final_response"],
-                            finalize=True,
-                        )
-                        response["already_sent"] = True
-                        logger.info(
-                            "Edited streamed message %s for session %s to include plugin-transformed content.",
-                            _sc_msg_id, session_key or "?",
-                        )
-                    except Exception as _edit_err:
-                        logger.warning(
-                            "Failed to edit streamed message for session %s: %s",
-                            session_key or "?", _edit_err,
-                        )
-            elif _sc is not None and not _is_empty_sentinel:
-                # DUPLICATE-RISK DIAGNOSTIC: a stream consumer existed for this
-                # turn but suppression did NOT fire, so the gateway's normal
-                # final-send is about to run. On WeCom this is the exact window
-                # that produced "回复了两条" — a final-frame ack still in flight
-                # (final_content_delivered not yet set) while this send races
-                # ahead. Log the decision inputs so a recurrence can be pinned to
-                # "signal never set" vs "ack-pending race".
-                # See docs/rca-wecom-stream-final-ack-timeout-duplicate.md.
-                logger.warning(
-                    "Normal final-send NOT suppressed despite active stream "
-                    "consumer for session %s: streamed=%s previewed=%s "
-                    "content_delivered=%s transformed=%s final_len=%d — "
-                    "possible duplicate send (see wecom ack-timeout RCA).",
-                    session_key or "?",
-                    _streamed,
-                    _previewed,
-                    _content_delivered,
-                    _transformed,
-                    len(_final),
-                )
+        await self._run_agent_mark_streamed_delivery(response, turn_ctx)
 
         # Schedule deletion of tracked temporary progress bubbles after the
         # final response lands. Failed runs skip this so bubbles remain as

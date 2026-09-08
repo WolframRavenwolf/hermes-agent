@@ -33,6 +33,9 @@ from gateway.config import (
     DEFAULT_STREAMING_EDIT_INTERVAL as _DEFAULT_STREAMING_EDIT_INTERVAL,
     DEFAULT_STREAMING_BUFFER_THRESHOLD as _DEFAULT_STREAMING_BUFFER_THRESHOLD,
     DEFAULT_STREAMING_CURSOR as _DEFAULT_STREAMING_CURSOR,
+    MAX_STREAMING_CURSOR_LENGTH as _MAX_STREAMING_CURSOR_LENGTH,
+    STREAMING_CURSOR_LIMIT_DIVISOR as _STREAMING_CURSOR_LIMIT_DIVISOR,
+    STREAMING_FORMATTING_HEADROOM as _STREAMING_FORMATTING_HEADROOM,
 )
 from gateway.response_filters import (
     is_intentional_silence_response as _is_intentional_silence_response,
@@ -247,6 +250,8 @@ class GatewayStreamConsumer:
         self.adapter = adapter
         self.chat_id = chat_id
         self.cfg = config or StreamConsumerConfig()
+        # Per-consumer effective cursor; run() bounds it in platform units.
+        self._wire_cursor = str(self.cfg.cursor or "")
         self.metadata = metadata
         # Fired whenever a fresh content bubble is created on the platform
         # (first-send of a new message, commentary, overflow chunk, or
@@ -275,6 +280,12 @@ class GatewayStreamConsumer:
         # when overflow splits seal head chunks.  Used to record a reconciliable
         # turn-final payload for multi-message deliveries (#78541).
         self._stream_ledger = ""
+        self._source_offset = 0
+        self._source_receipt: Optional[dict] = None
+        self._source_receipt_segments: list[dict] = []
+        self._handled_final_source: Optional[str] = None
+        self._correction_attempted = False
+        self._delivery_ambiguous = False
         self._message_id: Optional[str] = None
         # Wall-clock timestamp (time.monotonic) when ``_message_id`` was
         # first assigned from a successful first-send.  Used by the
@@ -601,8 +612,8 @@ class GatewayStreamConsumer:
         self._final_response_sent = True
         self._final_content_delivered = True
         acked = self._last_sent_text or self._accumulated
-        if self.cfg.cursor and acked.endswith(self.cfg.cursor):
-            acked = acked[: -len(self.cfg.cursor)]
+        if self._wire_cursor and acked.endswith(self._wire_cursor):
+            acked = acked[: -len(self._wire_cursor)]
         self._record_turn_final_payload(acked)
 
     def _record_turn_final_payload(self, text: str) -> None:
@@ -840,7 +851,9 @@ class GatewayStreamConsumer:
         # Retain the finalized visible text of the current segment before
         # clearing ``_last_sent_text``, so ``has_delivered_text`` can still
         # match it after a segment break. (#65919 review)
-        if self._last_sent_text:
+        if self._source_receipt and self._source_receipt["uncertain"]:
+            self._source_receipt_segments.append(self._source_receipt)
+        elif self._last_sent_text:
             finalized = self._clean_for_display(self._last_sent_text).strip()
             if finalized:
                 self._delivered_segment_texts.append(finalized)
@@ -848,6 +861,11 @@ class GatewayStreamConsumer:
         self._message_created_ts = None
         self._accumulated = ""
         self._stream_ledger = ""
+        self._source_offset = 0
+        self._source_receipt = None
+        if self._delivery_ambiguous:
+            self._edit_supported = True
+        self._delivery_ambiguous = False
         self._last_sent_text = ""
         self._fallback_final_send = False
         self._fallback_prefix = ""
@@ -1224,7 +1242,33 @@ class GatewayStreamConsumer:
         # legacy per-message limit so a reply that fits one rich send/draft
         # isn't fragmented at 4096 while streaming.  See _raw_message_limit.
         _raw_limit = self._raw_message_limit()
-        _safe_limit = max(500, _raw_limit - _len_fn(self.cfg.cursor) - 100)
+        # A custom cursor is decoration, not content. Bound it both
+        # proportionally (10% of this platform's cap) and absolutely, then cap
+        # the working buffer after reserving that effective cursor. This keeps
+        # one update mapped to one editable message even when a configured
+        # cursor is itself at/above Mattermost's post cap.
+        _raw_limit = max(1, int(_raw_limit))
+        _cursor_budget = min(
+            _MAX_STREAMING_CURSOR_LENGTH,
+            _raw_limit // _STREAMING_CURSOR_LIMIT_DIVISOR,
+        )
+        _cursor_cp = _custom_unit_to_cp(
+            self._wire_cursor, _cursor_budget, _len_fn,
+        )
+        self._wire_cursor = self._wire_cursor[:_cursor_cp]
+        _cursor_len = _len_fn(self._wire_cursor)
+        _content_budget = max(
+            1,
+            _raw_limit - _cursor_len - _STREAMING_FORMATTING_HEADROOM,
+        )
+        _safe_limit = min(
+            _content_budget,
+            max(
+                1,
+                500 - _cursor_len,
+                _raw_limit - _cursor_len - 100,
+            ),
+        )
 
         # Resolve transport once per run. Native streaming wins over draft
         # because the only adapters that declare it (WeCom) cannot edit
@@ -1321,7 +1365,9 @@ class GatewayStreamConsumer:
                                 or self._message_id
                                 or self._last_sent_text
                             )
-                            if _streamed_something and not self._turn_split_delivery:
+                            if self._source_receipt and self._source_receipt["uncertain"]:
+                                self._accumulated = self._stream_ledger = item[1]
+                            elif _streamed_something and not self._turn_split_delivery:
                                 _final_payload = self._clean_for_display(item[1])
                                 _visible = self._clean_for_display(self._accumulated)
                                 if _final_payload and _final_payload != _visible:
@@ -1525,6 +1571,8 @@ class GatewayStreamConsumer:
                     )
                 ):
                     should_edit = False
+                if self._delivery_ambiguous:
+                    should_edit = False
                 if should_edit and (self._accumulated or (self._use_native_streaming and self._tool_progress_active)):
                     # Split overflow: if accumulated text exceeds the platform
                     # limit, split into properly sized chunks.
@@ -1632,6 +1680,9 @@ class GatewayStreamConsumer:
                         # full timeout waiting on already-delivered content.
                         if got_flush:
                             self._signal_flush(flush_event)
+                        # Yield on sealed-head failure so finish/flush producers
+                        # are not starved by this early-continue retry path.
+                        await asyncio.sleep(0.05)
                         continue
                     # Existing message: edit it with the first chunk, then
                     # start a new message for the overflow remainder.
@@ -1667,7 +1718,9 @@ class GatewayStreamConsumer:
                             # fallback final-send path can deliver the remaining
                             # continuation without dropping content.
                             break
-                        self._accumulated = self._accumulated[split_at:].lstrip("\n")
+                        remainder = self._accumulated[split_at:].lstrip("\n")
+                        self._source_offset += len(self._accumulated) - len(remainder)
+                        self._accumulated = remainder
                         self._message_id = None
                         self._last_sent_text = ""
                         # Sealed head chunk delivered — this turn is now a
@@ -1681,10 +1734,10 @@ class GatewayStreamConsumer:
                         # is appended to the composed content for consistency.
                         if self._use_native_streaming:
                             display_text = self._compose_frame_content()
-                            if display_text and self.cfg.cursor:
-                                display_text += self.cfg.cursor
+                            if display_text and self._wire_cursor:
+                                display_text += self._wire_cursor
                         else:
-                            display_text += self.cfg.cursor
+                            display_text += self._wire_cursor
 
                     # Segment break: finalize the current message so platforms
                     # that need explicit closure (e.g. DingTalk AI Cards) don't
@@ -1711,6 +1764,19 @@ class GatewayStreamConsumer:
                     # should_edit until new progress arrives.
                     if self._tool_progress_active:
                         self._tool_progress_active = False
+
+                if self._delivery_ambiguous:
+                    if got_done:
+                        return
+                    if got_segment_break or commentary_text is not None:
+                        await self._send_source_suffix(self._clean_for_display(self._stream_ledger), final=False)
+                        self._reset_segment_state()
+                        if commentary_text is not None:
+                            await self._send_commentary(commentary_text)
+                    if got_flush:
+                        self._signal_flush(flush_event)
+                    await asyncio.sleep(0.05)
+                    continue
 
                 if got_done:
                     if self._accumulated or self._message_id is not None or self._already_sent:
@@ -2083,8 +2149,8 @@ class GatewayStreamConsumer:
     def _visible_prefix(self) -> str:
         """Return the visible text already shown in the streamed message."""
         prefix = self._last_sent_text or ""
-        if self.cfg.cursor and prefix.endswith(self.cfg.cursor):
-            prefix = prefix[:-len(self.cfg.cursor)]
+        if self._wire_cursor and prefix.endswith(self._wire_cursor):
+            prefix = prefix[:-len(self._wire_cursor)]
         return self._clean_for_display(prefix)
 
     def _continuation_text(self, final_text: str) -> str:
@@ -2221,10 +2287,10 @@ class GatewayStreamConsumer:
                 if (
                     self._message_id
                     and self._last_sent_text
-                    and self.cfg.cursor
-                    and self._last_sent_text.endswith(self.cfg.cursor)
+                    and self._wire_cursor
+                    and self._last_sent_text.endswith(self._wire_cursor)
                 ):
-                    clean_text = self._last_sent_text[:-len(self.cfg.cursor)]
+                    clean_text = self._last_sent_text[:-len(self._wire_cursor)]
                     try:
                         result = await self._edit_message(
                             message_id=self._message_id,
@@ -2999,6 +3065,119 @@ class GatewayStreamConsumer:
             self.chat_id,
         )
 
+    def _adopt_message_id(self, message_id) -> None:
+        """Retarget edits at ``message_id``; None → "__no_edit__" sentinel so we never edit it."""
+        if message_id:
+            self._message_id = message_id
+            self._message_created_ts = time.monotonic()
+        else:
+            self._message_id = "__no_edit__"
+            self._message_created_ts = None
+
+    def _remember_source_receipt(self, result, snapshot) -> None:
+        """Only source-aware receipts opt into span reconciliation (currently Mattermost)."""
+        raw = getattr(result, "raw_response", None)
+        if not isinstance(raw, dict):
+            return
+        confirmed, attempted = raw.get("source_confirmed_prefix"), raw.get("source_attempted_prefix")
+        if not isinstance(confirmed, str) or not isinstance(attempted, str):
+            return
+        source, offset = snapshot
+        # The adapter saw a cursor/fence-decorated request. Clip those synthetic
+        # suffixes to the frozen, cleaned source; image formatting is adapter-local.
+        self._source_receipt = {
+            "source": source,
+            "confirmed_end": offset + min(len(confirmed), len(source) - offset),
+            "attempted_end": offset + min(len(attempted), len(source) - offset),
+            "uncertain": bool(raw.get("_delivery_uncertain")),
+        }
+        if self._source_receipt["uncertain"]:
+            self._delivery_ambiguous = True
+            self._final_content_delivered = self._final_response_sent = False
+            self._fallback_final_send = False
+            self._edit_supported = False
+            self._track_preview_ids_from_result(result)
+            if result.message_id:
+                self._adopt_message_id(result.message_id)
+                self._already_sent = True
+
+    async def _send_source_suffix(self, source: str, *, final: bool) -> None:
+        """Advance past confirmed/uncertain requests, never retry an ambiguous slice."""
+        receipt = self._source_receipt
+        protected = receipt["source"][:receipt["attempted_end"]]
+        if not source.startswith(protected):
+            return
+        end = receipt["attempted_end"]
+        # Each iteration consumes a nonempty source span or stops. A second lost
+        # ack can leave further, provably unattempted slices; those are still safe.
+        while end < len(source) and self._run_still_current() and not getattr(self, "_egress_declined", False):
+            remainder = source[end:]
+            # Bind the request before awaiting, including cancellation mid-ack.
+            self._source_receipt = {**receipt, "source": source, "attempted_end": len(source)}
+            try:
+                result = await self.adapter.send(
+                    chat_id=self.chat_id, content=remainder, reply_to=self._initial_reply_to_id,
+                    metadata=self._metadata_for_send(final=final))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return  # no receipt can establish a safe smaller boundary
+            self._track_preview_ids_from_result(result)
+            if result.message_id:
+                self._adopt_message_id(result.message_id)
+                self._already_sent = True
+            raw = getattr(result, "raw_response", None) or {}
+            attempted = raw.get("source_attempted_prefix")
+            if not isinstance(attempted, str) or not remainder.startswith(attempted):
+                return
+            next_end = end + len(attempted)
+            # Earlier uncertainty remains uncertainty even if the suffix succeeds.
+            self._source_receipt = {**receipt, "source": source, "attempted_end": next_end}
+            if result.success or next_end <= end or not raw.get("_delivery_uncertain"):
+                return
+            end = next_end
+
+    @property
+    def source_delivery_pending(self) -> bool:
+        """An uncertain active receipt, or the last segment if no new text followed."""
+        if self._source_receipt:
+            return self._source_receipt["uncertain"]
+        return bool(self._source_receipt_segments and not (self._stream_ledger or self._message_id))
+
+    async def reconcile_source_final(self, final_text: str) -> bool:
+        """Own this exact final after a source-aware lost ack; True suppresses full replay.
+
+        Called by the gateway after the consumer joins. This is responsibility for
+        delivery, not a claim that unacknowledged content reached the server.
+        """
+        if not self.source_delivery_pending:
+            return False
+        if self._source_receipt is None:
+            self._source_receipt = self._source_receipt_segments[-1]
+        receipt = self._source_receipt
+        if self._handled_final_source == final_text:
+            return True
+        if not self._run_still_current() or getattr(self, "_egress_declined", False):
+            return False
+        source = self._clean_for_display(final_text)
+        protected = receipt["source"][:receipt["attempted_end"]]
+        if source.startswith(protected):
+            self._handled_final_source = final_text
+            await self._send_source_suffix(source, final=True)
+            return True
+        if self._correction_attempted:
+            return False
+        # Policy A: exactly one logical, explicitly labelled full correction.
+        # Set both guards before awaiting; a lost correction ack is never replayed.
+        self._handled_final_source = final_text
+        self._correction_attempted = True
+        correction = ("Correction: Earlier text may appear again because delivery was not confirmed.\n\n"
+                      + source)
+        self._source_receipt = {"source": correction, "confirmed_end": 0,
+                                "attempted_end": 0, "uncertain": True}
+        await self._send_source_suffix(correction, final=True)
+        return True
+
     async def _send_or_edit(
         self, text: str, *, finalize: bool = False, is_turn_final: bool = True,
     ) -> bool:
@@ -3014,7 +3193,18 @@ class GatewayStreamConsumer:
         # Strip MEDIA: directives so they don't appear as visible text.
         # Media files are delivered as native attachments after the stream
         # finishes (via _deliver_media_from_response in gateway/run.py).
+        if self._delivery_ambiguous:
+            return False
         text = self._clean_for_display(text)
+        source = text
+        if not finalize and self._wire_cursor and source.endswith(self._wire_cursor):
+            source = source[:-len(self._wire_cursor)]
+        source_prefix = self._stream_ledger[:self._source_offset]
+        full_source = self._clean_for_display(source_prefix + source)
+        # Prevent suffix whitespace/media normalization from moving the sealed
+        # prefix boundary. The position guard is never sent or stored as source.
+        position_prefix = self._clean_for_display(source_prefix + "\0")
+        snapshot = (full_source, len(position_prefix) - 1)
         # Preserve the pre-fence-closed form for stream-is-the-message draft
         # frames: appending a closing ``` to a mid-code-block frame makes
         # frame N not a prefix of frame N+1, so the connector's append-only
@@ -3032,8 +3222,8 @@ class GatewayStreamConsumer:
         # A bare streaming cursor is not meaningful user-visible content and
         # can render as a stray tofu/white-box message on some clients.
         visible_without_cursor = text
-        if self.cfg.cursor:
-            visible_without_cursor = visible_without_cursor.replace(self.cfg.cursor, "")
+        if self._wire_cursor:
+            visible_without_cursor = visible_without_cursor.replace(self._wire_cursor, "")
         _visible_stripped = visible_without_cursor.strip()
         if not _visible_stripped:
             # For native streaming: even when the display text is empty (e.g.
@@ -3067,8 +3257,8 @@ class GatewayStreamConsumer:
         # Existing messages (edits) are unaffected — only first sends gated.
         _MIN_NEW_MSG_CHARS = 4
         if (self._message_id is None
-                and self.cfg.cursor
-                and self.cfg.cursor in text
+                and self._wire_cursor
+                and self._wire_cursor in text
                 and len(_visible_stripped) < _MIN_NEW_MSG_CHARS):
             return True  # too short for a standalone message — accumulate more
 
@@ -3256,8 +3446,8 @@ class GatewayStreamConsumer:
             # EVERY tick ("...text▉" is never a prefix of "...text more▉"),
             # triggering its whole-text fallback append — the user saw each
             # cumulative snapshot stacked inside one message, ▉ included.
-            if self.cfg.cursor and _frame_text.endswith(self.cfg.cursor):
-                _frame_text = _frame_text[: -len(self.cfg.cursor)]
+            if self._wire_cursor and _frame_text.endswith(self._wire_cursor):
+                _frame_text = _frame_text[: -len(self._wire_cursor)]
             # No-op skip: identical to the last frame we sent.
             if _frame_text == self._last_sent_text:
                 return True
@@ -3344,6 +3534,9 @@ class GatewayStreamConsumer:
                         content=text,
                         finalize=finalize,
                     )
+                    self._remember_source_receipt(result, snapshot)
+                    if self._delivery_ambiguous:
+                        return False
                     if result.success:
                         self._already_sent = True
                         # Record any continuation fragments an oversized edit
@@ -3384,8 +3577,8 @@ class GatewayStreamConsumer:
                         if (
                             finalize
                             and is_turn_final
-                            and self.cfg.cursor
-                            and self._last_sent_text.endswith(self.cfg.cursor)
+                            and self._wire_cursor
+                            and self._last_sent_text.endswith(self._wire_cursor)
                             and self._visible_prefix() == text
                         ):
                             # The final clean-up edit failed, but the complete
@@ -3510,6 +3703,9 @@ class GatewayStreamConsumer:
                         expect_edits=not finalize,
                     ),
                 )
+                self._remember_source_receipt(result, snapshot)
+                if self._delivery_ambiguous:
+                    return False
                 if result.success:
                     if result.message_id:
                         self._message_id = result.message_id
