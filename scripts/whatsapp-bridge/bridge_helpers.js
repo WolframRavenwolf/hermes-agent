@@ -1,6 +1,7 @@
 import path from 'path';
 import { mkdirSync, writeFileSync } from 'fs';
 import { randomBytes } from 'crypto';
+import { normalizeMessageContent } from '@whiskeysockets/baileys';
 
 export const MIME_MAP = {
   jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
@@ -19,11 +20,7 @@ export function normalizeWhatsAppId(value) {
 }
 
 export function getMessageContent(msg) {
-  const content = msg?.message || {};
-  if (content.ephemeralMessage?.message) return content.ephemeralMessage.message;
-  if (content.viewOnceMessage?.message) return content.viewOnceMessage.message;
-  if (content.viewOnceMessageV2?.message) return content.viewOnceMessageV2.message;
-  if (content.documentWithCaptionMessage?.message) return content.documentWithCaptionMessage.message;
+  const content = normalizeMessageContent(msg?.message) || {};
   if (content.templateMessage?.hydratedTemplate) return content.templateMessage.hydratedTemplate;
   if (content.buttonsMessage) return content.buttonsMessage;
   if (content.listMessage) return content.listMessage;
@@ -216,6 +213,7 @@ function mediaExtForMime(mime, fallback) {
     'audio/ogg': '.ogg',
     'audio/mp4': '.m4a',
     'audio/mpeg': '.mp3',
+    'audio/wav': '.wav',
     'application/pdf': '.pdf',
   };
   return extMap[normalized] || fallback;
