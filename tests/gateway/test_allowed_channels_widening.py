@@ -149,23 +149,20 @@ class TestDingTalkAllowedChats:
 
 
 # ---------------------------------------------------------------------------
-# Mattermost (env-var only — no config.yaml bridge)
+# Mattermost (profile-local config extras with operator-env override)
 # ---------------------------------------------------------------------------
 
 class TestMattermostAllowedChannels:
     """Mattermost whitelist logic — replicated since the adapter reads config
-    with env-var fallback inline inside _handle_post rather than through a
-    helper method."""
+    with an operator-env override inline inside ``_handle_ws_event`` rather
+    than through a helper method."""
 
     @staticmethod
-    def _would_process(channel_id, channel_type="O", allowed_cfg=None, allowed_env=""):
-        """Replicate the whitelist gate from gateway/platforms/mattermost.py."""
+    def _would_process(channel_id, channel_type="O", allowed_cfg=None, allowed_env=None):
+        """Replicate the whitelist gate from the Mattermost adapter."""
         if channel_type == "D":
             return True
-        # config-first, env-var fallback (matching the adapter)
-        allowed_raw = allowed_cfg
-        if allowed_raw is None:
-            allowed_raw = allowed_env
+        allowed_raw = allowed_env if allowed_env is not None else allowed_cfg
         if isinstance(allowed_raw, list):
             allowed = {str(c).strip() for c in allowed_raw if str(c).strip()}
         else:
@@ -191,17 +188,14 @@ class TestMattermostAllowedChannels:
             encoding="utf-8",
         )
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-        # Pre-register the key with monkeypatch so teardown cleans it up
-        # even though load_gateway_config mutates os.environ directly
-        # (monkeypatch only restores keys it's touched via setenv/delenv;
-        # delenv on an absent key is a no-op for teardown purposes).
-        monkeypatch.setenv("MATTERMOST_ALLOWED_CHANNELS", "__sentinel__")
-        monkeypatch.delenv("MATTERMOST_ALLOWED_CHANNELS")
+        monkeypatch.delenv("MATTERMOST_ALLOWED_CHANNELS", raising=False)
 
-        load_gateway_config()
+        config = load_gateway_config()
 
         import os as _os
-        assert _os.environ["MATTERMOST_ALLOWED_CHANNELS"] == "chanABC,chanDEF"
+        assert "MATTERMOST_ALLOWED_CHANNELS" not in _os.environ
+        platform = config.platforms[Platform.MATTERMOST]
+        assert platform.extra["allowed_channels"] == ["chanABC", "chanDEF"]
 
 
 # ---------------------------------------------------------------------------
