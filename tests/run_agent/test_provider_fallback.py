@@ -112,6 +112,50 @@ class TestFallbackChainAdvancement:
             assert agent.model == "gpt-4o"
             assert agent._fallback_activated is True
 
+    def test_successful_entry_activates_route_local_tier_policy(self):
+        agent = _make_agent(fallback_model={
+            "provider": "openai", "model": "gpt-4o",
+            "service_tier_override": " Normal ",
+        })
+        agent.request_overrides = {"extra_body": {"service_tier": "flex"}}
+        with patch("agent.auxiliary_client.resolve_provider_client",
+                   return_value=(_mock_client(), "gpt-4o")):
+            assert agent._try_activate_fallback(FailoverReason.rate_limit) is True
+
+        assert agent._active_fallback_service_tier_override == "normal"
+        assert agent.request_overrides == {"extra_body": {"service_tier": "flex"}}
+        # Native cooldowns must retain the active route and its policy.
+        assert agent._restore_primary_runtime() is False
+        assert agent._active_fallback_service_tier_override == "normal"
+        assert agent._provider_fallback_route == ("gpt-4o", "openai")
+        assert agent._pending_fallback_notice
+
+    def test_later_entry_without_override_clears_previous_entry_policy(self):
+        agent = _make_agent(fallback_model=[
+            {"provider": "openai", "model": "gpt-4o", "service_tier_override": "normal"},
+            {"provider": "zai", "model": "glm-4.7"},
+        ])
+        with patch("agent.auxiliary_client.resolve_provider_client", side_effect=[
+            (_mock_client(), "gpt-4o"), (_mock_client(), "glm-4.7"),
+        ]):
+            assert agent._try_activate_fallback() is True
+            assert agent._active_fallback_service_tier_override == "normal"
+            assert agent._try_activate_fallback() is True
+        assert agent._active_fallback_service_tier_override is None
+
+    def test_unresolved_entry_does_not_change_active_tier_policy(self):
+        agent = _make_agent(fallback_model=[
+            {"provider": "openai", "model": "gpt-4o", "service_tier_override": "normal"},
+            {"provider": "broken", "model": "nope"},
+        ])
+        with patch("agent.auxiliary_client.resolve_provider_client", side_effect=[
+            (_mock_client(), "gpt-4o"), (None, None),
+        ]):
+            assert agent._try_activate_fallback() is True
+            assert agent._try_activate_fallback() is False
+        assert agent._active_fallback_service_tier_override == "normal"
+        assert agent.model == "gpt-4o"
+
     def test_records_user_visible_switch_with_reason(self):
         agent = _make_agent(
             fallback_model={"provider": "zai", "model": "glm-5.2"},

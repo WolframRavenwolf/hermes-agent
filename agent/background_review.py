@@ -27,6 +27,7 @@ import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.thread_scoped_output import thread_scoped_silence
+from agent.fallback_policy import apply_fallback_service_tier_override
 
 logger = logging.getLogger(__name__)
 
@@ -341,7 +342,13 @@ def _resolve_review_runtime(
         "base_url": parent_runtime.get("base_url") or None,
         "api_mode": parent_api_mode,
         "credential_pool": getattr(agent, "_credential_pool", None),
-        "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
+        "request_overrides": apply_fallback_service_tier_override(
+            getattr(agent, "request_overrides", None),
+            getattr(agent, "_active_fallback_service_tier_override", None),
+        ),
+        "fallback_service_tier_override": getattr(
+            agent, "_active_fallback_service_tier_override", None,
+        ),
         "max_tokens": getattr(agent, "max_tokens", None),
         "command": getattr(agent, "acp_command", None),
         "args": list(getattr(agent, "acp_args", []) or []),
@@ -1217,7 +1224,7 @@ def build_cache_parity_fork(
             _pref_val = getattr(agent, _pref_attr, None)
             if _pref_val:
                 _fork_kwargs[_pref_attr] = _pref_val
-    review_agent = AIAgent(
+    review_agent: Any = AIAgent(
         model=_rt.get("model") or agent.model,
         max_iterations=max_iterations,
         quiet_mode=True,
@@ -1234,6 +1241,17 @@ def build_cache_parity_fork(
         skip_memory=True,
         **_fork_kwargs,
     )
+    _inherited_tier_override = _rt.get("fallback_service_tier_override")
+    if (
+        not _routed
+        and _inherited_tier_override is not None
+        and not getattr(review_agent, "_fallback_activated", False)
+    ):
+        # Init may reload provider tier defaults. Keep the inherited policy
+        # effective at the wire and after native primary restore, but never
+        # overwrite the policy of a fallback the child activated during init.
+        review_agent._active_fallback_service_tier_override = _inherited_tier_override
+        review_agent._primary_runtime["fallback_service_tier_override"] = _inherited_tier_override
     review_agent._memory_write_origin = write_origin
     review_agent._memory_write_context = write_origin
     # The review fork pins the parent's cached system prompt and keeps

@@ -78,6 +78,19 @@ def test_switch_with_empty_chain_stays_empty():
     assert agent._fallback_model is None
 
 
+def test_switch_clears_active_fallback_service_tier_policy():
+    agent = _make_agent([
+        {"provider": "nous", "model": "hermes-4", "service_tier_override": "normal"},
+    ])
+    agent._fallback_activated = True
+    agent._active_fallback_service_tier_override = "normal"
+
+    _switch_to_anthropic(agent)
+
+    assert agent._active_fallback_service_tier_override is None
+    assert agent._primary_runtime["fallback_service_tier_override"] is None
+
+
 def test_manual_switch_clears_provider_fallback_provenance():
     agent = _make_agent([
         {"provider": "openrouter", "model": "x-ai/grok-4"},

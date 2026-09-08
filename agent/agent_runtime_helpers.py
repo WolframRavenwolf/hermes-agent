@@ -1920,6 +1920,9 @@ def restore_primary_runtime(agent) -> bool:
 
         # ── Reset fallback chain for the new turn ──
         agent._fallback_activated = False
+        agent._active_fallback_service_tier_override = rt.get(
+            "fallback_service_tier_override"
+        )
         agent._fallback_index = 0
         agent._rate_limit_backoff_count = 0  # reset exponential backoff counter
 
@@ -3350,6 +3353,7 @@ def switch_model(
         "api_mode": agent.api_mode,
         "api_key": getattr(agent, "api_key", ""),
         "client_kwargs": dict(agent._client_kwargs),
+        "fallback_service_tier_override": None,
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,
         "reasoning_config": dict(agent.reasoning_config) if getattr(agent, "reasoning_config", None) else None,
@@ -3377,6 +3381,7 @@ def switch_model(
 
     # ── Reset fallback state ──
     agent._fallback_activated = False
+    agent._active_fallback_service_tier_override = None
     agent._provider_fallback_active = False
     agent._provider_fallback_route = None
     agent._fallback_index = 0

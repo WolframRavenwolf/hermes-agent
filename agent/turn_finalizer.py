@@ -28,6 +28,7 @@ import os
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.context_compressor import _DB_PERSISTED_MARKER
 from agent.message_content import flatten_message_text
+from agent.fallback_policy import apply_fallback_service_tier_override
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import _sanitize_surrogates
 
@@ -706,6 +707,11 @@ def finalize_turn(
         final_response = _sanitize_surrogates(final_response)
 
     # Build result with interrupt info if applicable
+    _effective_request_overrides = apply_fallback_service_tier_override(
+        getattr(agent, "request_overrides", None),
+        getattr(agent, "_active_fallback_service_tier_override", None),
+    )
+
     result = {
         "final_response": final_response,
         "last_reasoning": last_reasoning,
@@ -737,7 +743,7 @@ def finalize_turn(
         # Requested service tier (from request_overrides.extra_body), for
         # billing audits by callers like `hermes -z --usage-file`.
         "service_tier": (
-            (getattr(agent, "request_overrides", {}) or {}).get("extra_body") or {}
+            _effective_request_overrides.get("extra_body") or {}
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
