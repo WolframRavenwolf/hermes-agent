@@ -207,6 +207,11 @@ def build_gateway_parser(
         help=argparse.SUPPRESS,
     )
 
+    gateway_install.add_argument(
+        "--macos-app-wrapper", action="store_true", default=None,
+        help="macOS only: use the configured app name and signing identity for launchd",
+    )
+
     # gateway uninstall
     gateway_uninstall = gateway_subparsers.add_parser(
         "uninstall", help="Uninstall gateway service"
