@@ -4,6 +4,52 @@ import os
 import time
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
+from types import SimpleNamespace
+
+
+@pytest.fixture
+def mattermost_wire(monkeypatch):
+    """Offline REST boundary shared by the preservation regressions."""
+    wire = SimpleNamespace(posts=[], uploads=0, fail_at=None, raise_at=None)
+
+    def post(url, **kwargs):
+        response = AsyncMock()
+        response.__aenter__.return_value = response
+        response.text.return_value = "post failed"
+        response.status = 201
+        if url.endswith("/files"):
+            wire.uploads += 1
+            response.json.return_value = {"file_infos": [{"id": f"file-{wire.uploads}"}]}
+        else:
+            wire.posts.append(dict(kwargs["json"]))
+            if len(wire.posts) == wire.raise_at:
+                raise TimeoutError("ambiguous post timeout")
+            if len(wire.posts) == wire.fail_at:
+                response.status = 500
+            response.json.return_value = {"id": f"post-{len(wire.posts)}"}
+        return response
+
+    session = MagicMock()
+    session.__aenter__ = AsyncMock(return_value=session)
+    session.__aexit__ = AsyncMock(return_value=False)
+    session.post.side_effect = post
+    monkeypatch.setattr("aiohttp.ClientSession", lambda **kwargs: session)
+    return wire
+
+
+@pytest.mark.asyncio
+async def test_standalone_accepts_extract_media_tuple(mattermost_wire, tmp_path):
+    from plugins.platforms.mattermost.adapter import _standalone_send
+    path = tmp_path / "image.png"
+    path.write_bytes(b"png")
+    result = await _standalone_send(
+        SimpleNamespace(token="test-token", extra={"url": "https://mm.example.com"}),
+        "channel-1", "caption", thread_id="root-1",
+        media_files=[(str(path), False)],
+    )
+    assert result["success"] is True
+    assert mattermost_wire.posts[0]["file_ids"] == ["file-1"]
+    assert mattermost_wire.posts[0]["root_id"] == "root-1"
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import MessageType

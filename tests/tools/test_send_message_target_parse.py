@@ -9,12 +9,33 @@ import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
 from gateway.config import Platform
 from tools.send_message_tool import _parse_target_ref, _send_to_platform, send_message_tool
 
 
 def _run_async_immediately(coro):
     return asyncio.run(coro)
+
+
+@pytest.mark.parametrize("target", ["123", "-123", "1" * 25, "1" * 27, "١" * 26, "²" * 26])
+def test_mattermost_invalid_target_does_not_fall_through_to_numeric_id(target):
+    assert _parse_target_ref("mattermost", target) == (None, None, False)
+
+
+@pytest.mark.parametrize("channel_id", ["a" * 26, "Z" * 26, "0" * 26])
+def test_mattermost_valid_channel_and_root_ids_remain_explicit(channel_id):
+    root_id = "b" * 26
+    assert _parse_target_ref("mattermost", channel_id) == (channel_id, None, True)
+    assert _parse_target_ref("mattermost", f" \t{channel_id}:{root_id} ") == (
+        channel_id, root_id, True
+    )
+
+
+@pytest.mark.parametrize("platform", ["telegram", "discord"])
+def test_mattermost_target_validation_preserves_other_numeric_platforms(platform):
+    assert _parse_target_ref(platform, "123:456") == ("123", "456", True)
 
 
 def test_buzz_uuid_target_is_explicit() -> None:
@@ -596,3 +617,23 @@ def test_plugin_parser_stays_authoritative_despite_fallback() -> None:
 
     assert chat_id is None
     assert error is not None
+
+
+def test_mattermost_alphanumeric_channel_id_is_explicit() -> None:
+    channel_id = "abc123" * 4 + "ab"
+
+    assert _parse_target_ref("mattermost", channel_id) == (
+        channel_id,
+        None,
+        True,
+    )
+
+def test_mattermost_channel_and_root_ids_are_explicit() -> None:
+    channel_id = "abc123" * 4 + "ab"
+    root_id = "def456" * 4 + "de"
+
+    assert _parse_target_ref("mattermost", f"{channel_id}:{root_id}") == (
+        channel_id,
+        root_id,
+        True,
+    )

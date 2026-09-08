@@ -32,6 +32,12 @@ _SLACK_USER_NAME_RE = re.compile(r"^\s*@([A-Za-z0-9._-]{1,80})\s*$")
 _SLACK_MENTION_RE = re.compile(r"^\s*<@(U[A-Z0-9]{8,})(?:\|[^>]+)?>\s*$")
 # Session-derived Slack thread targets use "<conversation_id>:<thread_ts>".
 _SLACK_THREAD_TARGET_RE = re.compile(r"^\s*([CGD][A-Z0-9]{8,}):([^\s:]+)\s*$")
+# Mattermost channel/post IDs are 26-character alphanumeric identifiers.
+# Preserve an optional root post ID so explicit threaded sends do not pass
+# through channel-name resolution or fall back to the configured home channel.
+_MATTERMOST_TARGET_RE = re.compile(
+    r"^\s*([A-Za-z0-9]{26})(?::([A-Za-z0-9]{26}))?\s*$"
+)
 _WEIXIN_TARGET_RE = re.compile(r"^\s*((?:wxid|gh|v\d+|wm|wb)_[A-Za-z0-9_-]+|[A-Za-z0-9._-]+@chatroom|filehelper)\s*$")
 _YUANBAO_TARGET_RE = re.compile(r"^\s*((?:group|direct):[^:]+)\s*$")
 # Discord snowflake IDs are numeric, same regex pattern as Telegram topic targets.
@@ -564,12 +570,19 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         match = _SLACK_TARGET_RE.fullmatch(target_ref)
         if match:
             return match.group(1), None, True
-        match = _SLACK_USER_ID_RE.fullmatch(target_ref) or _SLACK_MENTION_RE.fullmatch(target_ref)
+        match = _SLACK_USER_ID_RE.fullmatch(target_ref) or _SLACK_MENTION_RE.fullmatch(
+            target_ref
+        )
         if match:
             return f"user:{match.group(1)}", None, True
         match = _SLACK_USER_NAME_RE.fullmatch(target_ref)
         if match:
             return f"user_name:{match.group(1)}", None, True
+    if platform_name == "mattermost":
+        match = _MATTERMOST_TARGET_RE.fullmatch(target_ref)
+        if match:
+            return match.group(1), match.group(2), True
+        return None, None, False
     if platform_name == "matrix":
         trimmed = target_ref.strip()
         split_idx = trimmed.rfind(":$")
@@ -1458,6 +1471,22 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 chunk,
                 thread_id=thread_id,
                 media_files=media_files if is_last else None,
+                force_document=force_document,
+            )
+            if isinstance(result, dict) and result.get("error"):
+                return result
+            last_result = result
+        return last_result
+
+    # Mattermost keeps the native live-adapter/cross-loop dispatch and its
+    # standalone fallback, including media-only and explicit thread targets.
+    if platform == Platform.MATTERMOST and media_files:
+        last_result = None
+        delivery_chunks = chunks or [message]
+        for i, chunk in enumerate(delivery_chunks):
+            result = await _send_via_adapter(
+                platform, pconfig, chat_id, chunk, thread_id=thread_id,
+                media_files=media_files if i == len(delivery_chunks) - 1 else [],
                 force_document=force_document,
             )
             if isinstance(result, dict) and result.get("error"):
@@ -2484,16 +2513,19 @@ async def _send_yuanbao(chat_id, message, media_files=None):
 
 
 # --- Registry ---
-from tools.registry import tool_error
+from tools.registry import registry, tool_error
 
-# NOTE: ``send_message`` is intentionally NOT registered as an agent-callable
-# model tool. The agent should not decide on its own to fire off cross-platform
-# messages or reactions. The send engine in this module (``_send_to_platform``,
-# ``_send_via_adapter``, ``_parse_target_ref``, the per-platform ``_send_*``
-# helpers) remains the shared transport used by:
-#   - cron delivery (cron/scheduler.py)
-#   - the ``hermes send`` CLI command (hermes_cli/send_cmd.py)
-#   - the gateway kanban notifier (dashboard-toggled, outside agent control)
-#   - the standalone MCP server (mcp_serve.py), which is an opt-in surface
-# Those callers import the helpers directly; none of them need the registry
-# entry.
+# Amy local policy: keep ``send_message`` available only through an explicit
+# ``messaging`` toolset.  It stays out of the broad Hermes core toolsets, so
+# models do not get cross-platform outbound messaging by default, but trusted
+# deployments can opt in via platform_toolsets (e.g. ``hermes-cli`` +
+# ``messaging``).  The send engine in this module remains the shared transport
+# used by cron delivery, ``hermes send``, the gateway kanban notifier, and MCP.
+registry.register(
+    name="send_message",
+    toolset="messaging",
+    schema=SEND_MESSAGE_SCHEMA,
+    handler=send_message_tool,
+    check_fn=_check_send_message,
+    emoji="📨",
+)

@@ -1865,3 +1865,35 @@ class TestSendTelegramThreadNotFoundRetry:
         finally:
             if media_path and os.path.exists(media_path):
                 os.unlink(media_path)
+
+
+def test_send_message_registered_as_explicit_messaging_toolset():
+    """Amy keeps send_message opt-in via the messaging toolset, not core."""
+    from tools.registry import registry
+    from toolsets import resolve_toolset
+
+    entry = registry.get_entry("send_message")
+    assert entry is not None
+    assert entry.toolset == "messaging"
+    assert entry.schema["name"] == "send_message"
+    assert registry.get_tool_names_for_toolset("messaging") == ["send_message"]
+    assert resolve_toolset("messaging") == ["send_message"]
+
+
+@pytest.mark.asyncio
+async def test_mattermost_media_only_uses_native_adapter_dispatch(monkeypatch, tmp_path):
+    import tools.send_message_tool as mod
+    from gateway.config import Platform, PlatformConfig
+
+    path = tmp_path / "asset.png"
+    path.write_bytes(b"png")
+    sender = AsyncMock(return_value={"success": True, "message_id": "post-1"})
+    monkeypatch.setattr(mod, "_send_via_adapter", sender)
+    result = await mod._send_to_platform(
+        Platform.MATTERMOST, PlatformConfig(), "channel-1", "",
+        thread_id="root-1", media_files=[(str(path), False)],
+    )
+    assert result["success"] is True
+    assert sender.await_count == 1
+    assert sender.call_args.kwargs["thread_id"] == "root-1"
+    assert sender.call_args.kwargs["media_files"] == [(str(path), False)]
