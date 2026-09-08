@@ -3642,6 +3642,7 @@ from gateway.config import (
 )
 from gateway.session import (
     AsyncSessionStore,
+    COMPRESSION_EXHAUSTED_METADATA_KEY,
     SessionEntry,
     SessionStore,
     SessionSource,
@@ -21428,6 +21429,69 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
+    @staticmethod
+    def _compression_pause_notice(*, persistence_failed=False) -> str:
+        notice = (
+            "⚠️ Session preserved: the conversation exceeded the maximum "
+            "context size and could not be compressed further. Because "
+            "session_reset.mode is none, automatic model retries are "
+            "paused. Use /compress to compact this session or /new to "
+            "start a fresh session."
+        )
+        if persistence_failed:
+            notice += (
+                " The pause could not be persisted and is only held in memory; "
+                "it cannot be guaranteed after a restart while storage is "
+                "unavailable. Fix storage before retrying recovery."
+            )
+        return notice
+
+    def _compression_exhaustion_reset_mode(self, source) -> str:
+        """Resolve whether exhaustion may reset, failing closed to ``none``."""
+        try:
+            policy = self.session_store.config.get_reset_policy(
+                platform=source.platform,
+                session_type=getattr(source, "chat_type", "dm"),
+            )
+            mode = str(getattr(policy, "mode", "none")).strip().lower()
+        except Exception:
+            logger.warning(
+                "Failed to resolve session reset policy after compression "
+                "exhaustion; preserving the session.",
+                exc_info=True,
+            )
+            return "none"
+        return mode if mode in {"idle", "daily", "both"} else "none"
+
+    async def _reset_session_after_compression_exhaustion(
+        self,
+        session_key: str,
+        session_entry: SessionEntry,
+        source,
+    ) -> Optional[SessionEntry]:
+        """Reset an exhausted session after policy explicitly permits it."""
+        logger.info(
+            "Auto-resetting session %s after compression exhaustion.",
+            session_entry.session_id,
+        )
+        new_entry = await self.async_session_store.reset_session(session_key)
+        self._evict_cached_agent(session_key)
+        self._clear_conversation_scope(
+            session_key, reason="compression_exhausted_reset"
+        )
+        if new_entry is not None:
+            # A Telegram topic binding may still point at the oversized
+            # compression child. Repoint it at the fresh session so the next
+            # inbound message cannot heal itself back onto exhausted history.
+            # This is a no-op on non-topic lanes.
+            await asyncio.to_thread(
+                self._sync_telegram_topic_binding,
+                source,
+                new_entry,
+                reason="compression-exhausted-reset",
+            )
+        return new_entry
+
     @property
     def async_session_store(self) -> AsyncSessionStore:
         """Return the single async facade for this runner's SessionStore."""
@@ -21749,6 +21813,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return
             session_entry = resolved_entry
         self._cache_session_source(session_key, source)
+        if getattr(session_entry, "compression_paused", False) is True:
+            # This is an operational recovery notice, not a successful agent
+            # answer. Do not let the outer /goal hook schedule another turn
+            # against known exhausted context.
+            setattr(event, "_gateway_skip_goal_continuation", True)
+            if self._compression_exhaustion_reset_mode(source) == "none":
+                return self._compression_pause_notice(
+                    persistence_failed=getattr(session_entry, "_compression_pause_pending", False) is True
+                )
+            new_entry = await self._reset_session_after_compression_exhaustion(
+                session_key,
+                session_entry,
+                source,
+            )
+            if new_entry is not None:
+                session_entry = new_entry
+            return (
+                "🔄 Session auto-reset: the conversation exceeded the maximum "
+                "context size and could not be compressed further. Your next "
+                "message will start a fresh session."
+            )
         if await asyncio.to_thread(self._is_telegram_topic_lane, source):
             try:
                 binding = (await self._session_db.get_telegram_topic_binding(
@@ -23759,10 +23844,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     agent_result.get("error", "processing incomplete"),
                 )
 
-            # When compression is exhausted, the session is permanently too
-            # large to process.  Auto-reset it so the next message starts
-            # fresh instead of replaying the same oversized context in an
-            # infinite fail loop.  (#9893)
+            # When compression is exhausted, honor the configured reset
+            # contract. Explicit idle/daily/both policies retain the existing
+            # reset recovery. Mode none preserves the session, marks it as
+            # exhausted, and pauses later agent calls until /compress commits
+            # smaller history or /new creates a fresh session.
             #
             # A lock-contended defer is the OPPOSITE case: the session is
             # temporarily uncompressible only because a concurrent path holds
@@ -23777,63 +23863,73 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_entry.session_id if session_entry else "?",
                 )
             elif agent_result.get("compression_exhausted") and session_entry and session_key:
-                logger.info(
-                    "Auto-resetting session %s after compression exhaustion.",
-                    session_entry.session_id,
-                )
-                new_entry = await self.async_session_store.reset_session(session_key)
-                self._evict_cached_agent(session_key)
-                # Conversation boundary: one funnel call clears every
-                # conversation-scoped per-session dict (#58403 and siblings).
-                # See _CONVERSATION_SCOPED_STATE.
-                self._clear_conversation_scope(
-                    session_key, reason="compression_exhausted_reset"
-                )
-                if new_entry is not None:
-                    # Drop the stale reference to the bloated compressed child and
-                    # re-point the Telegram topic binding at the fresh session.
-                    # Compression rotated session_entry.session_id to the oversized
-                    # compressed child earlier this turn (the agent-result sync
-                    # above), and that _sync also rewrote the (chat_id, thread_id)
-                    # -> bloated-child binding. reset_session swaps in a clean,
-                    # parentless session, but without re-syncing the binding the
-                    # next inbound message in this topic gets switch_session'd back
-                    # onto the bloated child by the binding-heal walk, reloads the
-                    # oversized transcript, and re-triggers compression exhaustion
-                    # forever (#35809 — regression of the #9893/#10063 auto-reset).
-                    # No-op on non-topic lanes.
-                    session_entry = new_entry
-                    await asyncio.to_thread(
-                        self._sync_telegram_topic_binding,
-                        source, session_entry, reason="compression-exhausted-reset",
+                # The non-empty terminal warning must not feed /goal's judge or
+                # enqueue a continuation against exhausted context.
+                setattr(event, "_gateway_skip_goal_continuation", True)
+                if self._compression_exhaustion_reset_mode(source) == "none":
+                    marked = await self.async_session_store.set_session_metadata(
+                        session_key,
+                        COMPRESSION_EXHAUSTED_METADATA_KEY,
+                        True,
                     )
-                response = (response or "") + (
-                    "\n\n🔄 Session auto-reset — the conversation exceeded the "
-                    "maximum context size and could not be compressed further. "
-                    "Your next message will start a fresh session."
-                )
+                    if not marked:
+                        logger.warning(
+                            "Could not persist compression exhaustion marker for "
+                            "session %s; preserving the session without reset.",
+                            session_entry.session_id,
+                        )
+                    self._evict_cached_agent(session_key)
+                    response = (response or "") + "\n\n" + self._compression_pause_notice(
+                        persistence_failed=not marked
+                    )
+                else:
+                    logger.info(
+                        "Auto-resetting session %s after compression exhaustion.",
+                        session_entry.session_id,
+                    )
+                    new_entry = await self.async_session_store.reset_session(
+                        session_key
+                    )
+                    self._evict_cached_agent(session_key)
+                    self._clear_conversation_scope(
+                        session_key, reason="compression_exhausted_reset"
+                    )
+                    if new_entry is not None:
+                        session_entry = new_entry
+                        # Repoint a Telegram topic at the fresh session so its
+                        # binding cannot heal the lane back onto the oversized
+                        # compression child. No-op on non-topic lanes.
+                        await asyncio.to_thread(
+                            self._sync_telegram_topic_binding,
+                            source,
+                            session_entry,
+                            reason="compression-exhausted-reset",
+                        )
+                    response = (response or "") + (
+                        "\n\n🔄 Session auto-reset: the conversation exceeded the "
+                        "maximum context size and could not be compressed further. "
+                        "Your next message will start a fresh session."
+                    )
                 if callable(_complete_lifecycle_progress):
                     try:
-                        _terminal_delivered = bool(
-                            await _complete_lifecycle_progress(response)
-                        )
+                        _terminal_result = await _complete_lifecycle_progress(response)
+                        _terminal_suppress_fallback = _terminal_result is True or declined_send(_terminal_result)
                         # The callback returned, so it owns a closed/drained
                         # rail regardless of delivery success. Do not invoke it
                         # a second time from the handler finally block.
                         _complete_lifecycle_progress = None
                     except Exception:
-                        _terminal_delivered = False
+                        _terminal_suppress_fallback = False
                         logger.warning(
                             "Terminal lifecycle progress delivery failed for "
                             "session %s; preserving assistant fallback.",
                             session_entry.session_id,
                             exc_info=True,
                         )
-                    if _terminal_delivered:
-                        # The exact terminal text (including reset outcome) is
-                        # already visible in the progress rail. Suppress only
-                        # this duplicate assistant fallback; all persistence and
-                        # reset bookkeeping above remains unchanged.
+                    if _terminal_suppress_fallback:
+                        # An acknowledgement needs no duplicate final. A
+                        # destination refusal forbids that retry too, without
+                        # claiming that the terminal content was delivered.
                         response = ""
 
             ts = time.time()  # Unix epoch float — consistent with DB storage
@@ -24882,7 +24978,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Empty interrupted/errored responses must not drive /goal, but an
         # in-flight /loop tick still needs to be released and rescheduled.
-        if final_text.strip():
+        if (
+            final_text.strip()
+            and not getattr(event, "_gateway_skip_goal_continuation", False)
+            and getattr(session_entry, "compression_paused", False) is not True
+        ):
             try:
                 await self._post_turn_goal_continuation(
                     session_entry=session_entry,

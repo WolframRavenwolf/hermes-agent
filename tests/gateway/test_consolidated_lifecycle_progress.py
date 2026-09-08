@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.config import GatewayConfig, Platform
+from gateway.config import GatewayConfig, Platform, SessionResetPolicy
 from gateway.platforms.base import MessageEvent, SendResult
 from gateway.run import GatewayRunner, TurnRunner
 from gateway.session import SessionEntry, SessionSource
@@ -546,7 +546,10 @@ def test_cleanup_fence_waits_for_callback_that_already_entered():
 
 
 def _make_handler_runner(tmp_path, adapter):
-    runner = GatewayRunner(GatewayConfig())
+    config = GatewayConfig(
+        default_reset_policy=SessionResetPolicy(mode="idle")
+    )
+    runner = GatewayRunner(config)
     runner.adapters = {Platform.MATTERMOST: adapter}
     runner._running_agents = {}
     runner._running_agents_ts = {}
@@ -587,6 +590,7 @@ def _make_handler_runner(tmp_path, adapter):
         chat_type="channel",
     )
     runner.session_store = MagicMock()
+    runner.session_store.config = config
     runner.session_store.get_or_create_session.return_value = old_entry
     runner.session_store.load_transcript.return_value = []
     runner.session_store.has_platform_message_id.return_value = False

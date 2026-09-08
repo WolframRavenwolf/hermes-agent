@@ -755,6 +755,11 @@ def build_session_context_prompt(
 # runner re-resolves credentials via the normal runtime provider resolution.
 PERSISTABLE_MODEL_OVERRIDE_KEYS = ("model", "provider", "base_url")
 
+# Durable routing-entry marker used to stop repeatedly invoking the model after
+# a preserved session has exhausted every safe compression attempt. Manual
+# compression clears it only after a compacted transcript is committed.
+COMPRESSION_EXHAUSTED_METADATA_KEY = "compression_exhausted"
+
 
 def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
     """Return a copy of *override* containing only persistable, non-secret keys.
@@ -870,6 +875,14 @@ class SessionEntry:
     # override is rehydrated after a restart and are never written to disk
     # (see sanitize_model_override / SessionStore.set_model_override).
     model_override: Optional[Dict[str, str]] = None
+
+    @property
+    def compression_paused(self) -> bool:
+        """Durable pause, or a process-local hold when the initial write failed."""
+        return (
+            self.metadata.get(COMPRESSION_EXHAUSTED_METADATA_KEY) is True
+            or getattr(self, "_compression_pause_pending", False) is True
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -1710,6 +1723,12 @@ class SessionStore:
                 continue
             elif current[key] == baseline[key]:
                 # Unchanged fallback data yields to the authoritative DB copy.
+                pending_entry = self._entries[key]
+                if (
+                    pending_entry.session_id == durable_entry.session_id
+                    and getattr(pending_entry, "_compression_pause_pending", False) is True
+                ):
+                    setattr(durable_entry, "_compression_pause_pending", True)
                 self._entries[key] = durable_entry
 
         self._routing_db_loaded = True
@@ -3095,8 +3114,39 @@ class SessionStore:
             entry = self._entries.get(session_key)
             if entry is None:
                 return False
+            missing = object()
+            previous = entry.metadata.get(key, missing)
+            if key == COMPRESSION_EXHAUSTED_METADATA_KEY and value is True:
+                # Hold before I/O so failed persistence cannot admit another turn.
+                entry._compression_pause_pending = True
             entry.metadata[key] = value
-            self._save()
+            try:
+                saved = self._save()
+            except Exception as exc:
+                logger.warning(
+                    "gateway.session: metadata save failed for %s key %r (%s)",
+                    session_key,
+                    key,
+                    type(exc).__name__,
+                )
+                saved = False
+            if not saved:
+                if previous is missing:
+                    entry.metadata.pop(key, None)
+                else:
+                    entry.metadata[key] = previous
+                try:
+                    self._save()
+                except Exception:
+                    logger.warning(
+                        "gateway.session: metadata rollback persistence failed "
+                        "for %s key %r",
+                        session_key,
+                        key,
+                    )
+                return False
+            if key == COMPRESSION_EXHAUSTED_METADATA_KEY:
+                entry._compression_pause_pending = False
             return True
 
     def set_model_override(

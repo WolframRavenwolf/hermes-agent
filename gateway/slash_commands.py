@@ -37,6 +37,7 @@ from gateway.config import HomeChannel, Platform, PlatformConfig, persist_home_c
 from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType
 from gateway.session import (
     AsyncSessionStore,
+    COMPRESSION_EXHAUSTED_METADATA_KEY,
     SessionSource,
     build_session_key,
 )
@@ -4899,8 +4900,11 @@ class GatewaySlashCommandsMixin:
                             f"failed to persist compressed transcript for "
                             f"session {new_session_id}"
                         )
+                    previous_session_id = session_entry.session_id
                     session_entry.session_id = new_session_id
-                    await self.async_session_store._save()
+                    if await self.async_session_store._save() is False:
+                        session_entry.session_id = previous_session_id
+                        raise RuntimeError("failed to commit compressed session routing")
                     await asyncio.to_thread(
                         self._sync_telegram_topic_binding,
                         source, session_entry, reason="compress-command",
@@ -4920,6 +4924,12 @@ class GatewaySlashCommandsMixin:
                 await self.async_session_store.update_session(
                     session_entry.session_key, last_prompt_tokens=0
                 )
+                if rotated or _in_place:
+                    await self.async_session_store.set_session_metadata(
+                        session_entry.session_key,
+                        COMPRESSION_EXHAUSTED_METADATA_KEY,
+                        False,
+                    )
                 finalize_context_engine_compression_notification(
                     tmp_agent,
                     committed=True,
