@@ -11,9 +11,9 @@ from being SIGTERMed by tests. See PR #23397 for the original incident
   > "You better do such a deep scan and scrub of the tests that this
   >  never is possible ever again for all eternity."
 
-Every primitive that can deliver a signal to a foreign process or mutate
-the live systemd unit MUST be exercised below. Adding a new primitive to
-the guard? Add a test here too.
+Every primitive that can deliver a signal to a foreign process, mutate the live
+systemd unit, or enter the real launchd namespace MUST be exercised below.
+Adding a new primitive to the guard? Add a test here too.
 """
 from __future__ import annotations
 
@@ -21,12 +21,16 @@ import os
 import signal
 import subprocess
 import types
+from pathlib import Path
 
 import pytest
 
 # A guaranteed-foreign PID: PID 1 (init).  Owned by root, not us, and
 # always exists. A sane guard refuses to signal it.
 FOREIGN_PID = 1
+
+# Capture only a path during collection; never open the production database.
+_HOME_AT_COLLECTION = Path.home().resolve()
 
 
 # ──────────────────── fail-closed self-protection ──────────────
@@ -101,6 +105,13 @@ def test_fail_closed_probe_classifies_raw_builtin_as_unguarded():
     assert isinstance(os.getpid, types.BuiltinFunctionType)
     assert not isinstance(os.kill, types.BuiltinFunctionType)
 
+def test_guard_home_does_not_claim_conventional_tmp_home(tmp_path):
+    """Existing tests may create ``tmp_path / 'home'`` themselves."""
+    assert Path.home().name == "_hermes_test_home"
+    assert not (tmp_path / "home").exists()
+    assert not any("live-system-guard-bin" in str(path) for path in tmp_path.rglob("*"))
+
+
 
 # ──────────────────── kill primitives ─────────────────────────
 
@@ -170,6 +181,231 @@ def test_subprocess_run_string_shell_true_blocked():
             "systemctl --user restart hermes-gateway",
             shell=True,
         )
+
+
+@pytest.mark.parametrize(
+    ("command", "kwargs"),
+    [
+        (["launchctl", "bootout", "gui/501/ai.hermes.gateway"], {}),
+        (["/bin/launchctl", "bootout", "gui/501/ai.hermes.gateway"], {}),
+        (["sudo", "launchctl", "bootout", "gui/501/ai.hermes.gateway"], {}),
+        (["env", "launchctl", "bootout", "gui/501/ai.hermes.gateway"], {}),
+        (["setsid", "launchctl", "bootout", "gui/501/ai.hermes.gateway"], {}),
+        (["bash", "-c", "launchctl bootout gui/501/ai.hermes.gateway"], {}),
+        ("bash -c 'launchctl bootout gui/501/ai.hermes.gateway'", {"shell": True}),
+        ("bash -c 'echo $(launchctl print gui/501/ai.hermes.gateway)'", {"shell": True}),
+        ("launchctl>/tmp/pytest-must-not-exist", {"shell": True}),
+        (("launchctl", "bootout", "gui/501/ai.hermes.gateway"), {}),
+        ([b"launchctl", b"bootout", b"gui/501/ai.hermes.gateway"], {}),
+        (b"launchctl bootout gui/501/ai.hermes.gateway", {"shell": True}),
+        (["ignored-argv-zero"], {"executable": "/bin/launchctl"}),
+    ],
+)
+def test_subprocess_run_launchctl_shapes_are_blocked_before_exec(
+    command, kwargs, monkeypatch
+):
+    """Every supported command shape must stop before the final executor."""
+    escaped: list[object] = []
+
+    def escaped_to_real_popen(*args, **popen_kwargs):
+        escaped.append((args, popen_kwargs))
+        raise AssertionError("launchctl escaped the live-system guard")
+
+    # subprocess.run resolves subprocess.Popen at call time. Replacing that
+    # final executor makes this regression safe even while RED: a missing
+    # launchctl guard reaches only this trap, never the real operating system.
+    monkeypatch.setattr(subprocess, "Popen", escaped_to_real_popen)
+
+    with pytest.raises(RuntimeError, match="blocked.*launchctl"):
+        subprocess.run(command, check=False, **kwargs)
+
+    assert escaped == []
+
+
+@pytest.mark.parametrize(
+    ("event", "args"),
+    [
+        ("subprocess.Popen", ("/bin/launchctl", ["launchctl", "print"], None, None)),
+        ("os.system", (b"launchctl print gui/501/ai.hermes.gateway",)),
+        ("os.exec", ("/bin/launchctl", ["launchctl", "print"], None)),
+        ("os.spawn", (0, "/bin/launchctl", ["launchctl", "print"], None)),
+        ("os.posix_spawn", ("/bin/launchctl", ["launchctl", "print"], {})),
+    ],
+)
+def test_process_global_audit_guard_blocks_launchctl_events(event, args, request):
+    """Collection-time and direct os process primitives share the hard block."""
+    matching_plugins = [
+        plugin
+        for plugin in request.config.pluginmanager.get_plugins()
+        if hasattr(plugin, "_pytest_launchctl_audit_guard")
+    ]
+    assert len(matching_plugins) == 1
+
+    with pytest.raises(RuntimeError, match="blocked launchctl"):
+        matching_plugins[0]._pytest_launchctl_audit_guard(event, args)
+
+
+def test_launchctl_path_resolves_only_to_per_test_stub(
+    tmp_path: Path, tmp_path_factory
+):
+    """Opaque child scripts can resolve only the harmless temporary stub."""
+    import shutil
+
+    resolved = Path(shutil.which("launchctl") or "")
+    assert resolved.is_relative_to(tmp_path_factory.getbasetemp())
+    assert not resolved.is_relative_to(tmp_path)
+    assert resolved.name == "launchctl"
+    assert "launchctl blocked" in resolved.read_text(encoding="utf-8")
+
+
+def test_launchd_unit_tests_use_only_temporary_runtime_paths(tmp_path: Path) -> None:
+    """Launchd tests must never resolve the operator's real runtime homes."""
+    import hermes_cli.gateway as gateway_cli
+
+    home = Path(os.environ["HOME"])
+    hermes_home = Path(os.environ["HERMES_HOME"])
+    launchd_home = gateway_cli._launchd_user_home()
+    plist_path = gateway_cli.get_launchd_plist_path()
+
+    assert home.is_relative_to(tmp_path)
+    assert hermes_home.is_relative_to(tmp_path)
+    assert launchd_home.is_relative_to(tmp_path)
+    assert plist_path.is_relative_to(tmp_path)
+    assert plist_path.parent == launchd_home / "Library" / "LaunchAgents"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX HOME/passwd isolation")
+def test_home_isolation_preserves_upstream_production_db_guard():
+    """Redirecting HOME must not erase the upstream production deny root."""
+    import hermes_state
+
+    with pytest.raises(RuntimeError, match="test attempted to open production"):
+        hermes_state._ensure_test_isolation(
+            _HOME_AT_COLLECTION / ".hermes" / "state.db"
+        )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX HOME/passwd isolation")
+def test_home_isolation_does_not_classify_test_home_as_production():
+    """A DB in the per-test user home remains a hermetic path, not production."""
+    import hermes_state
+
+    hermes_state._ensure_test_isolation(Path.home() / ".hermes" / "state.db")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX HOME/passwd isolation")
+@pytest.mark.parametrize("marker,origin", [(False, "absolute"), (True, "absolute"), (True, "relative"), (True, "missing")])
+def test_original_home_protocol_is_scoped_and_has_legacy_fallback(
+    marker, origin, tmp_path, monkeypatch
+):
+    import hermes_state
+
+    current = tmp_path / "current"
+    original = tmp_path / "original"
+    monkeypatch.setenv("HOME", str(current))
+    if marker:
+        monkeypatch.setenv("HERMES_TEST_ISOLATION", "1")
+    else:
+        monkeypatch.delenv("HERMES_TEST_ISOLATION", raising=False)
+    if origin == "missing":
+        monkeypatch.delenv("HERMES_TEST_ORIGINAL_HOME", raising=False)
+    else:
+        monkeypatch.setenv(
+            "HERMES_TEST_ORIGINAL_HOME",
+            str(original) if origin == "absolute" else "relative-home",
+        )
+    expected = original if marker and origin == "absolute" else current
+    assert hermes_state._real_platform_state_root() == expected / ".hermes"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX HOME/bootstrap isolation")
+def test_bootstrap_resolves_production_home_symlink(tmp_path, monkeypatch):
+    import runpy
+
+    home = tmp_path / "bootstrap-home"
+    production = tmp_path / "production"
+    home.mkdir()
+    production.mkdir()
+    (home / ".hermes").symlink_to(production, target_is_directory=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("HERMES_HOME", str(production))
+    monkeypatch.delenv("HERMES_TEST_ISOLATION", raising=False)
+    monkeypatch.delenv("HERMES_TEST_ORIGINAL_HOME", raising=False)
+    state = runpy.run_path(str(Path(__file__).with_name("conftest.py")))
+    assert state["_PRE_SANDBOX_USER_HERMES_ROOT"] == production
+    assert Path(state["HERMES_HOME_AT_CONFTEST_IMPORT"]) != production
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX HOME/bootstrap isolation")
+def test_bootstrap_rejects_relative_original_home(tmp_path, monkeypatch):
+    import runpy
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_TEST_ISOLATION", "1")
+    monkeypatch.setenv("HERMES_TEST_ORIGINAL_HOME", "relative-home")
+    state = runpy.run_path(str(Path(__file__).with_name("conftest.py")))
+    assert state["_PRE_SANDBOX_USER_HOME"] == tmp_path
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX HOME/passwd isolation")
+def test_home_isolation_preserves_upstream_production_db_guard_in_child():
+    """The subprocess-surviving isolation marker must retain the real deny root.
+
+    Call only the path guard in the child: even a regression cannot open a DB.
+    """
+    import sys
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            "-c",
+            "import os, sys\n"
+            "from pathlib import Path\n"
+            "import hermes_state\n"
+            "assert os.environ.get('HERMES_TEST_ISOLATION')\n"
+            "for target in sys.argv[1:]:\n"
+            "    try:\n"
+            "        hermes_state._ensure_test_isolation(Path(target))\n"
+            "    except RuntimeError:\n"
+            "        print('BLOCKED')\n"
+            "    else:\n"
+            "        print('UNGUARDED')\n",
+            str(_HOME_AT_COLLECTION / ".hermes" / "state.db"),
+            str(Path.home() / ".hermes" / "state.db"),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout.splitlines() == ["BLOCKED", "UNGUARDED"]
+
+
+def test_unmocked_launchd_uninstall_is_blocked_before_service_or_plist_mutation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A forgotten subprocess mock must fail closed at the production caller."""
+    import hermes_cli.gateway as gateway_cli
+
+    escaped: list[object] = []
+
+    def escaped_to_real_popen(*args, **kwargs):
+        escaped.append((args, kwargs))
+        raise AssertionError("launchd_uninstall escaped to real Popen")
+
+    monkeypatch.setattr(subprocess, "Popen", escaped_to_real_popen)
+    plist_path = tmp_path / "ai.hermes.gateway.plist"
+    old_bytes = b"installed plist must survive an unmocked test\n"
+    plist_path.write_bytes(old_bytes)
+    monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+    monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway")
+    monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "gui/501")
+
+    with pytest.raises(RuntimeError, match="blocked.*launchctl"):
+        gateway_cli.launchd_uninstall()
+
+    assert escaped == []
+    assert plist_path.read_bytes() == old_bytes
 
 
 def test_subprocess_popen_systemctl_blocked():
@@ -303,7 +539,26 @@ def test_bypass_marker_disables_guard():
     We use it harmlessly here by signaling our own PID 0 (own group) so we
     don't actually kill anything — but the call goes through real os.kill.
     """
-    # With bypass, the guard yields without installing the monkeypatch,
-    # so we get the real os.kill. Calling os.kill(os.getpid(), 0) just
+    # With bypass, os.kill remains real. Calling os.kill(os.getpid(), 0) just
     # checks that the PID exists — harmless.
-    os.kill(os.getpid(), 0)  # No exception — guard is OFF.
+    os.kill(os.getpid(), 0)  # No exception — signal guard is OFF.
+
+
+@pytest.mark.live_system_guard_bypass
+def test_bypass_marker_never_allows_launchctl(monkeypatch):
+    """The signal-test bypass must never become a real-service bypass."""
+    escaped: list[object] = []
+
+    def escaped_to_real_popen(*args, **kwargs):
+        escaped.append((args, kwargs))
+        raise AssertionError("launchctl escaped through the bypass marker")
+
+    monkeypatch.setattr(subprocess, "Popen", escaped_to_real_popen)
+
+    with pytest.raises(RuntimeError, match="blocked.*launchctl"):
+        subprocess.run(
+            ["/bin/launchctl", "bootout", "gui/501/ai.hermes.gateway"],
+            check=False,
+        )
+
+    assert escaped == []

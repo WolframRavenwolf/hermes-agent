@@ -729,8 +729,10 @@ def _real_platform_state_root() -> Optional[Path]:
     is often imported lazily *while* such a patch is active — resolving
     through the patched callable would misidentify the test's own hermetic
     home as "production" (false positive) or, worse, miss the real one
-    (false negative).  ``os.path.expanduser`` reads the HOME environment
-    variable / passwd entry, which the hermetic conftest never rewrites.
+    (false negative). Test trees that also redirect HOME preserve its original
+    value in HERMES_TEST_ORIGINAL_HOME alongside HERMES_TEST_ISOLATION, so
+    fresh subprocesses retain the same deny root. Outside that protocol the
+    existing platform resolution is unchanged.
     """
     try:
         if sys.platform == "win32":
@@ -741,7 +743,17 @@ def _real_platform_state_root() -> Optional[Path]:
                 else Path(os.path.expanduser("~")) / "AppData" / "Local" / "hermes"
             )
         else:
-            root = Path(os.path.expanduser("~")) / ".hermes"
+            original_home = (
+                os.environ.get("HERMES_TEST_ORIGINAL_HOME", "")
+                if os.environ.get("HERMES_TEST_ISOLATION")
+                else ""
+            )
+            base = (
+                Path(original_home)
+                if original_home and Path(original_home).is_absolute()
+                else Path(os.path.expanduser("~"))
+            )
+            root = base / ".hermes"
         return root.resolve()
     except Exception:
         return None

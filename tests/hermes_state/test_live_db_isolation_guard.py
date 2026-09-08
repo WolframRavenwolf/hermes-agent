@@ -159,6 +159,10 @@ class TestSubprocessChildCovered:
             if k not in ("HERMES_HOME", "PYTEST_PLUGINS", "PYTHONPATH")
         }
         env["PYTEST_CURRENT_TEST"] = "tests/fake.py::test_child (call)"
+        # P16 also isolates HOME. Simulate losing both redirects to reproduce
+        # the production escape, not a still-hermetic fallback under test HOME.
+        if sys.platform != "win32" and REAL_ROOT is not None:
+            env["HOME"] = str(REAL_ROOT.parent)
         env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
         code = (
             "from hermes_state import SessionDB\n"
