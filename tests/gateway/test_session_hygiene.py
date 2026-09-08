@@ -573,6 +573,7 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
     runner._voice_mode = {}
     runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
     runner.session_store = MagicMock()
+    runner.session_store.get_session_metadata.return_value = None
     runner.session_store.get_or_create_session.return_value = SessionEntry(
         session_key="agent:main:telegram:dm:12345",
         session_id="sess-timeout",
@@ -1299,6 +1300,7 @@ def _make_progress_runner(monkeypatch, tmp_path, agent_cls, cfg_text):
     runner._voice_mode = {}
     runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
     runner.session_store = MagicMock()
+    runner.session_store.get_session_metadata.return_value = None
     runner.session_store.get_or_create_session.return_value = SessionEntry(
         session_key="agent:main:telegram:dm:12345",
         session_id="sess-progress",
@@ -1387,6 +1389,7 @@ def _make_cooldown_runner(monkeypatch, tmp_path, agent_cls, session_db, session_
     runner._voice_mode = {}
     runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
     runner.session_store = MagicMock()
+    runner.session_store.get_session_metadata.return_value = None
     runner.session_store.get_or_create_session.return_value = SessionEntry(
         session_key="agent:main:telegram:dm:12345",
         session_id=session_id,

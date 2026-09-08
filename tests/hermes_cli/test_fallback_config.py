@@ -1,5 +1,7 @@
 """Tests for hermes_cli/fallback_config.py — fallback entry API-key resolution."""
 
+import pytest
+
 from agent.secret_scope import reset_secret_scope, set_secret_scope
 from hermes_cli.fallback_config import resolve_entry_api_key
 
@@ -37,3 +39,16 @@ class TestResolveEntryApiKey:
         # secret scope installed, resolution still reads os.environ.
         monkeypatch.setenv("FB_KEY", "env-key")
         assert resolve_entry_api_key({"key_env": "FB_KEY"}) == "env-key"
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            {"api_key": "${MISSING_FALLBACK_KEY}"},
+            {"key_env": "MISSING_FALLBACK_KEY"},
+        ],
+    )
+    def test_explicit_unresolved_key_source_fails_closed(self, entry, monkeypatch):
+        monkeypatch.delenv("MISSING_FALLBACK_KEY", raising=False)
+
+        with pytest.raises(ValueError, match="API key"):
+            resolve_entry_api_key(entry)

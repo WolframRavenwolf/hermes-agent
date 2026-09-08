@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 
@@ -15,9 +16,11 @@ def resolve_entry_api_key(entry: dict[str, Any] | None) -> str | None:
     """API key for one fallback entry: inline ``api_key``, else ``key_env``.
 
     Mirrors the custom-provider convention (``key_env`` names the env var
-    holding the key; ``api_key_env`` accepted as an alias). Returns None when
-    neither yields a non-empty value, letting ``resolve_runtime_provider``
-    fall through to the provider's standard credential resolution.
+    holding the key; ``api_key_env`` is accepted as an alias). When a key field
+    was explicitly configured but cannot be resolved, ``ValueError`` is raised
+    so callers fail closed instead of falling through to credentials from
+    another provider or profile. Returns ``None`` only when no key source was
+    declared, allowing normal provider credential resolution.
 
     ``key_env`` is resolved through ``agent.secret_scope.get_secret`` rather
     than a raw ``os.getenv`` — in a multiplexed gateway a bare env read would
@@ -31,12 +34,17 @@ def resolve_entry_api_key(entry: dict[str, Any] | None) -> str | None:
         return None
     inline = str(entry.get("api_key") or "").strip()
     if inline:
+        if re.search(r"\$\{[^}]+\}", inline):
+            raise ValueError("Configured fallback API key could not be resolved")
         return inline
     key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
     if key_env:
         from agent.secret_scope import get_secret
 
-        return (get_secret(key_env) or "").strip() or None
+        resolved = (get_secret(key_env) or "").strip()
+        if not resolved or re.search(r"\$\{[^}]+\}", resolved):
+            raise ValueError("Configured fallback API key could not be resolved")
+        return resolved
     return None
 
 

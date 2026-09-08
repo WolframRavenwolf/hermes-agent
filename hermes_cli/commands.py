@@ -301,6 +301,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="[normal|fast|status] [--global]",
                subcommands=("normal", "fast", "status", "on", "off", "--global"),
                desktop="advanced"),
+    CommandDef("fallback", "Route this session through fallback entry 1", "Configuration",
+               args_hint="[on|off|status]", gateway_only=True,
+               subcommands=("on", "off", "status"), busy_policy="reject"),
     CommandDef("skin", "Show or change the display skin/theme", "Configuration",
                cli_only=True, args_hint="[name]", argument_mode="options"),
     CommandDef("indicator", "Pick the TUI busy-indicator style", "Configuration",
@@ -1478,7 +1481,7 @@ _SLACK_PRIORITY_ALIASES: tuple[str, ...] = ()
 #     (session export is an interactive surface; platform is a rare
 #     informational lookup) — without this entry /save tips the registry
 #     past the 50-cap and silently clamps /platform, breaking parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "insights"})
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "insights", "fallback"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

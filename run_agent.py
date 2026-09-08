@@ -524,6 +524,7 @@ class AIAgent:
         pass_session_id: bool = False,
         requested_provider: str = None,
         capabilities: Dict[str, bool] | None = None,
+        fallback_service_tier_override: Optional[str] = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         if tool_delay is not None:
@@ -609,6 +610,7 @@ class AIAgent:
             iteration_budget=iteration_budget,
             run_budget_seconds=run_budget_seconds,
             fallback_model=fallback_model,
+            fallback_service_tier_override=fallback_service_tier_override,
             credential_pool=credential_pool,
             checkpoints_enabled=checkpoints_enabled,
             checkpoint_max_snapshots=checkpoint_max_snapshots,

@@ -22,6 +22,8 @@ from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
 
+MANUAL_FALLBACK_METADATA_KEY = "manual_fallback_index"
+
 
 def _now() -> datetime:
     """Return the current local time."""
@@ -1619,6 +1621,29 @@ class SessionStore:
                     # queued/resume-pending work disappears until the user sends a
                     # fresh message.
                     if recovered_entry is not None and recovered_entry.session_id != entry.session_id:
+                        if (MANUAL_FALLBACK_METADATA_KEY in entry.metadata
+                                and row.get("end_reason") == "compression"):
+                            try:
+                                # Use the same active-scope DB that supplied the
+                                # parent and native recovery, after its scope gates.
+                                tip = db.get_compression_tip(entry.session_id)
+                                if tip == recovered_entry.session_id:
+                                    child = db.get_session(tip)
+                                    peer_fields = ("source", "user_id", "chat_id", "chat_type", "thread_id")
+                                    if (child is not None
+                                            and row.get("session_key") == key == child.get("session_key")
+                                            and all(row.get(field) == child.get(field) for field in peer_fields)):
+                                        # Preserve presence and invalid values verbatim;
+                                        # unrelated metadata belongs to the old entry.
+                                        recovered_entry.metadata[MANUAL_FALLBACK_METADATA_KEY] = entry.metadata[MANUAL_FALLBACK_METADATA_KEY]
+                            except Exception:
+                                # Do not publish a markerless route on an
+                                # indeterminate compression-lineage lookup.
+                                logger.debug(
+                                    "gateway.session: manual compression lineage lookup failed for %r",
+                                    key, exc_info=True,
+                                )
+                                continue
                         logger.warning(
                             "gateway.session: repointing stale sessions.json entry "
                             "%r from ended %s (end_reason=%r) to recovered %s",
@@ -1668,10 +1693,10 @@ class SessionStore:
         if stale_keys or recovered_keys:
             self._save()
 
-    def _save(self) -> None:
+    def _save(self) -> bool:
         """Persist the routing index while the caller holds ``_lock``."""
         data, generation = self._snapshot_routing_locked()
-        self._persist_routing_data(data, generation)
+        return self._persist_routing_data(data, generation)
 
     def _next_routing_generation_locked(self) -> int:
         """Bump and return the shared routing counter. Caller holds ``_lock``.
@@ -1742,15 +1767,15 @@ class SessionStore:
             self._next_routing_generation_locked(),
         )
 
-    def _persist_routing_data(self, data: Dict[str, Any], generation: int) -> None:
-        """Serialize all whole-index writers through one durable write lock."""
+    def _persist_routing_data(self, data: Dict[str, Any], generation: int) -> bool:
+        """Serialize whole-index writers and report primary-store durability."""
         save_lock = getattr(self, "_save_lock", None)
         if save_lock is None:
             save_lock = threading.Lock()
             self._save_lock = save_lock
         with save_lock:
             if generation <= getattr(self, "_persisted_routing_generation", 0):
-                return
+                return True
             # Fold in single-entry upserts with a newer revision than this
             # snapshot (see _save_entry): revisions share the routing
             # generation counter, so a fast record numbered above us was
@@ -1762,10 +1787,12 @@ class SessionStore:
                     if revision > generation:
                         data[key] = json.loads(entry_json)
             db_saved = False
+            db_write_required = False
             _db = getattr(self, "_db", None)
             if _db:
                 replacer = getattr(_db, "replace_gateway_routing_entries", None)
                 if callable(replacer):
+                    db_write_required = True
                     try:
                         replacer(
                             {k: json.dumps(v) for k, v in data.items()},
@@ -1776,6 +1803,9 @@ class SessionStore:
                         logger.warning(
                             "gateway.session: state.db routing save failed: %s", exc
                         )
+            if db_write_required and not db_saved:
+                # An uncommitted primary mutation must not reach the legacy mirror.
+                return False
             if getattr(self, "_write_sessions_json", True) or not db_saved:
                 try:
                     self._save_sessions_json(data)
@@ -1798,6 +1828,7 @@ class SessionStore:
                     if rev <= generation
                 ]:
                     del fast_persisted[key]
+            return True
 
     def _save_sessions_json(self, data: Dict[str, Any]) -> None:
         """Write the legacy sessions.json mirror of the routing index."""
@@ -3149,6 +3180,39 @@ class SessionStore:
                 entry._compression_pause_pending = False
             return True
 
+    def delete_session_metadata(self, session_key: str, key: str) -> bool:
+        """Remove one persisted metadata key without leaving a null tombstone."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None or key not in entry.metadata:
+                return False
+            previous = entry.metadata[key]
+            del entry.metadata[key]
+            try:
+                saved = self._save()
+            except Exception as exc:
+                logger.warning(
+                    "gateway.session: metadata delete failed for %s key %r (%s)",
+                    session_key,
+                    key,
+                    type(exc).__name__,
+                )
+                saved = False
+            if not saved:
+                entry.metadata[key] = previous
+                try:
+                    self._save()
+                except Exception:
+                    logger.warning(
+                        "gateway.session: metadata-delete rollback persistence "
+                        "failed for %s key %r",
+                        session_key,
+                        key,
+                    )
+                return False
+            return True
+
     def set_model_override(
         self, session_key: str, override: Optional[Dict[str, Any]]
     ) -> None:
@@ -3497,7 +3561,12 @@ class SessionStore:
             )
 
             self._entries[session_key] = new_entry
-            self._save()
+            try:
+                if self._save() is False:
+                    raise RuntimeError("Could not persist session reset")
+            except Exception:
+                self._entries[session_key] = old_entry
+                raise
             _reset_origin_json = None
             if old_entry.origin is not None:
                 try:
