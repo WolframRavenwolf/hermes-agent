@@ -167,6 +167,25 @@ _ENV_ASSIGN_LOWER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Exact operational metadata names that contain ``AUTH`` but do not carry
+# authentication secrets. Keep this allowlist narrow and case-sensitive.
+_SAFE_ENV_ASSIGNMENT_NAMES = frozenset({
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_AUTHOR_DATE",
+    "SSH_AUTH_SOCK",
+})
+
+# A complete assignment head, not a local character boundary. Numbered
+# output accepts only a positive ASCII cat-n number followed by a tab;
+# arbitrary log prefixes and whole-assignment quote wrappers are not heads.
+# Only export is case-insensitive; metadata names remain exact.
+_SAFE_ENV_ASSIGNMENT_HEAD_RE = re.compile(
+    r"^[ \t]*+(?:[1-9][0-9]*+\t[ \t]*+)?(?i:export[ \t]++)?"
+    r"(" + "|".join(sorted(_SAFE_ENV_ASSIGNMENT_NAMES)) + r")[ \t]*+=",
+    re.MULTILINE,
+)
+
 # Lowercase / dotted / hyphenated config keys from config files
 # (application.properties, .env, YAML-ish dumps): ``spring.datasource.password=secret``,
 # ``app.api.key=xyz``, ``password=secret``. The uppercase _ENV_ASSIGN_RE above
@@ -856,12 +875,14 @@ def redact_sensitive_text(
     # ENV assignments: OPENAI_API_KEY=***  (skip for code files — false positives)
     if not code_file:
         if "=" in text:
-            def _redact_env(m):
+            def _redact_env(m, safe_spans):
                 name, quote, value = m.group(1), m.group(2), m.group(3)
                 # Programmatic env lookups reference variable *names*, not
                 # secret values — masking them corrupts code snippets in
                 # prose/log contexts (issue #2852): ``KEY=os.getenv('X')``.
                 if _ENV_LOOKUP_VALUE_RE.match(value):
+                    return m.group(0)
+                if m.span(1) in safe_spans:
                     return m.group(0)
                 # Keyword must sit at a word boundary within the key —
                 # ``author=Smith`` / ``press.secretary=…`` are prose, not
@@ -871,7 +892,18 @@ def redact_sensitive_text(
                 if not _key_has_secret_keyword(name):
                     return m.group(0)
                 return f"{name}={quote}{_mask_token(value)}{quote}"
-            text = _ENV_ASSIGN_RE.sub(_redact_env, text)
+            def _sub_env(pattern, current_text):
+                # Recompute once per pass: earlier substitutions change offsets.
+                # The anchored scanner captures indentation/export as part of
+                # group(1); the other scanners capture only the exact name.
+                safe_spans = {
+                    span
+                    for head in _SAFE_ENV_ASSIGNMENT_HEAD_RE.finditer(current_text)
+                    for span in (head.span(1), (head.start(), head.end(1)))
+                }
+                return pattern.sub(lambda m: _redact_env(m, safe_spans), current_text)
+
+            text = _sub_env(_ENV_ASSIGN_RE, text)
             # Lowercase env names (``openai_key=…``). Skip URLs — the query
             # string may contain ``token=``/``key=`` params that are
             # intentionally passed through (see note near the bottom of this
@@ -879,7 +911,7 @@ def redact_sensitive_text(
             # case). The uppercase regex above is all-caps-only, so it never
             # matches URL params; the lowercase one would (issue #77484).
             if "://" not in text:
-                text = _ENV_ASSIGN_LOWER_RE.sub(_redact_env, text)
+                text = _sub_env(_ENV_ASSIGN_LOWER_RE, text)
             # Lowercase/dotted config keys (issue #16413). Skip URLs entirely —
             # web-URL query params are intentionally passed through (see note
             # near the bottom of this function); _DB_CONNSTR_RE still guards
@@ -893,8 +925,8 @@ def redact_sensitive_text(
             # keyword scan prevents that pathological path on secret-free
             # text.
             if "://" not in text and _CFG_SECRET_WORD_RE.search(text):
-                text = _CFG_DOTTED_RE.sub(_redact_env, text)
-                text = _CFG_ANCHORED_RE.sub(_redact_env, text)
+                text = _sub_env(_CFG_DOTTED_RE, text)
+                text = _sub_env(_CFG_ANCHORED_RE, text)
 
         # JSON fields: "apiKey": "***"  (skip for code files — false positives)
         if ":" in text and '"' in text:

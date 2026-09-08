@@ -932,6 +932,233 @@ class TestTerminalOutputRedaction:
 
 
 
+    def test_printenv_preserves_exact_safe_operational_metadata(self):
+        from agent.redact import redact_terminal_output
+
+        out = (
+            "GIT_AUTHOR_NAME=Amy Ravenwolf\n"
+            "GIT_AUTHOR_EMAIL=amy@example.test\n"
+            "GIT_AUTHOR_DATE=Thu Jul 16 12:34:56 2026 +0200\n"
+            "SSH_AUTH_SOCK=/private/tmp/com.apple.launchd.ABCD/Listeners"
+        )
+
+        assert redact_terminal_output(out, "printenv", force=True) == out
+
+    @pytest.mark.parametrize("prefix", ["", " ", "\t", "export ", " \texport\t", "EXPORT "])
+    @pytest.mark.parametrize("command", ["printenv", "cat .env"])
+    def test_safe_metadata_survives_prefixed_assignment_passes(self, prefix, command):
+        from agent.redact import redact_terminal_output
+
+        values = {
+            "GIT_AUTHOR_NAME": '"Example Author"',
+            "GIT_AUTHOR_EMAIL": "author@example.test",
+            "GIT_AUTHOR_DATE": '"2026-07-16 12:34:56 +0200"',
+            "SSH_AUTH_SOCK": '"/private/tmp/agent.sock"',
+        }
+        out = "\n".join(f"{prefix}{name}={value}" for name, value in values.items())
+
+        assert redact_terminal_output(out, command, force=True) == out
+
+    @pytest.mark.parametrize("prefix", ["", " \texport\t"])
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "ssh_auth_sock",
+            "Ssh_AUTH_SOCK",
+            "SSH_AUTH_SOCK_TOKEN",
+            "GIT_AUTHOR_TOKEN",
+            "AUTH_SSH_AUTH_SOCK",
+            "GIT_AUTHOR_NAME_PASSWORD",
+            "AUTH.SSH_AUTH_SOCK",
+            "exportSSH_AUTH_SOCK",
+        ],
+    )
+    def test_safe_metadata_prefix_handling_keeps_exact_case_sensitive_names(self, prefix, name):
+        from agent.redact import redact_terminal_output
+
+        secret = "opaque-sensitive-value-1234567890"
+        out = f"{prefix}{name}={secret}"
+        redacted = redact_terminal_output(out, "cat .env", force=True)
+
+        assert secret not in redacted
+        assert redacted.startswith(f"{prefix}{name}=")
+
+    @pytest.mark.parametrize("line_prefix", ["     1\t", "log: "])
+    @pytest.mark.parametrize(
+        "key_prefix",
+        ["export", "mixed_", "app.", "app-", "Ü", "\u0301", "prefix[", "A" * 64 + "export"],
+    )
+    def test_numbered_metadata_name_suffix_is_never_exempt(self, line_prefix, key_prefix):
+        from agent.redact import redact_terminal_output
+
+        # Upstream masks AUTH_SOCK suffixes, not AUTHOR suffixes. Preserve
+        # that native distinction instead of broadening secret detection.
+        secret = "opaque-sensitive-value-1234567890"
+        key = key_prefix + "SSH_AUTH_SOCK"
+        out = f"{line_prefix}{key}={secret}\n"
+        redacted = redact_terminal_output(out, "cat -n .env", force=True)
+
+        assert secret not in redacted
+        assert redacted.startswith(f"{line_prefix}{key}=")
+
+    def test_numbered_complete_metadata_assignment_is_preserved(self):
+        from agent.redact import redact_terminal_output
+
+        out = "     1\tSSH_AUTH_SOCK=/private/tmp/agent.sock\n"
+        assert redact_terminal_output(out, "cat -n .env", force=True) == out
+
+    @pytest.mark.parametrize("quote", ["'", '"'])
+    def test_whole_assignment_quote_wrapper_is_not_a_metadata_head(self, quote):
+        from agent.redact import redact_terminal_output
+
+        # V4 introduced this passthrough; it was not part of the original
+        # metadata contract. Whole-assignment quotes fail closed like Native.
+        secret = "opaque-sensitive-value-1234567890"
+        out = f"{quote}SSH_AUTH_SOCK={secret}{quote}"
+        redacted = redact_terminal_output(out, "cat -n .env", force=True)
+        assert secret not in redacted
+        assert redacted.startswith(f"{quote}SSH_AUTH_SOCK=")
+
+    @pytest.mark.parametrize(
+        "command,line_prefix",
+        [("printenv", ""), ("cat .env", ""), ("cat -n .env", "     1\t")],
+    )
+    @pytest.mark.parametrize(
+        "key_prefix",
+        ["prefix'", 'prefix"', "prefix ", "prefix\t", "'", '"',
+         "log: ", "[INFO] ", "prefix;", "prefix|", "prefix(",
+         "prefix=", "exportexport ", "export \"", "a" * 200 + " ",
+         "A" * 200 + "'"],
+    )
+    def test_only_complete_metadata_heads_are_exempt(self, command, line_prefix, key_prefix):
+        from agent.redact import redact_terminal_output
+
+        # Golden control: Native masks these SSH_AUTH_SOCK suffix captures.
+        # A separator alone must not upgrade them to safe assignment heads.
+        secret = "opaque-sensitive-value-1234567890"
+        out = f"{line_prefix}{key_prefix}SSH_AUTH_SOCK={secret}\n"
+        expected = f"{line_prefix}{key_prefix}SSH_AUTH_SOCK=opaque...7890\n"
+        assert redact_terminal_output(out, command, force=True) == expected
+
+    @pytest.mark.parametrize("line_prefix", ["1 ", "42 ", "0001\t", "0\t", "1:\t", "1 | ", "\u0661\t"])
+    def test_arbitrary_numeric_log_prefix_is_not_a_line_number(self, line_prefix):
+        from agent.redact import redact_terminal_output
+
+        secret = "opaque-sensitive-value-1234567890"
+        out = f"{line_prefix}SSH_AUTH_SOCK={secret}\n"
+        expected = f"{line_prefix}SSH_AUTH_SOCK=opaque...7890\n"
+        assert redact_terminal_output(out, "cat -n .env", force=True) == expected
+
+    @pytest.mark.parametrize("prefix", ["", " \t", "export ", "\texport\t", "EXPORT ", "     1\t", "    42\t \texport "])
+    @pytest.mark.parametrize("value", ["/private/tmp/agent.sock", "'/private/tmp/agent.sock'", '"/private/tmp/agent.sock"'])
+    def test_exact_metadata_headers_preserve_quoted_values(self, prefix, value):
+        from agent.redact import redact_terminal_output
+
+        names = ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_DATE", "SSH_AUTH_SOCK")
+        out = "\n".join(f"{prefix}{name} = {value}" for name in names)
+        assert redact_terminal_output(out, "cat -n .env", force=True) == out
+
+    def test_metadata_head_spans_follow_each_substitution_text(self):
+        from agent.redact import redact_terminal_output
+
+        secret = "opaque-sensitive-value-1234567890"
+        token = "sk-" + "A" * 32
+        out = (
+            f"API_KEY={token}\n"
+            f"UPPER_TOKEN={secret}\n"
+            "export SSH_AUTH_SOCK='/private/tmp/first.sock'\n"
+            f"lower_token={secret}\n"
+            "  SSH_AUTH_SOCK=/private/tmp/second.sock\n"
+            f"app.password={secret}\n"
+            "\texport SSH_AUTH_SOCK=/private/tmp/third.sock\n"
+            f"prefix SSH_AUTH_SOCK={secret}\n"
+            "     8\tSSH_AUTH_SOCK=/private/tmp/fourth.sock\n"
+        )
+        result = redact_terminal_output(out, "cat -n .env", force=True)
+        assert token not in result
+        assert secret not in result
+        for line in out.splitlines():
+            if "/private/tmp/" in line:
+                assert line in result.splitlines()
+
+    @pytest.mark.parametrize("name", ["GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_DATE"])
+    def test_author_nearmatches_do_not_expand_native_secret_detection(self, name):
+        # Native does not classify AUTH inside AUTHOR as a secret keyword.
+        # P11 must not fix or broaden that separate scanner decision.
+        secret = "opaque-sensitive-value-1234567890"
+        for prefix in ("prefix'", "prefix ", "export", "app-", "A" * 64):
+            out = f"{prefix}{name}={secret}\n"
+            assert redact_sensitive_text(out, force=True) == out
+
+    def test_many_same_line_suffixes_do_not_trigger_backwards_rescans(self):
+        import time
+        from agent.redact import redact_terminal_output
+
+        secret = "opaque-sensitive-value-1234567890"
+        out = "prefix " + f"SSH_AUTH_SOCK={secret} " * 4000
+        started = time.perf_counter()
+        result = redact_terminal_output(out, "printenv", force=True)
+        assert secret not in result
+        assert time.perf_counter() - started < 2.0
+
+    @pytest.mark.parametrize("prefix", [" ", "export "])
+    @pytest.mark.parametrize("command", ["printenv", "cat .env"])
+    def test_prefixed_safe_metadata_still_masks_recognizable_secret_values(self, prefix, command):
+        from agent.redact import redact_terminal_output
+
+        token = "sk-" + "A" * 32
+        names = ["GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_DATE", "SSH_AUTH_SOCK"]
+        out = "\n".join(f"{prefix}{name}={token}" for name in names)
+        redacted = redact_terminal_output(out, command, force=True)
+
+        assert token not in redacted
+        assert len(redacted.splitlines()) == len(names)
+        for name, line in zip(names, redacted.splitlines()):
+            assert line.startswith(f"{prefix}{name}=")
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "AUTH_KEY",
+            "AUTH_TOKEN",
+            "ACCESS_TOKEN_VALUE",
+            "CREDENTIAL_VALUE",
+            "GIT_AUTHOR_TOKEN",
+            "AUTH_BEFORE",
+            "AUTH_AFTER",
+        ],
+    )
+    def test_printenv_masks_secret_like_nearby_names(self, name):
+        from agent.redact import redact_terminal_output
+
+        secret = "opaque-sensitive-value-1234567890"
+        redacted = redact_terminal_output(
+            f"{name}={secret}", "printenv", force=True
+        )
+
+        assert secret not in redacted
+        assert redacted.startswith(f"{name}=")
+
+    def test_printenv_safe_metadata_still_masks_prefixed_secret_value(self):
+        from agent.redact import redact_terminal_output
+
+        token = "sk-" + "A" * 32
+        out = f"GIT_AUTHOR_NAME={token}"
+        redacted = redact_terminal_output(out, "printenv", force=True)
+
+        assert token not in redacted
+        assert redacted != out
+
+    def test_non_env_command_preserves_source_false_positives(self):
+        from agent.redact import redact_terminal_output
+
+        token = "sk-" + "prod0123456789abcdef0123456789"
+        out = f"MAX_TOKENS=100\nOPENAI_API_KEY={token}"
+        redacted = redact_terminal_output(out, "cat config.py")
+
+        assert "MAX_TOKENS=100" in redacted
+        assert token not in redacted
+
     def test_disabled_passes_through(self, monkeypatch):
         from agent.redact import redact_terminal_output
         monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
