@@ -145,12 +145,13 @@ class TestResolveSessionAgentRuntimePriority:
                      "base_url": "https://openrouter.ai/api/v1",
                      "api_mode": "chat_completions",
                  },
-             ):
+             ) as resolve_channel:
             model, runtime = runner._resolve_session_agent_runtime(
                 source=source,
                 user_config={"model": {"default": "global/model"}},
             )
         assert model == "channel/model"
         assert runtime["provider"] == "openrouter"
+        resolve_channel.assert_called_once_with("openrouter", target_model="channel/model")
 
 

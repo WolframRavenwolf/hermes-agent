@@ -187,8 +187,8 @@ def _detect_api_mode_for_url(base_url: str) -> Optional[str]:
 def _fallback_api_mode(provider: str, base_url: str, model: str = "") -> str:
     """Resolve api_mode when no explicit/persisted mode applies.
 
-    Precedence: URL detection (host-mandated wire shapes) first, then the
-    transport the provider overlay itself declares via
+    Native plugin-profile transports are authoritative. For built-in routes,
+    precedence remains URL detection first, then the overlay transport via
     ``providers.determine_api_mode`` — which already handles host mandates,
     dual-wire providers, and the registry transport map — and only then the
     ``chat_completions`` default for genuinely unknown providers/endpoints.
@@ -201,11 +201,30 @@ def _fallback_api_mode(provider: str, base_url: str, model: str = "") -> str:
     declaration was never consulted. Same latent class covered the other
     non-chat overlays (MiniMax family, copilot-acp).
     """
+    from hermes_cli.providers import HERMES_OVERLAYS, determine_api_mode, get_provider, TRANSPORT_TO_API_MODE
+
+    # Native plugin profiles declare their wire contract. A known host is
+    # only a heuristic for an otherwise unspecified route, not permission to
+    # replace a profile's transport. Keep built-in dual-wire policy below.
+    definition = get_provider(provider, allow_network=False)
+    if definition is None or (
+        definition.source == "models.dev" and definition.id not in HERMES_OVERLAYS
+    ):
+        # Catalog metadata must not replace a registered profile's transport.
+        # Env-URL profiles may also have no CLI catalog entry at all.
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(provider)
+        profile_mode = _parse_api_mode(getattr(profile, "api_mode", None))
+        if profile_mode:
+            return profile_mode
+    if definition is not None and definition.source == "plugin-profile":
+        profile_mode = TRANSPORT_TO_API_MODE.get(definition.transport)
+        if profile_mode:
+            return profile_mode
     detected = _detect_api_mode_for_url(base_url)
     if detected:
         return detected
-    from hermes_cli.providers import determine_api_mode
-
     return determine_api_mode(provider, base_url, model) or "chat_completions"
 
 
@@ -381,6 +400,20 @@ def _get_model_config() -> Dict[str, Any]:
     return {}
 
 
+def _canonical_provider_id(provider: Optional[str]) -> str:
+    """Use native auth/profile aliases without resolving credentials or I/O."""
+    name = str(provider or "").strip().lower()
+    if name == "custom" or name.startswith("custom:"):
+        return "custom"
+    registered = PROVIDER_REGISTRY.get(name)
+    if registered is not None:
+        return registered.id
+    from providers import get_provider_profile
+
+    profile = get_provider_profile(name)
+    return profile.name if profile is not None else name
+
+
 def _provider_supports_explicit_api_mode(provider: Optional[str], configured_provider: Optional[str] = None) -> bool:
     """Check whether a persisted api_mode should be honored for a given provider.
 
@@ -389,13 +422,9 @@ def _provider_supports_explicit_api_mode(provider: Optional[str], configured_pro
     persisted mode when the config's provider matches the runtime
     provider (or when no configured provider is recorded).
     """
-    normalized_provider = (provider or "").strip().lower()
-    normalized_configured = (configured_provider or "").strip().lower()
-    if not normalized_configured:
+    if not str(configured_provider or "").strip():
         return True
-    if normalized_provider == "custom":
-        return normalized_configured == "custom" or normalized_configured.startswith("custom:")
-    return normalized_configured == normalized_provider
+    return _canonical_provider_id(provider) == _canonical_provider_id(configured_provider)
 
 
 def _copilot_runtime_api_mode(
@@ -591,7 +620,7 @@ def _resolve_runtime_from_pool_entry(
         # fell back to the hardcoded default).  Env var overrides win (#6039).
         pconfig = PROVIDER_REGISTRY.get(provider)
         pool_url_is_default = pconfig and base_url.rstrip("/") == pconfig.inference_base_url.rstrip("/")
-        if configured_provider == provider and pool_url_is_default:
+        if _canonical_provider_id(configured_provider) == provider and pool_url_is_default:
             cfg_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
             if cfg_base_url:
                 base_url = cfg_base_url
@@ -1868,7 +1897,13 @@ def _resolve_explicit_runtime(
         else:
             configured_provider = str(model_cfg.get("provider") or "").strip().lower()
             configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
-            if configured_mode and _provider_supports_explicit_api_mode(provider, configured_provider):
+            from hermes_cli.models import opencode_model_api_mode, opencode_provider_family
+
+            if opencode_provider_family(provider) is not None:
+                api_mode = opencode_model_api_mode(
+                    provider, target_model or model_cfg.get("default", "")
+                )
+            elif configured_mode and _provider_supports_explicit_api_mode(provider, configured_provider):
                 api_mode = configured_mode
             else:
                 # URL detection first, then the provider's declared transport
@@ -1876,6 +1911,13 @@ def _resolve_explicit_runtime(
                 api_mode = _fallback_api_mode(
                     provider, base_url, target_model or model_cfg.get("default", "")
                 )
+
+        from hermes_cli.models import normalize_opencode_base_url, opencode_provider_family
+
+        if opencode_provider_family(provider) is not None:
+            base_url = normalize_opencode_base_url(provider, api_mode, base_url)
+        if provider == "lmstudio":
+            base_url = auth_mod._normalize_lmstudio_runtime_base_url(base_url)
 
         if provider == "actual" and not api_key and is_actual_local_base_url(base_url):
             api_key = ACTUAL_LOCAL_NOAUTH_PLACEHOLDER
@@ -2499,7 +2541,7 @@ def resolve_runtime_provider(
         # (China endpoint) still get the hardcoded api.minimax.io default (#6039).
         cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
         cfg_base_url = ""
-        if cfg_provider == provider:
+        if _canonical_provider_id(cfg_provider) == provider:
             cfg_base_url = (model_cfg.get("base_url") or "").strip().rstrip("/")
         base_url = cfg_base_url or creds.get("base_url", "").rstrip("/")
         if provider == "actual":

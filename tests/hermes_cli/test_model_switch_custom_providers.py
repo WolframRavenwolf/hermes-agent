@@ -47,6 +47,25 @@ def _disable_live_custom_provider_model_probe(monkeypatch):
     )
 
 
+def test_native_profile_catalog_preserves_alias_identity_and_env_roles(monkeypatch):
+    import providers
+    from providers import ProviderProfile
+
+    profile = ProviderProfile(
+        name="port-profile", aliases=("port-alias",), base_url="https://profile.example/v1",
+        api_mode="codex_responses", env_vars=("PORT_BASE_URL", "PORT_API_KEY"),
+    )
+    monkeypatch.setattr(providers, "_REGISTRY", dict(providers._REGISTRY))
+    monkeypatch.setattr(providers, "_ALIASES", dict(providers._ALIASES))
+    monkeypatch.setattr(providers, "_PROVIDER_LIST_CACHE", None)
+    providers.register_provider(profile)
+    definition = providers_mod.get_provider("port-alias", allow_network=False)
+    assert definition.id == profile.name
+    assert definition.transport == "codex_responses"
+    assert definition.api_key_env_vars == ("PORT_API_KEY",)
+    assert definition.base_url_env_var == "PORT_BASE_URL"
+
+
 def test_picker_native_probe_failure_falls_back_to_openai_catalog(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.models.should_use_ollama_native_catalog", lambda *a, **k: True

@@ -8,6 +8,280 @@ import pytest
 from hermes_cli import runtime_provider as rp
 
 
+@pytest.fixture
+def port_provider_profile(monkeypatch):
+    import providers
+    from providers import ProviderProfile
+    from hermes_cli.auth import ProviderConfig
+
+    class Profile(ProviderProfile):
+        def build_api_kwargs_extras(self, **context):
+            return {}, {"reasoning_effort": context["reasoning_config"]["effort"], "verbosity": "low"}
+
+    profile = Profile(
+        name="port-profile", aliases=("port-alias",),
+        base_url="https://api.openai.com/v1", api_mode="chat_completions",
+        env_vars=("PORT_PROFILE_KEY", "PORT_PROFILE_BASE_URL"),
+        default_headers={"X-Profile": "port-profile"},
+    )
+    monkeypatch.setattr(providers, "_REGISTRY", dict(providers._REGISTRY))
+    monkeypatch.setattr(providers, "_ALIASES", dict(providers._ALIASES))
+    monkeypatch.setattr(providers, "_PROVIDER_LIST_CACHE", None)
+    providers.register_provider(profile)
+    pconfig = ProviderConfig(
+        id=profile.name, name=profile.name, auth_type="api_key",
+        inference_base_url=profile.base_url, api_key_env_vars=("PORT_PROFILE_KEY",),
+        base_url_env_var="PORT_PROFILE_BASE_URL",
+    )
+    for name in (profile.name, *profile.aliases):
+        monkeypatch.setitem(rp.PROVIDER_REGISTRY, name, pconfig)
+    monkeypatch.setenv("PORT_PROFILE_KEY", "synthetic-profile-key")
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+    return profile
+
+
+@pytest.mark.parametrize("path", ["normal", "pool", "explicit"])
+@pytest.mark.parametrize("config_provider, configured_mode", [
+    ("port-alias", "anthropic_messages"), ("port-profile", None),
+    ("unrelated", "anthropic_messages"),
+])
+def test_profile_runtime_identity_and_transport(
+    port_provider_profile, monkeypatch, path, config_provider, configured_mode,
+):
+    profile = port_provider_profile
+    cfg = {"provider": config_provider, "default": "old-model"}
+    if configured_mode:
+        cfg["api_mode"] = configured_mode
+    monkeypatch.setattr(rp, "_get_model_config", lambda: cfg)
+    entry = SimpleNamespace(runtime_api_key="synthetic-pool-key", runtime_base_url=profile.base_url)
+    pool = SimpleNamespace(has_credentials=lambda: path == "pool", select=lambda: entry)
+    monkeypatch.setattr(rp, "load_pool", lambda name: pool)
+    kwargs = {"explicit_api_key": "synthetic-explicit-key"} if path == "explicit" else {}
+    runtime = rp.resolve_runtime_provider(requested="port-alias", target_model="target-model", **kwargs)
+    assert runtime["provider"] == profile.name
+    assert runtime["requested_provider"] == "port-alias"
+    assert runtime["base_url"] == profile.base_url
+    assert runtime["api_mode"] == (
+        configured_mode if config_provider == "port-alias" else profile.api_mode
+    )
+
+
+@pytest.mark.parametrize("path", ["normal", "pool", "explicit"])
+@pytest.mark.parametrize("catalog_hit", [False, True], ids=["no-catalog-entry", "catalog-entry"])
+def test_catalog_entry_preserves_registered_profile_transport(
+    port_provider_profile, monkeypatch, path, catalog_hit,
+):
+    from agent import models_dev
+    from hermes_cli.providers import get_provider
+
+    profile = port_provider_profile
+    profile.api_mode = "anthropic_messages"
+    profile.base_url = "https://profile.example/v1"
+    monkeypatch.setattr(rp.PROVIDER_REGISTRY[profile.name], "inference_base_url", profile.base_url)
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {
+        "provider": "port-alias", "default": "target-model",
+    })
+    # Exercise the real models.dev parser and CLI lookup, not a mocked ProviderDef.
+    raw_entry = {
+        "name": profile.name, "api": profile.base_url,
+        "env": ["PORT_PROFILE_KEY"], "models": {},
+    }
+    catalog = {"catalog-control": raw_entry}
+    if catalog_hit:
+        catalog[profile.name] = raw_entry
+    monkeypatch.setattr(models_dev, "_models_dev_cache", catalog)
+    monkeypatch.setattr(models_dev, "_models_dev_cache_time", time.time())
+    definition = get_provider(profile.name, allow_network=False)
+    assert definition is not None
+    assert definition.source == ("models.dev" if catalog_hit else "plugin-profile")
+    if catalog_hit:
+        assert definition.transport == "openai_chat"
+
+    credentials = rp.resolve_api_key_provider_credentials(profile.name)
+    assert credentials["base_url"] == profile.base_url
+    assert credentials["api_key"] == "synthetic-profile-key"
+    entry = SimpleNamespace(
+        runtime_api_key=credentials["api_key"], runtime_base_url=credentials["base_url"],
+    )
+    pool = SimpleNamespace(has_credentials=lambda: path == "pool", select=lambda: entry)
+    monkeypatch.setattr(rp, "load_pool", lambda name: pool)
+    kwargs = {"explicit_api_key": "synthetic-explicit-key"} if path == "explicit" else {}
+
+    runtime = rp.resolve_runtime_provider(requested="port-alias", target_model="target-model", **kwargs)
+
+    assert runtime["provider"] == profile.name
+    assert runtime["base_url"] == profile.base_url
+    assert runtime["api_key"] == ("synthetic-explicit-key" if path == "explicit" else credentials["api_key"])
+    assert runtime["api_mode"] == profile.api_mode
+    if path == "pool":
+        assert runtime["credential_pool"] is pool
+    elif path == "explicit":
+        assert runtime["source"] == "explicit"
+
+
+@pytest.mark.parametrize("path", ["normal", "pool"])
+def test_profile_alias_keeps_its_configured_endpoint(port_provider_profile, monkeypatch, path):
+    profile = port_provider_profile
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {
+        "provider": "port-alias", "default": "target-model", "base_url": "https://proxy.example/v1",
+    })
+    entry = SimpleNamespace(runtime_api_key="synthetic-pool-key", runtime_base_url=profile.base_url)
+    monkeypatch.setattr(rp, "load_pool", lambda name: SimpleNamespace(
+        has_credentials=lambda: path == "pool", select=lambda: entry,
+    ))
+    runtime = rp.resolve_runtime_provider(requested=profile.name, target_model="target-model")
+    assert runtime["base_url"] == "https://proxy.example/v1"
+
+
+@pytest.mark.parametrize("path", ["normal", "pool", "explicit"])
+@pytest.mark.parametrize("config_provider, configured_mode", [
+    ("port-profile", None), ("unrelated", "anthropic_messages"),
+    ("port-alias", "anthropic_messages"),
+])
+def test_env_url_profile_preserves_runtime_transport(
+    port_provider_profile, monkeypatch, path, config_provider, configured_mode,
+):
+    """A registered API-key profile need not have a static CLI-catalog URL."""
+    from hermes_cli.providers import get_provider
+
+    profile = port_provider_profile
+    profile.base_url = ""
+    monkeypatch.setattr(rp.PROVIDER_REGISTRY[profile.name], "inference_base_url", "")
+    endpoint = "https://api.openai.com/v1"
+    monkeypatch.setenv("PORT_PROFILE_BASE_URL", endpoint)
+    cfg = {"provider": config_provider, "default": "target-model"}
+    if configured_mode:
+        cfg["api_mode"] = configured_mode
+    monkeypatch.setattr(rp, "_get_model_config", lambda: cfg)
+    # Native auth resolves the declared key and URL env roles, not test stubs.
+    credentials = rp.resolve_api_key_provider_credentials(profile.name)
+    assert credentials["base_url"] == endpoint
+    assert credentials["api_key"] == "synthetic-profile-key"
+    assert get_provider(profile.name, allow_network=False) is None
+    entry = SimpleNamespace(
+        runtime_api_key=credentials["api_key"], runtime_base_url=credentials["base_url"],
+    )
+    pool = SimpleNamespace(has_credentials=lambda: path == "pool", select=lambda: entry)
+    monkeypatch.setattr(rp, "load_pool", lambda provider: pool)
+    kwargs = {"explicit_api_key": "synthetic-explicit-key"} if path == "explicit" else {}
+
+    runtime = rp.resolve_runtime_provider(requested="port-alias", target_model="target-model", **kwargs)
+
+    assert runtime["provider"] == profile.name
+    assert runtime["base_url"] == endpoint
+    assert runtime["api_mode"] == (
+        configured_mode if config_provider == "port-alias" else profile.api_mode
+    )
+    if path == "pool":
+        assert runtime["credential_pool"] is pool
+    elif path == "explicit":
+        assert runtime["source"] == "explicit"
+
+
+@pytest.mark.parametrize("provider, target_model, stale_model, stale_mode, base_url, expected_mode, expected_url", [
+    ("opencode-go", "deepseek-v4-flash", "minimax-m2.7", "anthropic_messages",
+     "https://opencode.ai/zen/go", "chat_completions", "https://opencode.ai/zen/go/v1"),
+    ("opencode-go", "minimax-m2.7", "deepseek-v4-flash", "chat_completions",
+     "https://opencode.ai/zen/go/v1", "anthropic_messages", "https://opencode.ai/zen/go"),
+    ("opencode-zen", "deepseek-v4-flash", "claude-sonnet-4-6", "anthropic_messages",
+     "https://opencode.ai/zen", "chat_completions", "https://opencode.ai/zen/v1"),
+    ("opencode-zen", "claude-sonnet-4-6", "deepseek-v4-flash", "chat_completions",
+     "https://opencode.ai/zen/v1", "anthropic_messages", "https://opencode.ai/zen"),
+    ("opencode-go", "deepseek-v4-flash", "minimax-m2.7", "anthropic_messages",
+     "https://proxy.example/opencode", "chat_completions", "https://proxy.example/opencode"),
+    ("lmstudio", "local-model", "local-model", "chat_completions",
+     "http://127.0.0.1:1234/api/v1", "chat_completions", "http://127.0.0.1:1234/v1"),
+])
+def test_explicit_runtime_retains_original_model_and_url_normalization(
+    monkeypatch, provider, target_model, stale_model, stale_mode, base_url, expected_mode, expected_url,
+):
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {
+        "provider": provider, "default": stale_model, "api_mode": stale_mode,
+    })
+
+    runtime = rp.resolve_runtime_provider(
+        requested=provider, target_model=target_model,
+        explicit_api_key="synthetic-explicit-key", explicit_base_url=base_url,
+    )
+
+    assert runtime["provider"] == provider
+    assert runtime["source"] == "explicit"
+    assert runtime["api_mode"] == expected_mode
+    assert runtime["base_url"] == expected_url
+
+
+def test_native_profile_headers_reasoning_and_verbosity(port_provider_profile, monkeypatch):
+    from unittest.mock import MagicMock
+    import agent.auxiliary_client as aux
+    from agent.transports.chat_completions import ChatCompletionsTransport
+    from providers import get_provider_profile
+
+    profile = port_provider_profile
+    profile.base_url = "https://profile.example/v1"
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {"provider": "port-alias", "default": "target-model"})
+    monkeypatch.setattr(rp, "load_pool", lambda name: None)
+    runtime = rp.resolve_runtime_provider(
+        requested="port-alias", explicit_api_key="synthetic-key", explicit_base_url=profile.base_url,
+    )
+    factory = MagicMock(return_value=SimpleNamespace())
+    monkeypatch.setattr(aux, "_create_openai_client", factory)
+    aux.resolve_provider_client(
+        runtime["provider"], model="target-model", explicit_api_key=runtime["api_key"],
+        explicit_base_url=runtime["base_url"],
+    )
+    assert factory.call_args.kwargs["default_headers"]["X-Profile"] == "port-profile"
+    request = ChatCompletionsTransport().build_kwargs(
+        model="target-model", messages=[{"role": "user", "content": "hello"}], tools=None,
+        provider_profile=get_provider_profile(runtime["provider"]),
+        reasoning_config={"enabled": True, "effort": "medium"},
+    )
+    assert request["reasoning_effort"] == "medium"
+    assert request["verbosity"] == "low"
+
+
+def test_gateway_provider_boundary_passes_target_model(monkeypatch):
+    from unittest.mock import MagicMock
+    from gateway.run import _resolve_runtime_agent_kwargs_for_provider
+
+    resolve = MagicMock(return_value={"provider": "port-profile", "api_mode": "chat_completions"})
+    monkeypatch.setattr(rp, "resolve_runtime_provider", resolve)
+    result = _resolve_runtime_agent_kwargs_for_provider("port-alias", target_model="target-model")
+    resolve.assert_called_once_with(requested="port-alias", target_model="target-model")
+    assert result["provider"] == "port-profile"
+
+
+@pytest.mark.parametrize("entrypoint", ["channel", "rehydrate"])
+def test_gateway_runtime_callers_supply_their_selected_model(monkeypatch, entrypoint):
+    from unittest.mock import MagicMock
+    import gateway.run as gateway
+    from gateway.config import ChannelOverride, GatewayConfig, Platform, PlatformConfig
+    from gateway.session import SessionSource
+
+    runner = object.__new__(gateway.GatewayRunner)
+    runner._session_model_overrides = {}
+    resolve = MagicMock(return_value={"provider": "port-profile", "api_key": "synthetic-key"})
+    monkeypatch.setattr(gateway, "_resolve_runtime_agent_kwargs_for_provider", resolve)
+    if entrypoint == "rehydrate":
+        runner.session_store = SimpleNamespace(get_model_override=lambda key: {
+            "provider": "port-alias", "model": "target-model",
+        })
+        runner._rehydrate_session_model_override("test-session")
+    else:
+        runner.config = GatewayConfig(platforms={Platform.DISCORD: PlatformConfig(
+            enabled=True, channel_overrides={"test-channel": ChannelOverride(
+                provider="port-alias", model="target-model",
+            )},
+        )})
+        monkeypatch.setattr(gateway, "_resolve_gateway_model", lambda *a, **kw: "old-model")
+        monkeypatch.setattr(gateway, "_resolve_runtime_agent_kwargs", lambda: {})
+        runner._resolve_session_agent_runtime(
+            source=SessionSource(platform=Platform.DISCORD, chat_id="test-channel", user_id="test-user"),
+            user_config={"model": {"default": "old-model"}},
+        )
+    resolve.assert_called_once_with("port-alias", target_model="target-model")
+
+
 def test_configured_api_key_provider_without_key_fails_closed(monkeypatch):
     """A saved provider must not resolve as another authenticated provider."""
     monkeypatch.setattr(
