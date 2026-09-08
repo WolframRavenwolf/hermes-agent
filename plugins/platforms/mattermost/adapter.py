@@ -304,7 +304,9 @@ class MattermostAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]],
     ) -> Optional[str]:
         """Resolve the Mattermost root_id from reply_to or metadata."""
-        if self._reply_mode != "thread":
+        if self._reply_mode != "thread" and not (
+            isinstance(metadata, dict) and metadata.get("mattermost_explicit_thread")
+        ):
             return None
         candidate = reply_to
         if not candidate and isinstance(metadata, dict):
@@ -810,17 +812,19 @@ class MattermostAdapter(BasePlatformAdapter):
 
         payload: Dict[str, Any] = _with_mentions_disabled({
             "channel_id": chat_id,
-            "message": caption or "",
+            "message": _file_post_message(caption, [fname]),
             "file_ids": [file_id],
         })
         resolved_root = await self._thread_root_for_send(reply_to, metadata)
         if resolved_root:
             payload["root_id"] = resolved_root
 
-        data = await self._post_preserving_thread(chat_id, payload, metadata)
-        if not data or "id" not in data:
-            return SendResult(success=False, error="Failed to post with file")
-        return SendResult(success=True, message_id=data["id"])
+        return await self._post_chunked_payload(
+            chat_id,
+            payload,
+            metadata,
+            error="Failed to post with file",
+        )
 
     async def _send_local_file(
         self,
@@ -851,17 +855,19 @@ class MattermostAdapter(BasePlatformAdapter):
 
         payload: Dict[str, Any] = _with_mentions_disabled({
             "channel_id": chat_id,
-            "message": caption or "",
+            "message": _file_post_message(caption, [fname]),
             "file_ids": [file_id],
         })
         resolved_root = await self._thread_root_for_send(reply_to, metadata)
         if resolved_root:
             payload["root_id"] = resolved_root
 
-        data = await self._post_preserving_thread(chat_id, payload, metadata)
-        if not data or "id" not in data:
-            return SendResult(success=False, error="Failed to post with file")
-        return SendResult(success=True, message_id=data["id"])
+        return await self._post_chunked_payload(
+            chat_id,
+            payload,
+            metadata,
+            error="Failed to post with file",
+        )
 
     async def send_multiple_images(
         self,
@@ -869,17 +875,20 @@ class MattermostAdapter(BasePlatformAdapter):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+        *,
+        caption: Optional[str] = None,
+    ) -> SendResult:
         """Send a batch of images as a single Mattermost post with multiple attachments.
 
         Mattermost supports up to 5 ``file_ids`` per post. Each image is
         uploaded individually (Mattermost's file API is one-at-a-time),
         then a single post is created referencing all uploaded file_ids
-        at once. Batches larger than 5 are chunked. Falls back to the
-        base per-image loop on total failure.
+        at once. Batches larger than 5 are chunked. Per-image fallback is
+        limited to authoritative rejections, with receipts retained. A shared
+        caption belongs to the delivery, not to an upload that may be skipped.
         """
         if not images:
-            return
+            return SendResult(success=True)
 
         import mimetypes
         import aiohttp
@@ -888,17 +897,42 @@ class MattermostAdapter(BasePlatformAdapter):
         CHUNK = 5  # Mattermost post file_ids cap
         chunks = [images[i:i + CHUNK] for i in range(0, len(images), CHUNK)]
 
+        message_ids: List[str] = []
+        caption_delivered = False
+        delivered_media_count = 0
+
+        def receipt(success: bool, error: Optional[str] = None) -> SendResult:
+            return SendResult(
+                success=success,
+                message_id=message_ids[-1] if message_ids else None,
+                error=error,
+                continuation_message_ids=tuple(message_ids[:-1] if success else message_ids),
+                raw_response={
+                    "message_ids": tuple(message_ids),
+                    "requested_media_count": len(images),
+                    "delivered_media_count": delivered_media_count,
+                },
+            )
+
+        def collect(result: SendResult) -> None:
+            ids = (result.raw_response or {}).get("message_ids")
+            if ids is None:
+                ids = list(result.continuation_message_ids)
+                if result.message_id and result.message_id not in ids:
+                    ids.append(result.message_id)
+            message_ids.extend(str(mid) for mid in ids if mid not in message_ids)
+
         for chunk_idx, chunk in enumerate(chunks):
             if human_delay > 0 and chunk_idx > 0:
                 await asyncio.sleep(human_delay)
 
             file_ids: List[str] = []
+            uploaded_names: List[str] = []
             caption_parts: List[str] = []
             try:
                 for image_url, alt_text in chunk:
                     if alt_text:
                         caption_parts.append(alt_text)
-
                     if image_url.startswith("file://"):
                         local_path = _unquote(image_url[7:])
                         p = Path(local_path)
@@ -933,13 +967,17 @@ class MattermostAdapter(BasePlatformAdapter):
                     fid = await self._upload_file(chat_id, file_data, fname, ct)
                     if fid:
                         file_ids.append(fid)
+                        uploaded_names.append(fname)
 
                 if not file_ids:
                     continue
 
                 payload: Dict[str, Any] = _with_mentions_disabled({
                     "channel_id": chat_id,
-                    "message": "\n".join(caption_parts),
+                    "message": _file_post_message(
+                        caption if caption is not None and not caption_delivered
+                        else "\n".join(caption_parts), uploaded_names,
+                    ),
                     "file_ids": file_ids,
                 })
                 resolved_root = await self._thread_root_for_send(None, metadata)
@@ -949,16 +987,49 @@ class MattermostAdapter(BasePlatformAdapter):
                     "Mattermost: sending %d image(s) as single post (chunk %d/%d)",
                     len(file_ids), chunk_idx + 1, len(chunks),
                 )
-                data = await self._post_preserving_thread(chat_id, payload, metadata)
-                if not data or "id" not in data:
-                    logger.warning("Mattermost: multi-image post failed, falling back")
-                    await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
-            except Exception as e:
-                logger.warning(
-                    "Mattermost: multi-image send failed (chunk %d/%d), falling back: %s",
-                    chunk_idx + 1, len(chunks), e, exc_info=True,
+                result = await self._post_chunked_payload(
+                    chat_id,
+                    payload,
+                    metadata,
+                    error="Failed to post image batch",
                 )
-                await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
+                collect(result)
+                if result.message_id:
+                    delivered_media_count += len(file_ids)
+                if not result.success:
+                    # Retry per image only after an authoritative rejection with
+                    # no acknowledged post. Network/5xx ambiguity is not rejection.
+                    if not result.message_id and self._last_post_status in {400, 403, 404, 413, 422}:
+                        for image_url, alt_text in chunk:
+                            if human_delay > 0:
+                                await asyncio.sleep(human_delay)
+                            fallback_caption = caption if caption is not None and not caption_delivered else alt_text
+                            if image_url.startswith("file://"):
+                                fallback = await self.send_image_file(
+                                    chat_id, _unquote(image_url[7:]),
+                                    caption=fallback_caption, metadata=metadata,
+                                )
+                            else:
+                                fallback = await self.send_image(
+                                    chat_id, image_url,
+                                    caption=fallback_caption, metadata=metadata,
+                                )
+                            collect(fallback)
+                            if fallback.message_id:
+                                delivered_media_count += 1
+                            if not fallback.success:
+                                return receipt(False, fallback.error)
+                            if fallback.message_id:
+                                caption_delivered = True
+                    else:
+                        return receipt(False, result.error)
+                if result.message_id:
+                    caption_delivered = True
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return receipt(False, "Mattermost image batch delivery failed")
+        return receipt(bool(message_ids), None if message_ids else "No deliverable media")
 
     # ------------------------------------------------------------------
     # WebSocket
@@ -1330,6 +1401,7 @@ async def _standalone_send(
     upload_headers = {"Authorization": f"Bearer {token}"}
 
     media_files = media_files or []
+    requested_media_count = len(media_files)
     message_ids: List[str] = []
 
     def _failure(error: str) -> Dict[str, Any]:
@@ -1342,6 +1414,7 @@ async def _standalone_send(
             "chat_id": chat_id,
             "message_id": delivered_ids[-1] if delivered_ids else None,
             "message_ids": delivered_ids,
+            "media_delivered": False,
             "error": error,
         }
 
@@ -1365,6 +1438,9 @@ async def _standalone_send(
                 file_path = media
             if file_path and os.path.exists(file_path):
                 media_paths.append(str(file_path))
+
+        if requested_media_count and not media_paths and not message.strip():
+            return _failure("No deliverable Mattermost media")
 
         # Mattermost accepts at most five file_ids per post. Upload and post one
         # batch before starting the next so a later failure cannot orphan files
@@ -1391,11 +1467,16 @@ async def _standalone_send(
                     # Mattermost requires channel_id on file uploads so the
                     # server can attribute them.
                     form.add_field("channel_id", chat_id)
-                    with open(file_path, "rb") as fh:
-                        form.add_field(
-                            "files",
-                            fh.read(),
-                            filename=filename,
+                    try:
+                        with open(file_path, "rb") as fh:
+                            form.add_field(
+                                "files",
+                                fh.read(),
+                                filename=filename,
+                            )
+                    except OSError:
+                        return _failure(
+                            "Mattermost media became unavailable before upload"
                         )
                     async with session.post(
                         f"{base_url}/api/v4/files",
@@ -1469,6 +1550,10 @@ async def _standalone_send(
                         )
                     message_ids.append(str(post_id))
 
+            if len(media_paths) != requested_media_count:
+                return _failure(
+                    "Not all requested Mattermost media were accepted for delivery"
+                )
             return {
                 "success": True,
                 "platform": "mattermost",

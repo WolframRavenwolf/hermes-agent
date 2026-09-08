@@ -448,7 +448,9 @@ def _handle_send(args):
     force_document_attachments = "[[as_document]]" in message
 
     media_files, cleaned_message = BasePlatformAdapter.extract_media(message)
+    requested_media_count = len(media_files)
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+    rejected_media_count = requested_media_count - len(media_files)
     mirror_text = cleaned_message.strip() or _describe_media_for_mirror(media_files)
 
     used_home_channel = False
@@ -493,6 +495,23 @@ def _handle_send(args):
                 return json.dumps(_resolve_err)
             chat_id = _resolved
 
+    if (
+        platform_name == "mattermost"
+        and requested_media_count
+        and not media_files
+        and not cleaned_message.strip()
+    ):
+        return json.dumps({
+            "success": False,
+            "platform": "mattermost",
+            "chat_id": chat_id,
+            "message_id": None,
+            "message_ids": [],
+            "partial_failure": False,
+            "media_delivered": False,
+            "error": "No deliverable Mattermost media",
+        })
+
     try:
         from model_tools import _run_async
         send_kwargs = {
@@ -513,6 +532,23 @@ def _handle_send(args):
                 **send_kwargs,
             )
         )
+        if platform_name == "mattermost" and rejected_media_count:
+            if not isinstance(result, dict):
+                result = {"success": False, "message_ids": []}
+            message_ids = list(result.get("message_ids") or [])
+            message_id = result.get("message_id")
+            if message_id and message_id not in message_ids:
+                message_ids.append(message_id)
+            result.update(
+                success=False,
+                media_delivered=False,
+                partial_failure=bool(message_ids),
+                message_ids=message_ids,
+            )
+            result.setdefault(
+                "error",
+                "Not all requested Mattermost media were accepted for delivery",
+            )
         if used_home_channel and isinstance(result, dict) and result.get("success"):
             result["note"] = f"Sent to {platform_name} home channel (chat_id: {chat_id})"
 
@@ -864,6 +900,20 @@ def _bounded_send_error(detail, max_chars=900):
     return f"{text[: max_chars - 3]}..."
 
 
+def _mattermost_adapter_receipt(result, chat_id):
+    """Expose every adapter-owned post, including partial failure receipts."""
+    ids = list((result.raw_response or {}).get("message_ids", result.continuation_message_ids))
+    if result.message_id and result.message_id not in ids:
+        ids.append(result.message_id)
+    receipt = {
+        "success": result.success, "platform": "mattermost", "chat_id": chat_id,
+        "message_id": result.message_id, "message_ids": ids,
+    }
+    if not result.success:
+        receipt.update(partial_failure=bool(ids), error=_bounded_send_error(result.error))
+    return receipt
+
+
 async def _send_live_adapter_media(
     adapter,
     chat_id,
@@ -875,6 +925,50 @@ async def _send_live_adapter_media(
     force_document=False,
 ):
     """Deliver text and every media descriptor through adapter media APIs."""
+    adapter_platform = getattr(adapter, "platform", None)
+    if getattr(adapter_platform, "value", adapter_platform) == "mattermost":
+        # Mattermost attaches arbitrary files in five-file posts. Keep the full
+        # caption and all receipts in the native batch owner, on the gateway loop.
+        from pathlib import Path
+        paths = []
+        for descriptor in media_files:
+            path = (descriptor.get("path") if isinstance(descriptor, dict) else
+                    descriptor[0] if isinstance(descriptor, (tuple, list)) and descriptor else
+                    descriptor)
+            if isinstance(path, (str, os.PathLike)) and os.path.isfile(path):
+                paths.append(Path(path).absolute().as_uri())
+        if not paths:
+            if not message:
+                return {
+                    "success": False,
+                    "platform": "mattermost",
+                    "chat_id": chat_id,
+                    "message_id": None,
+                    "message_ids": [],
+                    "partial_failure": False,
+                    "media_delivered": False,
+                    "error": "No deliverable Mattermost media",
+                }
+            result = await adapter.send(chat_id, message, metadata=metadata)
+        else:
+            result = await adapter.send_multiple_images(
+                chat_id, [(path, "") for path in paths], metadata=metadata, caption=message,
+            )
+        receipt = _mattermost_adapter_receipt(result, chat_id)
+        delivered = (result.raw_response or {}).get("delivered_media_count", 0)
+        complete = (
+            result.success and len(paths) == len(media_files)
+            and type(delivered) is int and delivered == len(paths)
+        )
+        receipt["success"] = bool(complete)
+        receipt["media_delivered"] = bool(paths) and bool(complete)
+        if not complete:
+            receipt["partial_failure"] = bool(receipt["message_ids"])
+            receipt["error"] = _bounded_send_error(
+                result.error or "Not all requested Mattermost media were delivered"
+            )
+        return receipt
+
     caption, separate_text = _media_caption_split(
         message, media_files, max_caption_len=_DEFAULT_CAPTION_LIMIT
     )
@@ -995,6 +1089,8 @@ async def _send_via_adapter(
                 metadata = {}
                 if thread_id:
                     metadata["thread_id"] = thread_id
+                    if platform_name == "mattermost":
+                        metadata["mattermost_explicit_thread"] = True
                 if platform_name == "ntfy" and chat_id:
                     metadata["publish_topic"] = chat_id
                 if not metadata:
@@ -1073,6 +1169,8 @@ async def _send_via_adapter(
                 raise
             except Exception as e:
                 return {"error": f"Plugin platform send failed: {_bounded_send_error(e)}"}
+            if platform_name == "mattermost":
+                return _mattermost_adapter_receipt(result, chat_id)
             if result.success:
                 return {"success": True, "message_id": result.message_id}
             return {"error": f"Adapter send failed: {_bounded_send_error(result.error)}"}
@@ -1490,21 +1588,15 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             last_result = result
         return last_result
 
-    # Mattermost keeps the native live-adapter/cross-loop dispatch and its
-    # standalone fallback, including media-only and explicit thread targets.
-    if platform == Platform.MATTERMOST and media_files:
-        last_result = None
-        delivery_chunks = chunks or [message]
-        for i, chunk in enumerate(delivery_chunks):
-            result = await _send_via_adapter(
-                platform, pconfig, chat_id, chunk, thread_id=thread_id,
-                media_files=media_files if i == len(delivery_chunks) - 1 else [],
-                force_document=force_document,
-            )
-            if isinstance(result, dict) and result.get("error"):
-                return result
-            last_result = result
-        return last_result
+    # Mattermost owns its own caption/text chunking and five-file batches.
+    # Dispatch once: pre-chunking here loses receipts on a later failure.
+    if platform == Platform.MATTERMOST:
+        from hermes_cli.plugins import discover_plugins
+        discover_plugins()
+        return await _send_via_adapter(
+            platform, pconfig, chat_id, message, thread_id=thread_id,
+            media_files=media_files, force_document=force_document,
+        )
 
     # --- Non-media platforms ---
     # Buzz is a plugin platform with verified native media delivery through

@@ -650,6 +650,53 @@ class TestMattermostFileUpload:
         assert result.success is True
         assert result.message_id == "post_with_file"
 
+    @pytest.mark.asyncio
+    async def test_send_image_file_adds_filename_caption_and_keeps_thread(self, tmp_path):
+        self.adapter._reply_mode = "thread"
+        image_path = tmp_path / "example.png"
+        image_path.write_bytes(b"png")
+        self.adapter._upload_file = AsyncMock(return_value="file_123")
+        self.adapter._api_get = AsyncMock(
+            return_value={"id": "root_post_123", "root_id": ""}
+        )
+        self.adapter._api_post = AsyncMock(return_value={"id": "post_with_file"})
+
+        result = await self.adapter.send_image_file(
+            "channel_1",
+            str(image_path),
+            metadata={"thread_id": "root_post_123"},
+        )
+
+        assert result.success is True
+        payload = self.adapter._api_post.call_args.args[1]
+        assert payload["root_id"] == "root_post_123"
+        assert payload["file_ids"] == ["file_123"]
+        assert payload["message"] == "📎 example.png"
+
+    @pytest.mark.asyncio
+    async def test_send_multiple_images_adds_filename_caption_and_keeps_thread(
+        self, tmp_path
+    ):
+        self.adapter._reply_mode = "thread"
+        image_path = tmp_path / "example.png"
+        image_path.write_bytes(b"png")
+        self.adapter._upload_file = AsyncMock(return_value="file_123")
+        self.adapter._api_get = AsyncMock(
+            return_value={"id": "root_post_123", "root_id": ""}
+        )
+        self.adapter._api_post = AsyncMock(return_value={"id": "post_with_file"})
+
+        await self.adapter.send_multiple_images(
+            "channel_1",
+            [(f"file://{image_path}", "")],
+            metadata={"thread_id": "root_post_123"},
+        )
+
+        payload = self.adapter._api_post.call_args.args[1]
+        assert payload["root_id"] == "root_post_123"
+        assert payload["file_ids"] == ["file_123"]
+        assert payload["message"] == "📎 example.png"
+
 
 # ---------------------------------------------------------------------------
 # Dedup cache
@@ -909,6 +956,100 @@ class TestMattermostPortLimits:
         assert caption not in post_payloads[1]["message"]
 
     @pytest.mark.asyncio
+    async def test_standalone_missing_media_is_truthful_partial_failure(
+        self, monkeypatch, tmp_path
+    ):
+        from plugins.platforms.mattermost.adapter import _standalone_send
+
+        good = tmp_path / "good.bin"
+        missing = tmp_path / "missing.bin"
+        good.write_bytes(b"good")
+
+        class FakeResponse:
+            status = 201
+
+            def __init__(self, data):
+                self._data = data
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def json(self):
+                return self._data
+
+            async def text(self):
+                return ""
+
+        provider_posts = []
+
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            def post(self, url, **_kwargs):
+                if url.endswith("/files"):
+                    return FakeResponse({"file_infos": [{"id": "file-1"}]})
+                provider_posts.append(url)
+                return FakeResponse({"id": "post-1"})
+
+        monkeypatch.setattr("aiohttp.ClientSession", lambda **_kwargs: FakeSession())
+        result = await _standalone_send(
+            SimpleNamespace(token="token", extra={"url": "https://mm.example.com"}),
+            "channel-1",
+            "caption",
+            media_files=[str(good), str(missing)],
+        )
+
+        assert result["success"] is False
+        assert result["media_delivered"] is False
+        assert result["partial_failure"] is True
+        assert result["message_ids"] == ["post-1"]
+        assert result["error"] == "Not all requested Mattermost media were accepted for delivery"
+        assert str(missing) not in json.dumps(result)
+
+        post_count = len(provider_posts)
+        rejected = await _standalone_send(
+            SimpleNamespace(token="token", extra={"url": "https://mm.example.com"}),
+            "channel-1",
+            "",
+            media_files=[str(missing)],
+        )
+        assert len(provider_posts) == post_count
+        assert rejected["success"] is False
+        assert rejected["media_delivered"] is False
+        assert rejected["partial_failure"] is False
+        assert rejected["message_ids"] == []
+        assert str(missing) not in json.dumps(rejected)
+
+        import builtins
+        real_open = builtins.open
+
+        def racing_open(path, *args, **kwargs):
+            if str(path) == str(good):
+                raise FileNotFoundError(str(path))
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", racing_open)
+        raced = await _standalone_send(
+            SimpleNamespace(token="token", extra={"url": "https://mm.example.com"}),
+            "channel-1",
+            "caption",
+            media_files=[str(good)],
+        )
+        assert len(provider_posts) == post_count
+        assert raced["success"] is False
+        assert raced["media_delivered"] is False
+        assert raced["partial_failure"] is False
+        assert raced["message_ids"] == []
+        assert str(good) not in json.dumps(raced)
+
+    @pytest.mark.asyncio
     async def test_standalone_media_partial_failure_returns_all_post_ids_and_stops_uploads(
         self, monkeypatch, tmp_path
     ):
@@ -1032,3 +1173,532 @@ class TestMattermostPortLimits:
         assert result["message_id"] is None
         assert result["message_ids"] == []
         assert "missing post id" in result["error"].lower()
+
+
+class TestMattermostPortCaptions:
+    @pytest.mark.asyncio
+    async def test_local_file_caption_is_chunked_and_attached_once(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.delenv("MATTERMOST_MAX_POST_LENGTH", raising=False)
+        adapter = _make_adapter({"max_post_length": 500})
+        image_path = tmp_path / "example.png"
+        image_path.write_bytes(b"png")
+        adapter._upload_file = AsyncMock(return_value="file_123")
+        payloads = []
+
+        async def fake_post(_path, payload):
+            payloads.append(dict(payload))
+            return {"id": f"post-{len(payloads)}"}
+
+        adapter._api_post = AsyncMock(side_effect=fake_post)
+
+        result = await adapter.send_image_file(
+            "channel_1", str(image_path), caption="x" * 1200
+        )
+
+        assert result.success is True
+        assert all(len(payload["message"]) <= 500 for payload in payloads)
+        assert sum(payload["message"].count("x") for payload in payloads) == 1200
+        assert [payload.get("file_ids") for payload in payloads] == [
+            ["file_123"],
+            None,
+            None,
+        ]
+
+    @pytest.mark.asyncio
+    @patch("tools.url_safety.is_safe_url", return_value=True)
+    async def test_url_media_caption_is_chunked_and_attached_once(
+        self, _mock_safe, monkeypatch
+    ):
+        monkeypatch.delenv("MATTERMOST_MAX_POST_LENGTH", raising=False)
+        adapter = _make_adapter({"max_post_length": 500})
+        response = AsyncMock()
+        response.status = 200
+        response.read = AsyncMock(return_value=b"png")
+        response.content_type = "image/png"
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=False)
+        adapter._session = MagicMock()
+        adapter._session.get = MagicMock(return_value=response)
+        adapter._upload_file = AsyncMock(return_value="file_123")
+        payloads = []
+
+        async def fake_post(_path, payload):
+            payloads.append(dict(payload))
+            return {"id": f"post-{len(payloads)}"}
+
+        adapter._api_post = AsyncMock(side_effect=fake_post)
+
+        result = await adapter.send_image(
+            "channel_1", "https://img.example.com/example.png", caption="x" * 1200
+        )
+
+        assert result.success is True
+        assert all(len(payload["message"]) <= 500 for payload in payloads)
+        assert sum(payload["message"].count("x") for payload in payloads) == 1200
+        assert [payload.get("file_ids") for payload in payloads] == [
+            ["file_123"],
+            None,
+            None,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_multiple_image_caption_is_chunked_and_attached_once(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.delenv("MATTERMOST_MAX_POST_LENGTH", raising=False)
+        adapter = _make_adapter({"max_post_length": 500})
+        image_path = tmp_path / "example.png"
+        image_path.write_bytes(b"png")
+        adapter._upload_file = AsyncMock(return_value="file_123")
+        payloads = []
+
+        async def fake_post(_path, payload):
+            payloads.append(dict(payload))
+            return {"id": f"post-{len(payloads)}"}
+
+        adapter._api_post = AsyncMock(side_effect=fake_post)
+
+        await adapter.send_multiple_images(
+            "channel_1",
+            [(f"file://{image_path}", "x" * 1200)],
+        )
+
+        assert all(len(payload["message"]) <= 500 for payload in payloads)
+        assert sum(payload["message"].count("x") for payload in payloads) == 1200
+        assert [payload.get("file_ids") for payload in payloads] == [
+            ["file_123"],
+            None,
+            None,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_standalone_file_caption_is_chunked_and_attached_once(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.delenv("MATTERMOST_MAX_POST_LENGTH", raising=False)
+        from plugins.platforms.mattermost.adapter import _standalone_send
+
+        media_path = tmp_path / "report.pdf"
+        media_path.write_bytes(b"pdf")
+        post_payloads = []
+
+        class FakeResponse:
+            def __init__(self, status, data):
+                self.status = status
+                self._data = data
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def json(self):
+                return self._data
+
+            async def text(self):
+                return ""
+
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            def post(self, url, **kwargs):
+                if url.endswith("/files"):
+                    return FakeResponse(201, {"file_infos": [{"id": "file_123"}]})
+                post_payloads.append(dict(kwargs["json"]))
+                return FakeResponse(201, {"id": f"post-{len(post_payloads)}"})
+
+        monkeypatch.setattr("aiohttp.ClientSession", lambda **_kwargs: FakeSession())
+        result = await _standalone_send(
+            SimpleNamespace(
+                token="test-token",
+                extra={
+                    "url": "https://mm.example.com",
+                    "max_post_length": 500,
+                },
+            ),
+            "channel_1",
+            "x" * 1200,
+            media_files=[str(media_path)],
+        )
+
+        assert result["success"] is True
+        assert all(len(payload["message"]) <= 500 for payload in post_payloads)
+        assert sum(payload["message"].count("x") for payload in post_payloads) == 1200
+        assert [payload.get("file_ids") for payload in post_payloads] == [
+            ["file_123"],
+            None,
+            None,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_public_media_send_preserves_all_ids_on_long_text_partial_failure(
+        self, monkeypatch, tmp_path
+    ):
+        from tools.send_message_tool import _send_to_platform
+
+        monkeypatch.delenv("MATTERMOST_MAX_POST_LENGTH", raising=False)
+        media_path = tmp_path / "asset.bin"
+        media_path.write_bytes(b"media")
+        post_payloads = []
+        upload_count = 0
+
+        class FakeResponse:
+            def __init__(self, status, data, body=""):
+                self.status = status
+                self._data = data
+                self._body = body
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def json(self):
+                return self._data
+
+            async def text(self):
+                return self._body
+
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            def post(self, url, **kwargs):
+                nonlocal upload_count
+                if url.endswith("/files"):
+                    upload_count += 1
+                    return FakeResponse(201, {"file_infos": [{"id": "file-1"}]})
+                post_payloads.append(dict(kwargs["json"]))
+                if len(post_payloads) == 3:
+                    return FakeResponse(500, {}, "post failed")
+                return FakeResponse(201, {"id": f"post-{len(post_payloads)}"})
+
+        monkeypatch.setattr("aiohttp.ClientSession", lambda **_kwargs: FakeSession())
+
+        result = await _send_to_platform(
+            Platform.MATTERMOST,
+            PlatformConfig(
+                enabled=True,
+                token="test-token",
+                extra={"url": "https://mm.example.com", "max_post_length": 500},
+            ),
+            "channel_1",
+            "x" * 1200,
+            media_files=[str(media_path)],
+        )
+
+        assert result["success"] is False
+        assert result["partial_failure"] is True
+        assert result["message_id"] == "post-2"
+        assert result["message_ids"] == ["post-1", "post-2"]
+        assert "Mattermost API error (500)" in result["error"]
+        assert upload_count == 1
+        assert len(post_payloads) == 3
+        assert sum(payload["message"].count("x") for payload in post_payloads) == 1200
+        assert [payload.get("file_ids") for payload in post_payloads] == [
+            ["file-1"],
+            None,
+            None,
+        ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [False, True])
+async def test_live_public_media_caption_receipts_and_thread(monkeypatch, tmp_path, failure):
+    import sys
+    from tools.send_message_tool import _send_to_platform
+    adapter = _make_adapter({"max_post_length": 500})
+    # Explicit tool threads must survive the default in-channel reply mode.
+    adapter._api_get = AsyncMock(return_value={"id": "root-1", "root_id": ""})
+    adapter._upload_file = AsyncMock(side_effect=[f"file-{i}" for i in range(6)])
+    payloads = []
+    async def post(_path, payload):
+        payloads.append(dict(payload))
+        if failure and len(payloads) == 3:
+            return {}
+        return {"id": f"post-{len(payloads)}"}
+    adapter._api_post = AsyncMock(side_effect=post)
+    runner = SimpleNamespace(adapters={Platform.MATTERMOST: adapter})
+    monkeypatch.setitem(sys.modules, "gateway.run", SimpleNamespace(_gateway_runner_ref=lambda: runner))
+    media = []
+    for i in range(6):
+        path = tmp_path / f"asset-{i}.png"
+        path.write_bytes(b"png")
+        media.append((str(path), False))
+    result = await _send_to_platform(
+        Platform.MATTERMOST, adapter.config, "channel-1", "x" * 1200,
+        thread_id="root-1", media_files=media,
+    )
+    assert result["success"] is not failure
+    assert result["message_ids"] == (["post-1", "post-2"] if failure else ["post-1", "post-2", "post-3", "post-4"])
+    assert all(len(p["message"]) <= 500 for p in payloads)
+    assert all(p.get("root_id") == "root-1" for p in payloads)
+    assert sum(p["message"].count("x") for p in payloads) == 1200
+    assert payloads[0]["file_ids"] == [f"file-{i}" for i in range(5)]
+    assert not payloads[1].get("file_ids")
+    if failure:
+        assert result["partial_failure"] is True
+        assert adapter._upload_file.await_count == 5
+    else:
+        assert payloads[-1]["file_ids"] == ["file-5"]
+
+
+@pytest.mark.asyncio
+async def test_live_public_missing_only_media_fails_without_post(monkeypatch, tmp_path):
+    import sys
+    from tools.send_message_tool import _send_to_platform
+
+    adapter = _make_adapter()
+    adapter._api_post = AsyncMock(side_effect=AssertionError("provider post must not run"))
+    missing = tmp_path / "missing.png"
+    runner = SimpleNamespace(adapters={Platform.MATTERMOST: adapter})
+    monkeypatch.setitem(
+        sys.modules,
+        "gateway.run",
+        SimpleNamespace(_gateway_runner_ref=lambda: runner),
+    )
+
+    result = await _send_to_platform(
+        Platform.MATTERMOST,
+        adapter.config,
+        "channel-1",
+        "",
+        media_files=[(str(missing), False)],
+    )
+
+    assert result["success"] is False
+    assert result["media_delivered"] is False
+    assert result["partial_failure"] is False
+    assert result["message_ids"] == []
+    assert str(missing) not in json.dumps(result)
+    adapter._api_post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["send", "edit_message", "send_image_file"])
+async def test_partial_exception_retains_acknowledged_ids(monkeypatch, tmp_path, operation):
+    adapter = _make_adapter({"max_post_length": 500})
+    adapter._api_put = AsyncMock(return_value={"id": "original"})
+    adapter._api_post = AsyncMock(side_effect=[{"id": "post-1"}, TimeoutError("ambiguous")])
+    adapter._upload_file = AsyncMock(return_value="file-1")
+    if operation == "edit_message":
+        result = await adapter.edit_message("channel-1", "original", "x" * 1700)
+    elif operation == "send_image_file":
+        path = tmp_path / "image.png"
+        path.write_bytes(b"png")
+        result = await adapter.send_image_file("channel-1", str(path), caption="x" * 1200)
+    else:
+        result = await adapter.send("channel-1", "x" * 1200)
+    assert result.success is False
+    assert result.message_id == "post-1"
+    assert "post-1" in result.continuation_message_ids
+    assert adapter._api_post.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("existing_file", [False, True])
+async def test_live_public_caption_survives_missing_or_failed_first_upload(monkeypatch, tmp_path, existing_file):
+    import sys
+    from tools.send_message_tool import _send_to_platform
+    adapter = _make_adapter({"max_post_length": 500})
+    first = tmp_path / "first.png"
+    second = tmp_path / "second.png"
+    media = [(str(first), False)]
+    if existing_file:
+        first.write_bytes(b"png")
+        second.write_bytes(b"png")
+        media.append((str(second), False))
+    adapter._upload_file = AsyncMock(side_effect=[None, "file-2"])
+    adapter._api_post = AsyncMock(return_value={"id": "post-1"})
+    runner = SimpleNamespace(adapters={Platform.MATTERMOST: adapter})
+    monkeypatch.setitem(sys.modules, "gateway.run", SimpleNamespace(_gateway_runner_ref=lambda: runner))
+    result = await _send_to_platform(
+        Platform.MATTERMOST, adapter.config, "channel-1", "complete caption", media_files=media,
+    )
+    assert result["success"] is False
+    assert result["media_delivered"] is False
+    assert result["partial_failure"] is True
+    assert result["message_ids"] == ["post-1"]
+    assert adapter._api_post.call_args.args[1]["message"] == "complete caption"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [None, 400])
+@pytest.mark.parametrize("public_send", [False, True])
+async def test_batch_fallback_requires_authoritative_rejection(
+    monkeypatch, tmp_path, status, public_send
+):
+    adapter = _make_adapter()
+    if not public_send:
+        adapter._reply_mode = "thread"
+    # Exercise URI decoding and actual local reads, not mocked media dispatch.
+    path = tmp_path / "image ü #25%.png"
+    path.write_bytes(b"local image bytes")
+    adapter._upload_file = AsyncMock(side_effect=["file-1", "file-2"])
+    adapter._api_get = AsyncMock(return_value={"id": "root-1", "root_id": ""})
+    adapter._last_post_status = status
+    adapter._api_post = AsyncMock(side_effect=[{}, {"id": "fallback-1"}])
+    if public_send:
+        import sys
+        from tools.send_message_tool import _send_to_platform
+
+        runner = SimpleNamespace(adapters={Platform.MATTERMOST: adapter})
+        monkeypatch.setitem(sys.modules, "gateway.run", SimpleNamespace(_gateway_runner_ref=lambda: runner))
+        result = await _send_to_platform(
+            Platform.MATTERMOST, adapter.config, "channel-1", "caption",
+            thread_id="root-1", media_files=[(str(path), False)],
+        )
+        assert result["success"] is (status == 400)
+        if status == 400:
+            assert result["message_ids"] == ["fallback-1"]
+            assert result["media_delivered"] is True
+    else:
+        result = await adapter.send_multiple_images(
+            "channel-1", [(path.as_uri(), "caption")], metadata={"thread_id": "root-1"},
+        )
+        assert result.success is (status == 400)
+        if status == 400:
+            assert result.raw_response["message_ids"] == ("fallback-1",)
+    payloads = [call.args[1] for call in adapter._api_post.await_args_list]
+    assert len(payloads) == (2 if status == 400 else 1)
+    assert [payload.get("file_ids") for payload in payloads] == (
+        [["file-1"], ["file-2"]] if status == 400 else [["file-1"]]
+    )
+    assert all(payload["message"] == "caption" for payload in payloads)
+    assert all("file://" not in payload["message"] for payload in payloads)
+    assert all(payload["root_id"] == "root-1" for payload in payloads)
+    assert adapter._upload_file.await_count == len(payloads)
+    for call in adapter._upload_file.await_args_list:
+        assert call.args == ("channel-1", b"local image bytes", path.name, "image/png")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("existing_file", [False, True])
+@pytest.mark.parametrize("shared_caption", [None, "shared override", ""])
+async def test_descriptor_captions_survive_missing_or_failed_first_upload(
+    tmp_path, existing_file, shared_caption
+):
+    adapter = _make_adapter()
+    first = tmp_path / "first.png"
+    second = tmp_path / "second.png"
+    if existing_file:
+        first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    adapter._upload_file = AsyncMock(
+        side_effect=[None, "file-2"] if existing_file else ["file-2"],
+    )
+    adapter._api_post = AsyncMock(return_value={"id": "post-1"})
+    # Omit the keyword entirely for the original descriptor-only API.
+    kwargs = {} if shared_caption is None else {"caption": shared_caption}
+    result = await adapter.send_multiple_images(
+        "channel-1", [(first.as_uri(), "first caption"), (second.as_uri(), "second caption")],
+        **kwargs,
+    )
+    assert result.success is True
+    assert result.raw_response["message_ids"] == ("post-1",)
+    adapter._api_post.assert_awaited_once()
+    payload = adapter._api_post.await_args_list[0].args[1]
+    assert payload["file_ids"] == ["file-2"]
+    assert payload["message"] == (
+        "first caption\nsecond caption" if shared_caption is None
+        else shared_caption or "📎 second.png"
+    )
+    assert adapter._upload_file.await_count == (2 if existing_file else 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("human_delay", [0.125, 0.0, -0.25])
+async def test_batch_fallback_waits_before_each_single_file_send(
+    monkeypatch, tmp_path, human_delay
+):
+    import asyncio
+
+    adapter = _make_adapter()
+    images = []
+    for name in ("first.png", "second.png"):
+        path = tmp_path / name
+        path.write_bytes(b"png")
+        images.append((path.as_uri(), name))
+    events = []
+    payloads = []
+    upload_ids = iter(("file-1", "file-2", "file-3", "file-4"))
+
+    async def upload(_chat_id, _data, name, _content_type):
+        events.append(("upload", name))
+        return next(upload_ids)
+
+    async def post(_path, payload):
+        payloads.append(dict(payload))
+        events.append(("post", tuple(payload["file_ids"])))
+        if len(payloads) == 1:
+            adapter._last_post_status = 400  # Confirmed batch rejection, no post ID.
+            return {}
+        adapter._last_post_status = 201
+        return {"id": f"post-{len(payloads)}"}
+
+    sleep = AsyncMock(side_effect=lambda delay: events.append(("sleep", delay)))
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    adapter._upload_file = AsyncMock(side_effect=upload)
+    adapter._api_post = AsyncMock(side_effect=post)
+
+    result = await adapter.send_multiple_images(
+        "channel-1", images, human_delay=human_delay,
+    )
+
+    assert result.success is True
+    assert result.raw_response["message_ids"] == ("post-2", "post-3")
+    expected = [
+        ("upload", "first.png"), ("upload", "second.png"),
+        ("post", ("file-1", "file-2")),
+    ]
+    for name, file_id in (("first.png", "file-3"), ("second.png", "file-4")):
+        if human_delay > 0:
+            expected.append(("sleep", human_delay))
+        expected.extend([("upload", name), ("post", (file_id,))])
+    assert events == expected
+    assert sleep.await_count == (2 if human_delay > 0 else 0)
+
+
+@pytest.mark.asyncio
+async def test_shared_caption_survives_unposted_single_fallbacks(monkeypatch, tmp_path):
+    import sys
+    from tools.send_message_tool import _send_to_platform
+    adapter = _make_adapter({"max_post_length": 500})
+    files = [tmp_path / f"image-{i}.png" for i in range(6)]
+    for path in files:
+        path.write_bytes(b"png")
+    adapter._upload_file = AsyncMock(side_effect=[f"file-{i}" for i in range(6)])
+    payloads = []
+    async def post(endpoint, payload):
+        payloads.append(dict(payload))
+        if len(payloads) == 1:
+            for path in files[:5]:
+                path.unlink()
+            adapter._last_post_status = 400
+            return {}
+        return {"id": "last-batch-post"}
+    adapter._api_post = AsyncMock(side_effect=post)
+    runner = SimpleNamespace(adapters={Platform.MATTERMOST: adapter})
+    monkeypatch.setitem(sys.modules, "gateway.run", SimpleNamespace(_gateway_runner_ref=lambda: runner))
+    result = await _send_to_platform(
+        Platform.MATTERMOST, adapter.config, "channel-1", "caption must survive",
+        media_files=[(str(path), False) for path in files],
+    )
+    assert result["success"] is False
+    assert result["media_delivered"] is False
+    assert result["partial_failure"] is True
+    assert result["message_ids"] == ["last-batch-post"]
+    assert len(payloads) == 2
+    assert payloads[-1]["file_ids"] == ["file-5"]
+    assert payloads[-1]["message"] == "caption must survive"

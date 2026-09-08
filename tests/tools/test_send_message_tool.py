@@ -35,6 +35,134 @@ from tools.send_message_tool import (
     _send_to_platform,
     send_message_tool,
 )
+
+
+def test_public_mattermost_entry_reports_filtered_media_as_partial_failure(
+    monkeypatch, tmp_path
+):
+    import tools.send_message_tool as smt
+
+    good = tmp_path / "good.png"
+    missing = tmp_path / "missing.png"
+    good.write_bytes(b"good")
+    pconfig = SimpleNamespace(enabled=True, token="token", extra={})
+    config = SimpleNamespace(
+        platforms={Platform.MATTERMOST: pconfig},
+        get_home_channel=lambda _platform: None,
+    )
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
+    monkeypatch.setattr(smt, "prepare_send_message_platforms", lambda: None)
+    monkeypatch.setattr(
+        smt,
+        "resolve_send_target",
+        lambda *_args: ("channel-1", None, None),
+    )
+    monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
+
+    captured = {}
+    calls = []
+
+    async def fake_send(_platform, _pconfig, _chat_id, _message, **kwargs):
+        calls.append(True)
+        captured["media_files"] = kwargs["media_files"]
+        return {
+            "success": True,
+            "platform": "mattermost",
+            "chat_id": "channel-1",
+            "message_id": "post-1",
+            "message_ids": ["post-1"],
+            "media_delivered": True,
+        }
+
+    monkeypatch.setattr(smt, "_send_to_platform", fake_send)
+    result = json.loads(
+        smt._handle_send(
+            {
+                "target": "mattermost:channel-1",
+                "message": f"caption\nMEDIA:{good}\nMEDIA:{missing}",
+            }
+        )
+    )
+
+    assert len(captured["media_files"]) == 1
+    assert result["success"] is False
+    assert result["media_delivered"] is False
+    assert result["partial_failure"] is True
+    assert result["message_ids"] == ["post-1"]
+    assert result["error"] == "Not all requested Mattermost media were accepted for delivery"
+    assert str(missing) not in json.dumps(result)
+
+    sent_before = len(calls)
+    rejected = json.loads(
+        smt._handle_send(
+            {
+                "target": "mattermost:channel-1",
+                "message": f"MEDIA:{missing}",
+            }
+        )
+    )
+    assert len(calls) == sent_before
+    assert rejected["success"] is False
+    assert rejected["media_delivered"] is False
+    assert rejected["partial_failure"] is False
+    assert rejected["message_ids"] == []
+    assert str(missing) not in json.dumps(rejected)
+
+
+def test_public_mattermost_validate_dispatch_race_is_complete_failure(monkeypatch, tmp_path):
+    import tools.send_message_tool as smt
+
+    media = tmp_path / "race.png"
+    media.write_bytes(b"png")
+    pconfig = SimpleNamespace(enabled=True, token="token", extra={})
+    config = SimpleNamespace(
+        platforms={Platform.MATTERMOST: pconfig},
+        get_home_channel=lambda _platform: None,
+    )
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
+    monkeypatch.setattr(smt, "prepare_send_message_platforms", lambda: None)
+    monkeypatch.setattr(
+        smt,
+        "resolve_send_target",
+        lambda *_args: ("channel-1", None, None),
+    )
+    monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
+    monkeypatch.setitem(
+        sys.modules,
+        "gateway.run",
+        SimpleNamespace(
+            _gateway_runner_ref=lambda: SimpleNamespace(
+                adapters={Platform.MATTERMOST: SimpleNamespace(platform=Platform.MATTERMOST)}
+            )
+        ),
+    )
+    original_send = smt._send_to_platform
+
+    async def remove_after_validation(*args, **kwargs):
+        media.unlink()
+        return await original_send(*args, **kwargs)
+
+    monkeypatch.setattr(smt, "_send_to_platform", remove_after_validation)
+    result = json.loads(
+        smt._handle_send(
+            {
+                "target": "mattermost:channel-1",
+                "message": f"MEDIA:{media}",
+            }
+        )
+    )
+
+    assert "success" in result, result
+    assert result["success"] is False
+    assert result["platform"] == "mattermost"
+    assert result["chat_id"] == "channel-1"
+    assert result["message_id"] is None
+    assert result["message_ids"] == []
+    assert result["partial_failure"] is False
+    assert result["media_delivered"] is False
+    assert result["error"] == "No deliverable Mattermost media"
+    assert str(media) not in json.dumps(result)
+
 # Discord helpers moved to the plugin in #24325.  Import from the new path
 # and provide a thin ``_send_discord(token, ...)`` shim that mirrors the
 # pre-migration signature so the existing test bodies keep working.
