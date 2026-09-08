@@ -66,24 +66,33 @@ def query_session_listing(
     unnamed sessions stay visible since an id match may be the only handle.
     """
     query_source = None if include_all_sources else source
-    fetch_limit = max(limit * 4, limit)
+    fetch_limit = max(limit * 4, limit, 40)
     search = (search_query or "").strip()
-    rows = session_db.list_sessions_rich(
-        source=query_source,
-        session_key=session_key,
-        exclude_sources=exclude_sources,
-        limit=fetch_limit,
-        search_query=search or None,
-        order_by_last_active=bool(search),
-    )
+
     result: list[dict[str, Any]] = []
-    for row in rows:
-        if current_session_id and row.get("id") == current_session_id:
-            continue
-        if not include_unnamed and not row.get("title") and not search:
-            continue
-        result.append(row)
-        if len(result) >= limit:
+    offset = 0
+    while len(result) < limit:
+        rows = session_db.list_sessions_rich(
+            source=query_source,
+            session_key=session_key,
+            exclude_sources=exclude_sources,
+            limit=fetch_limit,
+            offset=offset,
+            search_query=search or None,
+            order_by_last_active=bool(search),
+        )
+        if not rows:
+            break
+        offset += len(rows)
+        for row in rows:
+            if current_session_id and row.get("id") == current_session_id:
+                continue
+            if not include_unnamed and not row.get("title") and not search:
+                continue
+            result.append(row)
+            if len(result) >= limit:
+                break
+        if len(rows) < fetch_limit:
             break
     return result
 
