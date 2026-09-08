@@ -4774,6 +4774,46 @@ def _is_model_incompatible_error(exc: Exception) -> bool:
     ))
 
 
+def _is_vision_capability_error(exc: Exception) -> bool:
+    """Only explicit image/route incapability can advance a vision candidate.
+
+    Billing, auth and quota bodies also appear in validation errors and must
+    never authorize an additional provider attempt.
+    """
+    status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+    if status not in {400, 415, 422, None}:
+        return False
+    text = str(exc).lower()
+    if (_is_auth_error(exc) or _is_payment_error(exc)
+            or _is_rate_limit_error(exc) or _is_model_not_found_error(exc)
+            or any(word in text for word in (
+                "credits", "insufficient funds", "can only afford", "billing",
+                "payment required", "out of funds", "run out of funds", "balance_depleted",
+                "no usable credits", "model_not_supported_on_free_tier",
+                "not available on the free tier", "isn't available on the free tier",
+                "requires a subscription", "upgrade for access", "upgrade for higher limits",
+                "reached your session usage limit", "quota exceeded", "quota_exceeded",
+                "too many tokens per day", "daily limit", "tokens per day", "daily quota",
+                "resource exhausted", "resource_exhausted", "resource-exhausted", "resourceexhausted",
+                "weekly usage limit", "weekly limit", "rate limit", "rate_limit",
+                "too many requests", "try again", "retry after", "resets in",
+                "quota", "unauthorized", "unauthenticated", "authentication",
+                "invalid api key", "invalid_api_key", "bad-credentials", "permission denied",
+                "access denied", "model not found", "model_not_found", "unknown model",
+                "no such model", "model does not exist",
+            ))):
+        return False
+    return _is_model_incompatible_error(exc) or (
+        any(word in text for word in (
+            "image_url", "image input", "image content", "images", "vision", "multimodal",
+        )) and any(word in text for word in (
+            "does not support", "doesn't support", "not supported", "unsupported",
+            "unknown variant", "expected `text`", 'expected "text"',
+            "text-only", "text only", "capability",
+        ))
+    )
+
+
 def _is_invalid_aux_response_error(exc: Exception) -> bool:
     """Detect provider responses that authenticated but cannot serve aux shape.
 
@@ -5481,7 +5521,9 @@ def _call_fallback_candidate_sync(
             task,
         )
     except Exception as fb_err:
-        if not _is_auth_error(fb_err):
+        if not _is_auth_error(fb_err) or task == "vision":
+            # Vision may advance only on a proven capability mismatch; an
+            # authentication failure must not silently select another model.
             raise
         fb_provider = _auth_refresh_provider_for_route(
             destination.provider, destination.base_url
@@ -5613,7 +5655,9 @@ async def _call_fallback_candidate_async(
             task,
         )
     except Exception as fb_err:
-        if not _is_auth_error(fb_err):
+        if not _is_auth_error(fb_err) or task == "vision":
+            # Vision may advance only on a proven capability mismatch; an
+            # authentication failure must not silently select another model.
             raise
         fb_provider = _auth_refresh_provider_for_route(
             destination.provider, destination.base_url
@@ -6068,10 +6112,17 @@ def _resolve_fallback_entry(entry: Dict[str, Any]) -> Tuple[Optional[Any], Optio
     return client, resolved_model
 
 
+def _main_fallback_candidate_key(provider: str, model: str) -> Tuple[str, str]:
+    """Normalize configured aliases and resolved labels for a bounded walk."""
+    return _normalize_aux_provider(provider), str(model or "").strip().lower()
+
+
 def _try_main_fallback_chain(
     task: Optional[str],
     failed_provider: str = "",
     reason: str = "error",
+    excluded_candidates: Optional[set[Tuple[str, str]]] = None,
+    failed_model: Optional[str] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try the top-level main-agent fallback chain for an auxiliary call.
 
@@ -6093,9 +6144,15 @@ def _try_main_fallback_chain(
     if not chain:
         return None, None, ""
 
-    failed_norm = (failed_provider or "").strip().lower()
-    main_norm = (_read_main_provider() or "").strip().lower()
-    skip = {p for p in (failed_norm, main_norm, "auto") if p}
+    from agent.backend_identity import (
+        BackendIdentity, classify_failure_scope, should_skip_candidate,
+    )
+
+    failed = BackendIdentity.build(
+        provider=failed_provider, model=failed_model,
+    )
+    scope = classify_failure_scope(reason)
+    excluded = excluded_candidates or set()
     tried: List[str] = []
     min_ctx = _task_minimum_context_length(task)
 
@@ -6108,8 +6165,21 @@ def _try_main_fallback_chain(
             continue
         fb_norm = fb_provider.lower()
         label = f"fallback_providers[{i}]({fb_provider})"
-        if fb_norm in skip:
+        if fb_norm == "auto" or should_skip_candidate(
+            BackendIdentity.build(
+                provider=fb_provider, model=fb_model,
+                base_url=str(entry.get("base_url") or ""),
+            ), failed, scope,
+        ):
             tried.append(f"{label} (skipped)")
+            continue
+        if _main_fallback_candidate_key(fb_provider, fb_model) in excluded:
+            continue
+        if task == "vision" and (
+            _normalize_aux_provider(fb_provider) in _PROVIDERS_WITHOUT_VISION
+            or not _main_model_supports_vision(fb_provider, fb_model)
+        ):
+            tried.append(f"{label} (no vision capability)")
             continue
         if _is_provider_unhealthy(fb_norm):
             _log_skip_unhealthy(fb_norm, task)
@@ -6121,6 +6191,8 @@ def _try_main_fallback_chain(
             logger.debug("Auxiliary %s: main fallback %s failed to resolve: %s", task or "call", label, exc)
             fb_client, resolved_model = None, None
         if fb_client is not None:
+            if _main_fallback_candidate_key(fb_provider, resolved_model or fb_model) in excluded:
+                continue
             if min_ctx is not None:
                 fb_ctx = _candidate_context_window(
                     fb_provider,
@@ -9897,6 +9969,7 @@ def _call_llm_impl(
     main_runtime = _normalize_main_runtime(main_runtime)
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
+    fallback_policy_is_auto = resolved_provider in {"auto", "", None}
     if api_mode:
         resolved_api_mode = api_mode
     effective_extra_body = _get_task_extra_body(task)
@@ -10487,8 +10560,10 @@ def _call_llm_impl(
         # auxiliary task on the floor (silent compression failure /
         # message loss). Auth is NOT a capacity error: it only bypasses
         # the explicit-provider gate when the user is in auto mode.
+        vision_capability_error = task == "vision" and _is_vision_capability_error(first_err)
         should_fallback = (
-            _is_auth_error(first_err)
+            vision_capability_error
+            or _is_auth_error(first_err)
             or _is_payment_error(first_err)
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
@@ -10501,7 +10576,7 @@ def _call_llm_impl(
         # connection failures are capacity problems, not request constraints.
         # See #26803: daily token quota (429 + "too many tokens per day") must
         # fall back just like a 402 credit error.
-        is_auto = resolved_provider in {"auto", "", None}
+        is_auto = fallback_policy_is_auto
         # Capacity errors bypass the explicit-provider gate: the provider
         # literally cannot serve this request regardless of user intent.
         # Rate limits are included: after retries are exhausted, a 429 means
@@ -10512,7 +10587,8 @@ def _call_llm_impl(
         # the explicit-provider gate and continue to the next candidate
         # instead of aborting the auxiliary task and churning the session.
         is_capacity_error = (
-            _is_payment_error(first_err)
+            vision_capability_error
+            or _is_payment_error(first_err)
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
@@ -10532,6 +10608,8 @@ def _call_llm_impl(
                 )
             elif _is_rate_limit_error(first_err):
                 reason = "rate limit"
+            elif vision_capability_error:
+                reason = "vision capability mismatch"
             elif _is_model_incompatible_error(first_err):
                 reason = "model incompatible with route"
             elif _is_invalid_aux_response_error(first_err):
@@ -10556,13 +10634,16 @@ def _call_llm_impl(
             #   3. For auto: built-in auxiliary discovery chain
             #   4. For explicit aux providers: main agent model safety net
             fb_client, fb_model, fb_label = (None, None, "")
+            from_main_chain = False
             if is_auto:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason=reason,
                     failed_model=_chain_failed_model)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_fallback_chain(
-                        task, resolved_provider or "auto", reason=reason)
+                        task, resolved_provider or "auto", reason=reason,
+                        failed_model=_chain_failed_model)
+                    from_main_chain = fb_client is not None
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_payment_fallback(
                         resolved_provider, task, reason=reason)
@@ -10575,28 +10656,13 @@ def _call_llm_impl(
                         resolved_provider, task, reason=reason,
                         failed_model=_chain_failed_model)
 
-            if fb_client is not None:
+            excluded_candidates: set[Tuple[str, str]] = set()
+            stale_retry_used = False
+            while fb_client is not None:
                 _record_route_info(
                     route_info, _fallback_provider_from_label(fb_label), fb_model
                 )
-                fb_resp = _call_fallback_candidate_sync(
-                    fb_client, fb_model, fb_label,
-                    task=task, messages=messages,
-                    temperature=temperature, max_tokens=max_tokens,
-                    tools=tools, effective_timeout=effective_timeout,
-                    effective_extra_body=effective_extra_body,
-                    reasoning_config=reasoning_config)
-                if fb_resp is not None:
-                    return fb_resp
-                # The candidate had a stale/unrefreshable credential and was
-                # quarantined — walk the discovery chain once more; unhealthy
-                # entries are skipped so the next viable candidate serves.
-                fb_client, fb_model, fb_label = _try_payment_fallback(
-                    resolved_provider, task, reason="stale fallback credential")
-                if fb_client is not None:
-                    _record_route_info(
-                        route_info, _fallback_provider_from_label(fb_label), fb_model
-                    )
+                try:
                     fb_resp = _call_fallback_candidate_sync(
                         fb_client, fb_model, fb_label,
                         task=task, messages=messages,
@@ -10604,8 +10670,34 @@ def _call_llm_impl(
                         tools=tools, effective_timeout=effective_timeout,
                         effective_extra_body=effective_extra_body,
                         reasoning_config=reasoning_config)
-                    if fb_resp is not None:
-                        return fb_resp
+                except Exception as fb_err:
+                    if not (task == "vision" and from_main_chain
+                            and _is_vision_capability_error(fb_err)):
+                        raise
+                    key = _main_fallback_candidate_key(fb_label, fb_model or "")
+                    if key in excluded_candidates:
+                        raise
+                    excluded_candidates.add(key)
+                    fb_client, fb_model, fb_label = _try_main_fallback_chain(
+                        task, resolved_provider or "auto",
+                        reason="vision capability mismatch",
+                        failed_model=_chain_failed_model,
+                        excluded_candidates=excluded_candidates,
+                    )
+                    if fb_client is None:
+                        from_main_chain = False
+                        fb_client, fb_model, fb_label = _try_payment_fallback(
+                            resolved_provider, task, reason="vision fallback chain exhausted")
+                    continue
+                if fb_resp is not None:
+                    return fb_resp
+                if stale_retry_used:
+                    break
+                # Preserve native non-vision stale-credential recovery once.
+                stale_retry_used = True
+                from_main_chain = False
+                fb_client, fb_model, fb_label = _try_payment_fallback(
+                    resolved_provider, task, reason="stale fallback credential")
             # All fallback layers exhausted — emit a single user-visible
             # warning so the operator knows aux task is about to fail.
             # (#26882) The error itself is re-raised below.
@@ -10754,6 +10846,7 @@ async def _async_call_llm_impl(
     main_runtime = _normalize_main_runtime(main_runtime)
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
+    fallback_policy_is_auto = resolved_provider in {"auto", "", None}
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
     effective_provider = resolved_provider
@@ -11197,8 +11290,10 @@ async def _async_call_llm_impl(
         # falls back in auto mode just like the sync call_llm() path. Auth is
         # NOT a capacity error, so on an explicit provider it still respects
         # the user's choice (handled by the is_auto/is_capacity_error gate).
+        vision_capability_error = task == "vision" and _is_vision_capability_error(first_err)
         should_fallback = (
-            _is_auth_error(first_err)
+            vision_capability_error
+            or _is_auth_error(first_err)
             or _is_payment_error(first_err)
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
@@ -11212,9 +11307,10 @@ async def _async_call_llm_impl(
         # See #26803: daily token quota must fall back like a 402 credit error.
         # Model-incompatibility 400s (route cannot run this model at all)
         # bypass the gate too — see the sync call_llm() path for rationale.
-        is_auto = resolved_provider in {"auto", "", None}
+        is_auto = fallback_policy_is_auto
         is_capacity_error = (
-            _is_payment_error(first_err)
+            vision_capability_error
+            or _is_payment_error(first_err)
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
@@ -11230,6 +11326,8 @@ async def _async_call_llm_impl(
                 )
             elif _is_rate_limit_error(first_err):
                 reason = "rate limit"
+            elif vision_capability_error:
+                reason = "vision capability mismatch"
             elif _is_model_incompatible_error(first_err):
                 reason = "model incompatible with route"
             elif _is_invalid_aux_response_error(first_err):
@@ -11254,13 +11352,16 @@ async def _async_call_llm_impl(
             #   3. For auto: built-in auxiliary discovery chain
             #   4. For explicit aux providers: main agent model safety net
             fb_client, fb_model, fb_label = (None, None, "")
+            from_main_chain = False
             if is_auto:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason=reason,
                     failed_model=_chain_failed_model)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_fallback_chain(
-                        task, resolved_provider or "auto", reason=reason)
+                        task, resolved_provider or "auto", reason=reason,
+                        failed_model=_chain_failed_model)
+                    from_main_chain = fb_client is not None
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_payment_fallback(
                         resolved_provider, task, reason=reason)
@@ -11273,38 +11374,16 @@ async def _async_call_llm_impl(
                         resolved_provider, task, reason=reason,
                         failed_model=_chain_failed_model)
 
-            if fb_client is not None:
-                # Convert sync fallback client to async
+            excluded_candidates: set[Tuple[str, str]] = set()
+            stale_retry_used = False
+            while fb_client is not None:
                 async_fb, async_fb_model = _to_async_client(
                     fb_client, fb_model or "", is_vision=(task == "vision")
                 )
                 _record_route_info(
-                    route_info,
-                    _fallback_provider_from_label(fb_label),
-                    async_fb_model or fb_model,
+                    route_info, _fallback_provider_from_label(fb_label), async_fb_model or fb_model
                 )
-                fb_resp = await _call_fallback_candidate_async(
-                    async_fb, async_fb_model or fb_model, fb_label,
-                    task=task, messages=messages,
-                    temperature=temperature, max_tokens=max_tokens,
-                    tools=tools, effective_timeout=effective_timeout,
-                    effective_extra_body=effective_extra_body,
-                    reasoning_config=reasoning_config)
-                if fb_resp is not None:
-                    return fb_resp
-                # Stale/unrefreshable candidate credential — quarantined; walk
-                # the discovery chain once more (unhealthy entries skipped).
-                fb_client, fb_model, fb_label = _try_payment_fallback(
-                    resolved_provider, task, reason="stale fallback credential")
-                if fb_client is not None:
-                    async_fb, async_fb_model = _to_async_client(
-                        fb_client, fb_model or "", is_vision=(task == "vision")
-                    )
-                    _record_route_info(
-                        route_info,
-                        _fallback_provider_from_label(fb_label),
-                        async_fb_model or fb_model,
-                    )
+                try:
                     fb_resp = await _call_fallback_candidate_async(
                         async_fb, async_fb_model or fb_model, fb_label,
                         task=task, messages=messages,
@@ -11312,8 +11391,34 @@ async def _async_call_llm_impl(
                         tools=tools, effective_timeout=effective_timeout,
                         effective_extra_body=effective_extra_body,
                         reasoning_config=reasoning_config)
-                    if fb_resp is not None:
-                        return fb_resp
+                except Exception as fb_err:
+                    if not (task == "vision" and from_main_chain
+                            and _is_vision_capability_error(fb_err)):
+                        raise
+                    key = _main_fallback_candidate_key(fb_label, fb_model or "")
+                    if key in excluded_candidates:
+                        raise
+                    excluded_candidates.add(key)
+                    fb_client, fb_model, fb_label = _try_main_fallback_chain(
+                        task, resolved_provider or "auto",
+                        reason="vision capability mismatch",
+                        failed_model=_chain_failed_model,
+                        excluded_candidates=excluded_candidates,
+                    )
+                    if fb_client is None:
+                        from_main_chain = False
+                        fb_client, fb_model, fb_label = _try_payment_fallback(
+                            resolved_provider, task, reason="vision fallback chain exhausted")
+                    continue
+                if fb_resp is not None:
+                    return fb_resp
+                if stale_retry_used:
+                    break
+                # Preserve native non-vision stale-credential recovery once.
+                stale_retry_used = True
+                from_main_chain = False
+                fb_client, fb_model, fb_label = _try_payment_fallback(
+                    resolved_provider, task, reason="stale fallback credential")
             # All fallback layers exhausted — warn before re-raising. (#26882)
             logger.warning(
                 "Auxiliary %s (async): %s on %s and all fallbacks exhausted "

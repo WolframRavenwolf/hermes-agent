@@ -101,8 +101,222 @@ def codex_auth_dir(tmp_path, monkeypatch):
     return codex_dir
 
 
-class TestAuxiliaryMaxTokensParam:
-    pass
+class TestPortVisionFallbackContracts:
+    """Exercise native public calls and the real global candidate walk, no I/O."""
+
+    @pytest.fixture
+    def routes(self, monkeypatch):
+        import agent.auxiliary_client as aux
+
+        monkeypatch.setattr(aux, "_resolve_task_provider_model", lambda *a: ("auto", None, None, None, None))
+        monkeypatch.setattr(aux, "_get_task_extra_body", lambda task: {})
+        monkeypatch.setattr(aux, "_recoverable_pool_provider", lambda *a, **kw: None)
+        monkeypatch.setattr(aux, "_transient_retry_count", lambda: 0)
+        monkeypatch.setattr(aux, "_try_configured_fallback_chain", lambda *a, **kw: (None, None, ""))
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {})
+        monkeypatch.setattr(aux, "_main_model_supports_vision", lambda provider, model: model != "known-text")
+        builtin = MagicMock(return_value=(None, None, ""))
+        refresh = MagicMock(return_value=False)
+        monkeypatch.setattr(aux, "_try_payment_fallback", builtin)
+        monkeypatch.setattr(aux, "_refresh_provider_credentials", refresh)
+        return aux, builtin, refresh
+
+    @staticmethod
+    def error(status, message):
+        exc = Exception(message)
+        setattr(exc, "status_code", status)
+        return exc
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("asynchronous", [False, True])
+    @pytest.mark.parametrize("primary_status", [400, 429])
+    @pytest.mark.parametrize("candidate_error", [
+        None, 401, 402, 404, 429, 500, "malformed",
+        (400, "vision unsupported; billing quota exceeded", None),
+        (415, "vision unsupported; quota exceeded", None),
+        (400, "vision unsupported; invalid api key", None),
+        (400, "vision unsupported; permission denied", None),
+        (None, "vision unsupported", 401),
+        (None, "vision unsupported", 500),
+    ])
+    async def test_auto_vision_walk_retains_payload_and_final_receipt(
+        self, routes, monkeypatch, asynchronous, primary_status, candidate_error,
+    ):
+        aux, builtin, refresh = routes
+        mock_type = AsyncMock if asynchronous else MagicMock
+        primary_error = self.error(
+            primary_status,
+            "This model does not support image input" if primary_status == 400 else "rate limit",
+        )
+        first_error = (
+            self.error(400, "image_url unsupported; text-only model")
+            if candidate_error is None else
+            ValueError("malformed response") if candidate_error == "malformed" else
+            self.error(candidate_error, "image input unsupported on this account")
+        )
+        if isinstance(candidate_error, tuple):
+            status, message, response_status = candidate_error
+            first_error = self.error(status, message)
+            if response_status is not None:
+                setattr(first_error, "response", SimpleNamespace(status_code=response_status))
+        clients = {}
+        for model, error in [("primary", primary_error), ("runtime-text", first_error), ("vision", None)]:
+            create = mock_type(side_effect=error, return_value=_DummyResponse("image understood"))
+            clients[model] = SimpleNamespace(
+                base_url="https://provider.example/v1", chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+            )
+        chain = [
+            {"provider": "custom:vision-route", "model": "known-text"},
+            {"provider": "custom:vision-route", "model": "runtime-text"},
+            {"provider": "custom:vision-route", "model": "vision"},
+        ]
+        monkeypatch.setattr("hermes_cli.fallback_config.get_fallback_chain", lambda cfg: chain)
+        resolved = []
+
+        def resolve(entry):
+            resolved.append(entry["model"])
+            return clients[entry["model"]], entry["model"]
+
+        monkeypatch.setattr(aux, "_resolve_fallback_entry", resolve)
+        monkeypatch.setattr(aux, "resolve_vision_provider_client", lambda **kw: ("custom:primary-route", clients["primary"], "primary"))
+        monkeypatch.setattr(aux, "_to_async_client", lambda client, model, **kw: (client, model))
+        messages = [{"role": "user", "content": [
+            {"type": "text", "text": "describe"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+        ]}]
+        tools = [{"type": "function", "function": {"name": "annotate", "parameters": {"type": "object"}}}]
+        route_info = {}
+
+        async def invoke():
+            kwargs: dict = dict(task="vision", messages=messages, tools=tools, max_tokens=73,
+                          reasoning_config={"enabled": True, "effort": "low"}, route_info=route_info)
+            return await async_call_llm(**kwargs) if asynchronous else call_llm(**kwargs)
+
+        if candidate_error is not None:
+            with pytest.raises(type(first_error)) as caught:
+                await invoke()
+            assert caught.value is first_error
+            clients["vision"].chat.completions.create.assert_not_called()
+            refresh.assert_not_called()
+        else:
+            response = await invoke()
+            assert response.choices[0].message.content == "image understood"
+            assert route_info == {"provider": "custom:vision-route", "model": "vision"}
+            assert set(resolved) == {"runtime-text", "vision"}
+            for model in ("runtime-text", "vision"):
+                create = clients[model].chat.completions.create
+                assert create.call_count == 1
+                request = create.call_args.kwargs
+                assert request["messages"] == messages
+                assert request["tools"] == tools
+                # Native 0.21 deliberately leaves generic auxiliary output uncapped.
+                assert "max_tokens" not in request
+                assert "max_completion_tokens" not in request
+                assert request["extra_body"]["reasoning"] == {"enabled": True, "effort": "low"}
+        builtin.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("asynchronous", [False, True])
+    @pytest.mark.parametrize("failed_provider, fallback_provider", [
+        ("xai", "custom:xai"),
+        ("custom:xai", "xai"),
+        ("custom:a", "custom:b"),
+    ])
+    async def test_credential_failure_keeps_raw_provider_namespaces(
+        self, routes, monkeypatch, asynchronous, failed_provider, fallback_provider,
+    ):
+        """A 401 must not discard an independently configured credential route."""
+        aux, builtin, _ = routes
+        mock_type = AsyncMock if asynchronous else MagicMock
+        primary = SimpleNamespace(
+            base_url="https://primary.example/v1",
+            chat=SimpleNamespace(completions=SimpleNamespace(
+                create=mock_type(side_effect=self.error(401, "invalid API key")),
+            )),
+        )
+        fallback = SimpleNamespace(
+            base_url="https://fallback.example/v1",
+            chat=SimpleNamespace(completions=SimpleNamespace(
+                create=mock_type(return_value=_DummyResponse("independent route succeeded")),
+            )),
+        )
+        chain = [{
+            "provider": fallback_provider, "model": "vision-model",
+            "base_url": fallback.base_url, "api_key": "synthetic-fallback-key",
+        }]
+        monkeypatch.setattr("hermes_cli.fallback_config.get_fallback_chain", lambda cfg: chain)
+        monkeypatch.setattr(aux, "_is_provider_unhealthy", lambda provider: False)
+        monkeypatch.setattr(aux, "resolve_vision_provider_client", lambda **kw: (
+            failed_provider, primary, "vision-model",
+        ))
+        resolver = MagicMock(return_value=(fallback, "vision-model"))
+        monkeypatch.setattr(aux, "resolve_provider_client", resolver)
+        monkeypatch.setattr(aux, "_to_async_client", lambda client, model, **kw: (client, model))
+        messages = [{"role": "user", "content": [
+            {"type": "text", "text": "describe"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+        ]}]
+
+        kwargs: dict = dict(task="vision", messages=messages)
+        response = await async_call_llm(**kwargs) if asynchronous else call_llm(**kwargs)
+
+        assert response.choices[0].message.content == "independent route succeeded"
+        resolver.assert_called_once_with(
+            fallback_provider, model="vision-model", explicit_base_url=fallback.base_url,
+            explicit_api_key="synthetic-fallback-key", api_mode=None,
+        )
+        assert fallback.chat.completions.create.call_args.kwargs["messages"] == messages
+        assert fallback.chat.completions.create.call_count == 1
+        builtin.assert_not_called()
+
+    @pytest.mark.parametrize("reason, expected", [
+        ("rate limit", "sibling"), ("model incompatible with route", "sibling"),
+        ("auth error", "other"), ("payment error", "other"),
+    ])
+    def test_global_chain_uses_native_failure_scope(self, routes, monkeypatch, reason, expected):
+        aux, _, _ = routes
+        chain = [
+            {"provider": "custom", "model": "failed"},
+            {"provider": "custom", "model": "sibling"},
+            {"provider": "other", "model": "other"},
+        ]
+        monkeypatch.setattr("hermes_cli.fallback_config.get_fallback_chain", lambda cfg: chain)
+        monkeypatch.setattr(aux, "_resolve_fallback_entry", lambda entry: (object(), entry["model"]))
+        _, model, _ = aux._try_main_fallback_chain(
+            "title_generation", "custom", reason=reason, failed_model="failed",
+        )
+        assert model == expected
+
+
+class TestAuxiliaryToolTokenRetryContract:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("asynchronous", [False, True])
+    async def test_tool_payload_survives_native_token_parameter_retry(self, monkeypatch, asynchronous):
+        import agent.auxiliary_client as aux
+
+        create = (AsyncMock if asynchronous else MagicMock)(side_effect=[
+            RuntimeError("Unsupported parameter: max_tokens; use max_completion_tokens"),
+            _DummyResponse("tool-ready"),
+        ])
+        client = SimpleNamespace(
+            base_url="https://provider.example/v1", chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+        )
+        monkeypatch.setattr(aux, "_resolve_task_provider_model", lambda *a: ("custom", "tool-model", None, None, None))
+        monkeypatch.setattr(aux, "_get_cached_client", lambda *a, **kw: (client, "tool-model"))
+        messages = [{"role": "user", "content": "use the tool"}]
+        tools = [{"type": "function", "function": {"name": "inspect", "parameters": {"type": "object"}}}]
+        # This native caller contract explicitly preserves an output cap.
+        kwargs: dict = dict(task="moa_reference", messages=messages, tools=tools, max_tokens=73)
+        response = await async_call_llm(**kwargs) if asynchronous else call_llm(**kwargs)
+        assert response.choices[0].message.content == "tool-ready"
+        assert create.call_count == 2
+        first, retry = [call.kwargs for call in create.call_args_list]
+        assert first["max_tokens"] == 73
+        assert "max_tokens" not in retry
+        # Native fallback retries uncapped instead of inventing another wire field.
+        assert "max_completion_tokens" not in retry
+        assert first["tools"] == retry["tools"] == tools
+        assert first["messages"] == retry["messages"] == messages
 
 
 
