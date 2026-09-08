@@ -876,7 +876,8 @@ class TestDiscordVoiceChannelMethods:
             after(None)
         mock_vc.play.side_effect = _play
 
-        with patch("plugins.platforms.discord.adapter.discord") as mock_discord:
+        with patch("plugins.platforms.discord.adapter.discord") as mock_discord, \
+             patch("plugins.platforms.discord.adapter.resolve_ffmpeg_executable", return_value="ffmpeg"):
             mock_discord.FFmpegPCMAudio.return_value = MagicMock()
             mock_discord.PCMVolumeTransformer.return_value = MagicMock()
             result = await adapter.play_in_voice_channel(111, "/tmp/long.mp3")
@@ -1367,6 +1368,7 @@ class TestPlaybackTimeout:
         DiscordAdapter.PLAYBACK_TIMEOUT = 0.1
         try:
             with patch("discord.FFmpegPCMAudio"), \
+                 patch("plugins.platforms.discord.adapter.resolve_ffmpeg_executable", return_value="ffmpeg"), \
                  patch("discord.PCMVolumeTransformer", side_effect=lambda s, **kw: s):
                 result = await adapter.play_in_voice_channel(111, "/tmp/test.mp3")
             assert result is True
@@ -1591,21 +1593,26 @@ class TestVoiceReception:
         assert len(completed) == 1
         assert completed[0][0] == 42
 
-    # -- SSRC auto-mapping --
+    # -- Explicit SSRC mapping security --
 
 
-    def test_automap_persists_across_calls(self):
-        """Auto-mapped SSRC stays mapped for subsequent checks."""
+    def test_unknown_ssrc_is_never_inferred_from_allowed_members(self):
+        """Allowlist membership alone never authorizes unknown audio for egress."""
         members = [
             SimpleNamespace(id=9999, name="Bot"),
             SimpleNamespace(id=42, name="Alice"),
+            SimpleNamespace(id=43, name="Unauthorized"),
         ]
         receiver = self._make_receiver(allowed_ids={"42"}, members=members)
         receiver.start()
         self._fill_buffer(receiver, 100)
-        receiver.check_silence()
-        assert receiver._ssrc_to_user[100] == 42
-        # Second utterance — should use cached mapping
+
+        assert receiver.check_silence() == []
+        assert 100 not in receiver._ssrc_to_user
+        assert receiver.drain_stream_chunks() == []
+
+        # Only an explicit Discord SPEAKING mapping authorizes later audio.
+        receiver.map_ssrc(100, 42)
         self._fill_buffer(receiver, 100)
         completed = receiver.check_silence()
         assert len(completed) == 1
@@ -1999,7 +2006,8 @@ class TestPcmToWav:
         from plugins.platforms.discord.adapter import VoiceReceiver
 
         out = tmp_path / "out.wav"
-        with patch("plugins.platforms.discord.adapter.subprocess.run") as run:
+        with patch("plugins.platforms.discord.adapter.subprocess.run") as run, \
+             patch("plugins.platforms.discord.adapter.resolve_ffmpeg_executable", return_value="ffmpeg"):
             VoiceReceiver.pcm_to_wav(b"\x00\x01" * 16, str(out))
 
         args, kwargs = run.call_args
