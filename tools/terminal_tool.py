@@ -3255,34 +3255,14 @@ def terminal_tool(
                     )
 
             def _read_script_in_env(script_path: str) -> Optional[str]:
-                """Best-effort script read; uses env.execute only when local read fails.
-
-                For local backends the script path is on the host filesystem. For
-                SSH/Modal/Daytona the same path is remote; the local read misses, so we
-                fall back to a bounded ``env.execute('head -c ... < path')`` read.
-                """
+                """Remote-only fallback; the native bounded parser owns local reads."""
                 if env is None:
                     return None
-                try:
-                    local_path = Path(script_path).expanduser()
-                    if not local_path.is_absolute():
-                        local_path = Path(guard_cwd) / local_path
-                    if local_path.is_file():
-                        metadata = local_path.stat()
-                        if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= _MAX_REFERENCED_SCRIPT_BYTES:
-                            data = local_path.read_bytes()
-                            if len(data) <= _MAX_REFERENCED_SCRIPT_BYTES:
-                                if b"\x00" in data:
-                                    # Binary (ELF/Mach-O/PE), not a shell script:
-                                    # feeding its decoded bytes back into the guard
-                                    # tokenizes machine code into bogus NUL-bearing
-                                    # paths and crashes the scanner (#77703). Mirror
-                                    # lifecycle_guard._read_referenced_script and
-                                    # treat it as nothing to scan.
-                                    return None
-                                return data.decode("utf-8", errors="replace")
-                except Exception:
-                    pass
+                if env_type == "local":
+                    # _read_referenced_script already made the authoritative
+                    # bounded FD/Magic/NUL/FileProvider decision. Never reopen
+                    # a skipped, missing, non-regular, or race-grown local file.
+                    return ""
                 # Remote / sandboxed backend: read via the environment's shell.
                 # Bound the read at the source with `head -c` so an oversized
                 # file (e.g. a 166MB ELF invoked by absolute path) never

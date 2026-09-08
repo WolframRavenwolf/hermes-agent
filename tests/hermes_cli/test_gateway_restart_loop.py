@@ -858,6 +858,56 @@ class TestTerminalToolGatewayLifecycleGuard:
 # cron.lifecycle_guard module — the shared checker create_job/CLI/terminal use
 # ---------------------------------------------------------------------------
 
+class TestBoundedLocalFallback:
+    _patch_env = TestTerminalToolGatewayLifecycleGuard._patch_env
+    _minimal_config = TestTerminalToolGatewayLifecycleGuard._minimal_config
+
+    @pytest.mark.parametrize('kind', ['binary', 'directory', 'dangling_symlink'])
+    def test_native_local_scan_is_authoritative(self, monkeypatch, tmp_path, kind):
+        from types import SimpleNamespace
+        from pathlib import Path
+        import tools.terminal_tool as tt
+        script = tmp_path / 'local-helper'
+        if kind == 'binary':
+            script.write_bytes(b'\x7fELF\x00' + b'x' * 100)
+        elif kind == 'directory':
+            script.mkdir()
+        else:
+            script.symlink_to(tmp_path / 'missing-target')
+        calls = []
+        env = SimpleNamespace(env={}, cwd=str(tmp_path), execute=lambda cmd, **kw: calls.append(cmd) or {'output': 'ok', 'returncode': 0})
+        self._patch_env(monkeypatch, env, inside_gateway=True)
+        monkeypatch.setattr(tt, '_check_all_guards', lambda *a, **kw: {'approved': True})
+        def forbidden_read(*a, **kw):
+            pytest.fail('unbounded local read_bytes callback')
+        monkeypatch.setattr(Path, 'read_bytes', forbidden_read)
+        result = json.loads(tt.terminal_tool(command=str(script)))
+        assert result['exit_code'] == 0
+        assert calls == [str(script)]
+
+    def test_rejected_or_race_grown_local_path_is_not_reopened(self, monkeypatch, tmp_path):
+        from types import SimpleNamespace
+        from pathlib import Path
+        import tools.terminal_tool as tt
+        import cron.lifecycle_guard as guard
+        script = tmp_path / 'growing-local'
+        script.write_bytes(b'x')
+        calls = []
+        env = SimpleNamespace(env={}, cwd=str(tmp_path), execute=lambda cmd, **kw: calls.append(cmd) or {'output': 'ok', 'returncode': 0})
+        self._patch_env(monkeypatch, env, inside_gateway=True)
+        monkeypatch.setattr(tt, '_check_all_guards', lambda *a, **kw: {'approved': True})
+        def scan(*a, read_remote_script, **kw):
+            assert read_remote_script(str(script)) == ''
+            return False
+        monkeypatch.setattr(guard, 'contains_gateway_lifecycle_command_or_referenced_script', scan)
+        def forbidden_read(*a, **kw):
+            pytest.fail('reopening a locally scanned file is not bounded')
+        monkeypatch.setattr(Path, 'read_bytes', forbidden_read)
+        result = json.loads(tt.terminal_tool(command='printf ok'))
+        assert result['exit_code'] == 0
+        assert calls == ['printf ok']
+
+
 class TestVerifiedRestartCorridor:
     _make_fake_env = TestTerminalToolGatewayLifecycleGuard._make_fake_env
     _minimal_config = TestTerminalToolGatewayLifecycleGuard._minimal_config
@@ -1992,6 +2042,10 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
         fake_env = _RemoteEnv()
         fake_env.cwd = "/remote/workspace"
         self._patch_env(monkeypatch, fake_env, inside_gateway=True)
+        monkeypatch.setattr(tt, "_get_env_config", lambda: {
+            "env_type": "ssh", "cwd": "/remote/workspace", "timeout": 60,
+            "lifetime_seconds": 3600,
+        })
 
         result = json.loads(tt.terminal_tool(command=f"/bin/bash {script}"))
 
