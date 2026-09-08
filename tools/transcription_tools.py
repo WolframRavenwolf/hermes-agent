@@ -27,6 +27,7 @@ Usage::
         print(result["transcript"])
 """
 
+import json
 import logging
 import os
 import platform
@@ -208,6 +209,53 @@ def _resolve_stt_language(
         if isinstance(candidate, str) and candidate.strip():
             return candidate.strip()
     return None
+
+
+def _decode_stt_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        if stripped.startswith("["):
+            try:
+                value = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                raise ValueError("expected a valid JSON list of strings") from exc
+            if not isinstance(value, list):
+                raise ValueError("expected a valid JSON list of strings")
+        else:
+            return [stripped]
+    if isinstance(value, (list, tuple)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    raise ValueError("expected a string or list of strings")
+
+
+def _is_native_openai_transcription_endpoint(base_url: Any) -> bool:
+    """Check the constructed client's endpoint, independent of its response label."""
+    return re.fullmatch(r"(?i:https://api\.openai\.com)(?::443)?/v1/?", str(base_url)) is not None
+
+
+def _decode_transcription_keywords(value: Any) -> list[str]:
+    """Validate raw keyword strings before trimming; leading ``[`` reserves JSON syntax."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        if any(character in value for character in "<>\r\n"):
+            raise ValueError("stt.openai.keywords: forbidden character (<, >, CR or LF)")
+        if value.lstrip().startswith("["):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise ValueError("stt.openai.keywords: expected a valid JSON list of strings") from exc
+        else:
+            value = [value]
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ValueError("stt.openai.keywords: expected a string or list of strings")
+    if any(character in item for item in value for character in "<>\r\n"):
+        raise ValueError("stt.openai.keywords: forbidden character (<, >, CR or LF)")
+    return [item.strip() for item in value if item.strip()]
 
 
 def _has_openai_audio_backend() -> bool:
@@ -1406,6 +1454,14 @@ def _enforce_prompt_length_limit(
     return prompt[-max_chars:]
 
 
+def _normalize_openai_model(model_name: str) -> str:
+    """Apply the native Groq-model correction before choosing context."""
+    if model_name in GROQ_MODELS:
+        logger.info("Model %s not available on OpenAI, using %s", model_name, DEFAULT_STT_MODEL)
+        model_name = DEFAULT_STT_MODEL
+    return model_name
+
+
 def _apply_pre_transcription_hook(
     *,
     file_path: str,
@@ -1414,6 +1470,7 @@ def _apply_pre_transcription_hook(
     language: Optional[str],
     prompt: Optional[str],
     source: Optional[str],
+    field_overrides: Optional[Dict[str, str]] = None,
 ) -> tuple[Optional[str], Optional[str], Optional[str]]:
     """Fire the ``pre_transcription`` plugin hook and merge its results.
 
@@ -1436,7 +1493,8 @@ def _apply_pre_transcription_hook(
     Returns ``(model, language_override, prompt)``. ``language_override``
     is ``None`` unless a hook explicitly set ``language`` — backends keep
     their existing config/env language resolution when no hook overrides
-    it.
+    it. The optional request-local ``field_overrides`` receives accepted
+    fields, preserving an explicit prompt clear without changing the return.
     """
     try:
         from hermes_cli.plugins import has_hook, invoke_hook
@@ -1481,6 +1539,8 @@ def _apply_pre_transcription_hook(
                     continue
                 overrides[key] = value
 
+        if field_overrides is not None:
+            field_overrides.update(overrides)
         if "model" in overrides:
             model = overrides["model"]
         if "prompt" in overrides:
@@ -2263,6 +2323,7 @@ def _transcribe_openai(
     provider_label: str = "openai",
     language: Optional[str] = None,
     prompt: Optional[str] = None,
+    stt_config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Transcribe via the OpenAI ``audio.transcriptions.create`` SDK shape.
 
@@ -2282,7 +2343,10 @@ def _transcribe_openai(
     # Language: hook override > stt.<provider>.language > stt.language >
     # env > auto-detect. Explicit language hint improves accuracy for
     # non-English languages.
-    language = language or _resolve_stt_language(provider_label)
+    cfg = _load_stt_config() if stt_config is None else stt_config
+    provider_config = _get_stt_section(cfg, provider_label)
+    language_override = language
+    language = language or _resolve_stt_language(provider_label, cfg)
 
     if not _HAS_OPENAI:
         return {"success": False, "transcript": "", "error": "openai package not installed"}
@@ -2290,9 +2354,8 @@ def _transcribe_openai(
     # Auto-correct model if caller passed a Groq-only model. Only applies
     # to the native OpenAI path — third-party endpoints may legitimately
     # serve a whisper-large-v3 variant.
-    if provider_label == "openai" and model_name in GROQ_MODELS:
-        logger.info("Model %s not available on OpenAI, using %s", model_name, DEFAULT_STT_MODEL)
-        model_name = DEFAULT_STT_MODEL
+    if provider_label == "openai":
+        model_name = _normalize_openai_model(model_name)
 
     try:
         from openai import (
@@ -2305,26 +2368,71 @@ def _transcribe_openai(
         client = OpenAI(api_key=api_key, base_url=base_url, timeout=30, max_retries=0)
 
         def _create_transcription(path: str):
+            request_prompt = prompt
+            extra_body: Dict[str, Any] = {}
+            native_context = (
+                model_name == "gpt-transcribe"
+                and _is_native_openai_transcription_endpoint(getattr(client, "base_url", None))
+            )
+            if native_context:
+                openai_config = _get_stt_section(cfg, "openai")
+                if request_prompt is None:
+                    request_prompt = openai_config.get("prompt")
+                    if request_prompt is None or (
+                        isinstance(request_prompt, str) and not request_prompt.strip()
+                    ):
+                        generic_prompt = cfg.get("prompt")
+                        request_prompt = (generic_prompt if isinstance(generic_prompt, str)
+                                          and generic_prompt.strip() else None)
+                if request_prompt is not None and not isinstance(request_prompt, str):
+                    raise ValueError("stt.openai.prompt: expected a string")
+                # Validate only the raw winner, before the established tail cap.
+                if request_prompt and len(request_prompt) > 5000:
+                    raise ValueError("OpenAI transcription prompt exceeds 5000 characters")
+                keywords = _decode_transcription_keywords(openai_config.get("keywords"))
+                if keywords:
+                    extra_body["keywords"] = keywords
+            elif request_prompt is None and stt_config is not None:
+                request_prompt = cfg.get("prompt")
+                if not isinstance(request_prompt, str) or not request_prompt.strip():
+                    request_prompt = None
+            if native_context or stt_config is not None:
+                request_prompt = _enforce_prompt_length_limit(
+                    request_prompt, "openai" if native_context else provider_label)
+
+            if provider_label == "openai" and model_name == "gpt-transcribe":
+                # Preserve this release's language owner and code limits independently
+                # of native prompt/keyword policy. A present [] means auto-detection.
+                if language_override:
+                    languages = [code.strip() for code in language_override.split(",") if code.strip()]
+                elif provider_config.get("languages") is not None:
+                    languages = _decode_stt_string_list(provider_config["languages"])
+                else:
+                    languages = [code.strip() for code in (language or "").split(",") if code.strip()]
+                for language_code in languages:
+                    if not re.fullmatch(r"[A-Za-z]{2,3}(?:-[A-Za-z]{2,4})?", language_code):
+                        raise ValueError(
+                            f"invalid OpenAI transcription language code: {language_code!r}"
+                        )
+                if languages:
+                    extra_body["languages"] = languages
+            elif model_name == "gpt-transcribe" and language:
+                # Compatible providers retain their legacy single-hint mapping.
+                extra_body["languages"] = [language]
+
+            create_kwargs: Dict[str, Any] = {
+                "model": model_name,
+                "response_format": "text" if model_name == "whisper-1" else "json",
+            }
+            if model_name != "gpt-transcribe" and language:
+                create_kwargs["language"] = language
+                logger.debug("Using language hint '%s' for OpenAI STT", language)
+            if extra_body:
+                create_kwargs["extra_body"] = extra_body
+            if request_prompt:
+                create_kwargs["prompt"] = request_prompt
             with open(path, "rb") as audio_file:
-                create_kwargs = {
-                    "model": model_name,
-                    "file": audio_file,
-                    "response_format": "text" if model_name == "whisper-1" else "json",
-                }
-                if language:
-                    if model_name == "gpt-transcribe":
-                        # gpt-transcribe replaces the singular ``language``
-                        # field with a ``languages`` list; the API rejects
-                        # requests that send the legacy field.
-                        create_kwargs["extra_body"] = {"languages": [language]}
-                    else:
-                        create_kwargs["language"] = language
-                    logger.debug("Using language hint '%s' for OpenAI STT", language)
-                if prompt:
-                    # Only send the prompt when set so the no-hook, no-config
-                    # request stays byte-identical to today's.
-                    create_kwargs["prompt"] = prompt
-                return client.audio.transcriptions.create(**create_kwargs)
+                return client.audio.transcriptions.create(file=audio_file, **create_kwargs)
 
         try:
             with tempfile.TemporaryDirectory(prefix="hermes-stt-") as work_dir:
@@ -2713,6 +2821,7 @@ def _transcribe_deepinfra(
     *,
     language: Optional[str] = None,
     prompt: Optional[str] = None,
+    stt_config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Resolve DeepInfra credentials/model, then delegate to the OpenAI handler.
 
@@ -2728,11 +2837,11 @@ def _transcribe_deepinfra(
 
     from hermes_cli.models import deepinfra_base_url, deepinfra_model_ids
 
-    stt_config = _load_stt_config()
-    # ``stt.deepinfra: null`` in YAML yields None, not {} — coalesce so the
+    cfg = _load_stt_config() if stt_config is None else stt_config
+    # ``stt.deepinfra: null`` in YAML yields None, not {} - coalesce so the
     # ``.get`` calls don't raise (no stt.deepinfra block in DEFAULT_CONFIG to
     # deep-merge over the null).
-    di_config = stt_config.get("deepinfra") if isinstance(stt_config, dict) else None
+    di_config = cfg.get("deepinfra") if isinstance(cfg, dict) else None
     if not isinstance(di_config, dict):
         di_config = {}
     base_url = deepinfra_base_url(di_config)
@@ -2760,6 +2869,7 @@ def _transcribe_deepinfra(
         provider_label="deepinfra",
         language=language,
         prompt=prompt,
+        stt_config=stt_config,
     )
 
 
@@ -2938,6 +3048,8 @@ def _transcribe_prepared_audio(
     file_path: str,
     model: Optional[str] = None,
     source: Optional[str] = None,
+    *,
+    provider: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Transcribe an audio file using the configured STT provider.
@@ -2985,7 +3097,11 @@ def _transcribe_prepared_audio(
             "error": "STT is disabled in config.yaml (stt.enabled: false).",
         }
 
-    provider = _get_provider(stt_config)
+    provider = (
+        str(provider).strip().lower()
+        if provider is not None
+        else _get_provider(stt_config)
+    )
     if not _is_local_stt_provider(provider, stt_config):
         error = _validate_audio_file_size(Path(file_path))
         if error:
@@ -3031,6 +3147,7 @@ def _dispatch_stt_provider(
     # Ordering: config is the base; pre_transcription hook results mutate on
     # top, in registration order, so the last hook to set a field wins.
     prompt = stt_config.get("prompt")
+    openai_config = _get_stt_section(stt_config, "openai")
     if not isinstance(prompt, str) or not prompt.strip():
         prompt = None
 
@@ -3040,6 +3157,7 @@ def _dispatch_stt_provider(
     # read-only. The helper short-circuits on has_hook() so the no-hook
     # dispatch path stays byte-identical. ``language`` stays None unless a
     # hook overrides it — backends keep their own config/env resolution.
+    hook_fields: Dict[str, str] = {}
     model, language, prompt = _apply_pre_transcription_hook(
         file_path=file_path,
         provider=provider,
@@ -3047,7 +3165,28 @@ def _dispatch_stt_provider(
         language=_get_stt_section(stt_config, provider).get("language"),
         prompt=prompt,
         source=source,
+        field_overrides=hook_fields,
     )
+
+    # The constructed SDK client owns endpoint-specific context. Defer raw
+    # defaults and hook intent until it exists; "" suppresses all fallbacks.
+    if provider == "openai":
+        model_name = _normalize_openai_model(
+            model or openai_config.get("model", DEFAULT_STT_MODEL)
+        )
+        if model_name == "gpt-transcribe":
+            return _transcribe_openai(
+                file_path, model_name, language=language,
+                prompt=hook_fields.get("prompt"), stt_config=stt_config,
+            )
+    if provider == "deepinfra":
+        # DeepInfra can select its final model from the catalog in the backend.
+        di_config = _get_stt_section(stt_config, "deepinfra")
+        model_name = model or di_config.get("model") or ""
+        return _transcribe_deepinfra(
+            file_path, model_name, language=language,
+            prompt=hook_fields.get("prompt"), stt_config=stt_config,
+        )
 
     # Whisper-family prompt windows top out around 224 tokens — truncate
     # (keeping the tail) with a warning rather than erroring or letting a
@@ -3080,10 +3219,12 @@ def _dispatch_stt_provider(
         )
 
     if provider == "openai":
-        openai_cfg = stt_config.get("openai") or {}
-        model_name = model or openai_cfg.get("model", DEFAULT_STT_MODEL)
+        model_name = _normalize_openai_model(
+            model or openai_config.get("model", DEFAULT_STT_MODEL)
+        )
         return _transcribe_openai(
-            file_path, model_name, language=language, prompt=prompt,
+            file_path, model_name, language=language,
+            prompt=prompt,
         )
 
     if provider == "mistral":
@@ -3104,14 +3245,6 @@ def _dispatch_stt_provider(
         elevenlabs_cfg = stt_config.get("elevenlabs") or {}
         model_name = model or elevenlabs_cfg.get("model_id", DEFAULT_ELEVENLABS_STT_MODEL)
         return _transcribe_elevenlabs(
-            file_path, model_name, language=language, prompt=prompt,
-        )
-
-    if provider == "deepinfra":
-        di_config = stt_config.get("deepinfra")  # may be None (YAML null)
-        di_config = di_config if isinstance(di_config, dict) else {}
-        model_name = model or di_config.get("model") or ""
-        return _transcribe_deepinfra(
             file_path, model_name, language=language, prompt=prompt,
         )
 
@@ -3194,10 +3327,12 @@ def _dispatch_stt_provider(
     }
 
 
-def transcribe_audio(
+def _transcribe_audio_with_provider(
     file_path: str,
     model: Optional[str] = None,
     source: Optional[str] = None,
+    *,
+    provider: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Safely validate, preprocess supported inputs, and dispatch transcription.
 
@@ -3236,10 +3371,23 @@ def transcribe_audio(
         prepared_error = _validate_audio_file(prepared_path, enforce_size_limit=False)
         if prepared_error:
             return prepared_error
-        return _transcribe_prepared_audio(prepared_path, model, source)
+        if provider is None:
+            return _transcribe_prepared_audio(prepared_path, model, source)
+        return _transcribe_prepared_audio(
+            prepared_path, model, source, provider=provider,
+        )
     finally:
         if cleanup_dir:
             shutil.rmtree(cleanup_dir, ignore_errors=True)
+
+
+def transcribe_audio(
+    file_path: str,
+    model: Optional[str] = None,
+    source: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Safely validate, preprocess, and transcribe; provider overrides are internal."""
+    return _transcribe_audio_with_provider(file_path, model, source)
 
 
 def _is_local_or_private_url(url: str) -> bool:

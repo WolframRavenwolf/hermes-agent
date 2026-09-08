@@ -220,6 +220,629 @@ class TestTranscribeGroq:
 # _transcribe_openai — additional tests
 # ============================================================================
 
+
+class TestTranscribeOpenAIContextual:
+    def test_gpt_transcribe_forwards_prompt_keywords_and_languages(
+        self, monkeypatch, sample_wav
+    ):
+        monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "test-key")
+        mock_client = MagicMock()
+        mock_client.base_url = "https://api.openai.com/v1/"
+        mock_response = MagicMock()
+        mock_response.text = "Hallo Hermes"
+        mock_client.audio.transcriptions.create.return_value = mock_response
+        config = {
+            "openai": {
+                "prompt": "German Discord voice chat about AI.",
+                "languages": ["de", "en"],
+                "keywords": ["Hermes Agent", "Mac mini"],
+            }
+        }
+
+        with patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("tools.transcription_tools._load_stt_config", return_value=config), \
+             patch("openai.OpenAI", return_value=mock_client):
+            from tools.transcription_tools import _transcribe_openai
+
+            result = _transcribe_openai(sample_wav, "gpt-transcribe")
+
+        assert result["success"] is True
+        kwargs = mock_client.audio.transcriptions.create.call_args.kwargs
+        assert kwargs["model"] == "gpt-transcribe"
+        assert kwargs["prompt"] == "German Discord voice chat about AI."
+        assert kwargs["extra_body"] == {
+            "languages": ["de", "en"],
+            "keywords": ["Hermes Agent", "Mac mini"],
+        }
+        assert "language" not in kwargs
+
+    def test_gpt_transcribe_decodes_cli_json_list_strings(
+        self, monkeypatch, sample_wav
+    ):
+        monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "test-key")
+        mock_client = MagicMock()
+        mock_client.base_url = "https://api.openai.com/v1/"
+        mock_response = MagicMock()
+        mock_response.text = "Hallo Hermes"
+        mock_client.audio.transcriptions.create.return_value = mock_response
+        config = {
+            "openai": {
+                "languages": '["de","en"]',
+                "keywords": '["Hermes Agent","Mac mini"]',
+            }
+        }
+
+        with patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("tools.transcription_tools._load_stt_config", return_value=config), \
+             patch("openai.OpenAI", return_value=mock_client):
+            from tools.transcription_tools import _transcribe_openai
+
+            result = _transcribe_openai(sample_wav, "gpt-transcribe")
+
+        assert result["success"] is True
+        kwargs = mock_client.audio.transcriptions.create.call_args.kwargs
+        assert kwargs["extra_body"] == {
+            "languages": ["de", "en"],
+            "keywords": ["Hermes Agent", "Mac mini"],
+        }
+
+    def test_malformed_context_is_rejected_before_provider_call(
+        self,
+        sample_wav,
+        monkeypatch,
+    ):
+        mock_client = MagicMock()
+        mock_client.base_url = "https://api.openai.com/v1/"
+        config = {
+            "openai": {
+                "keywords": ["bad\nkeyword"],
+                "languages": ["de"],
+            }
+        }
+
+        with patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch(
+                 "tools.transcription_tools._load_stt_config",
+                 return_value=config,
+             ), \
+             patch("openai.OpenAI", return_value=mock_client):
+            from tools.transcription_tools import _transcribe_openai
+
+            result = _transcribe_openai(
+                sample_wav,
+                "gpt-transcribe",
+                api_key="key",
+            )
+
+        assert result["success"] is False
+        assert "forbidden" in result["error"]
+        mock_client.audio.transcriptions.create.assert_not_called()
+
+    def test_gpt_transcribe_uses_single_language_as_languages_fallback(
+        self, monkeypatch, sample_wav
+    ):
+        monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "test-key")
+        mock_client = MagicMock()
+        mock_client.base_url = "https://api.openai.com/v1/"
+        mock_response = MagicMock()
+        mock_response.text = "Hallo"
+        mock_client.audio.transcriptions.create.return_value = mock_response
+        config = {"openai": {"language": "de"}}
+
+        with patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("tools.transcription_tools._load_stt_config", return_value=config), \
+             patch("openai.OpenAI", return_value=mock_client):
+            from tools.transcription_tools import _transcribe_openai
+
+            _transcribe_openai(sample_wav, "gpt-transcribe")
+
+        kwargs = mock_client.audio.transcriptions.create.call_args.kwargs
+        assert kwargs["extra_body"] == {"languages": ["de"]}
+
+
+class TestExplicitProviderOverride:
+    def test_public_transcribe_audio_signature_does_not_expose_provider_override(self):
+        import inspect
+
+        from tools.transcription_tools import transcribe_audio
+
+        assert "provider" not in inspect.signature(transcribe_audio).parameters
+
+    def test_transcribe_audio_can_override_global_provider_for_one_call(
+        self, sample_wav
+    ):
+        config = {
+            "provider": "local",
+            "local": {"model": "large-v3"},
+            "openai": {"model": "whisper-1"},
+        }
+        with patch("tools.transcription_tools._load_stt_config", return_value=config), \
+             patch("tools.transcription_tools._trim_silence_for_cloud_stt", return_value=None), \
+             patch(
+                 "tools.transcription_tools._transcribe_openai",
+                 return_value={
+                     "success": True,
+                     "transcript": "Hallo",
+                     "provider": "openai",
+                 },
+             ) as mock_openai:
+            from tools.transcription_tools import _transcribe_audio_with_provider
+
+            result = _transcribe_audio_with_provider(
+                sample_wav,
+                model="gpt-transcribe",
+                provider="openai",
+            )
+
+        assert result["success"] is True
+        mock_openai.assert_called_once_with(
+            sample_wav, "gpt-transcribe", language=None, prompt=None, stt_config=config
+        )
+        assert config["provider"] == "local"
+
+    @pytest.mark.parametrize("hook_prompt", ["hook vocabulary", ""])
+    def test_override_preserves_native_hooks_and_source(
+        self, sample_wav, hook_prompt
+    ):
+        from tools.transcription_tools import _transcribe_audio_with_provider
+
+        config = {"provider": "local", "openai": {
+            "prompt": "configured vocabulary", "languages": ["de", "en"]
+        }}
+        client = MagicMock()
+        client.base_url = "https://api.openai.com/v1/"
+        client.audio.transcriptions.create.return_value.text = "Hallo"
+        with patch("tools.transcription_tools._load_stt_config", return_value=config), \
+             patch("tools.transcription_tools._trim_silence_for_cloud_stt", return_value=None), \
+             patch("tools.transcription_tools._resolve_openai_audio_client_config", return_value=("test-key", None)), \
+             patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("openai.OpenAI", return_value=client), \
+             patch("hermes_cli.plugins.has_hook", return_value=True), \
+             patch("hermes_cli.plugins.invoke_hook", return_value=[{
+                 "prompt": hook_prompt, "language": "fr", "file_path": "/forbidden.wav"
+             }]) as hook:
+            result = _transcribe_audio_with_provider(
+                sample_wav, "gpt-transcribe", source="discord", provider="openai"
+            )
+        assert result["success"] is True
+        assert hook.call_args.kwargs["provider"] == "openai"
+        assert hook.call_args.kwargs["source"] == "discord"
+        assert hook.call_args.kwargs["prompt"] is None
+        kwargs = client.audio.transcriptions.create.call_args.kwargs
+        assert kwargs["file"].name == sample_wav
+        assert kwargs["extra_body"] == {"languages": ["fr"]}
+        assert kwargs.get("prompt", "") == hook_prompt
+        assert config["provider"] == "local"
+
+    @pytest.mark.parametrize("hook_results, configured_prompt, expected_prompt", [
+        ([{"model": "gpt-transcribe"}], "Fachvokabular", None),
+        ([{"model": "gpt-transcribe"}], "context " * 160 + "Fachvokabular", None),
+        ([{"model": "gpt-transcribe", "prompt": ""}], "Fachvokabular", ""),
+        ([{"prompt": ""}, {"model": "gpt-transcribe"}], "Fachvokabular", ""),
+        ([{"model": "gpt-transcribe"}, {"prompt": ""}], "Fachvokabular", ""),
+        ([{"model": "gpt-transcribe", "prompt": None}], "Fachvokabular", None),
+        ([{"model": "gpt-transcribe", "prompt": "hook vocabulary"}],
+         "Fachvokabular", "hook vocabulary"),
+    ], ids=["model-only", "native-cap", "clear", "clear-before-model",
+            "clear-after-model", "ignored-non-string", "hook-prompt"])
+    def test_model_hook_preserves_configured_context_unless_cleared(
+        self, sample_wav, hook_results, configured_prompt, expected_prompt
+    ):
+        from tools.transcription_tools import (
+            _PROMPT_CHARS_PER_TOKEN,
+            _WHISPER_PROMPT_TOKEN_CAP,
+            _transcribe_audio_with_provider,
+        )
+
+        config = {"enabled": True, "provider": "local", "openai": {
+            "model": "whisper-1", "prompt": configured_prompt,
+        }}
+        client = MagicMock()
+        client.base_url = "https://api.openai.com/v1/"
+        client.audio.transcriptions.create.return_value.text = "Hallo"
+        with patch("tools.transcription_tools._load_stt_config", return_value=config), \
+             patch("tools.transcription_tools._trim_silence_for_cloud_stt", return_value=None), \
+             patch("tools.transcription_tools._resolve_openai_audio_client_config", return_value=("test-key", None)), \
+             patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("openai.OpenAI", return_value=client), \
+             patch("hermes_cli.plugins.has_hook", return_value=True), \
+             patch("hermes_cli.plugins.invoke_hook", return_value=hook_results) as hook:
+            result = _transcribe_audio_with_provider(
+                sample_wav, source="discord", provider="openai"
+            )
+        assert result["success"] is True
+        hook.assert_called_once()
+        assert hook.call_args.kwargs["source"] == "discord"
+        assert hook.call_args.kwargs["provider"] == "openai"
+        assert hook.call_args.kwargs["prompt"] is None
+        client.audio.transcriptions.create.assert_called_once()
+        kwargs = client.audio.transcriptions.create.call_args.kwargs
+        assert kwargs["model"] == "gpt-transcribe"
+        assert kwargs["file"].name == sample_wav
+        if expected_prompt is None:
+            cap = _WHISPER_PROMPT_TOKEN_CAP * _PROMPT_CHARS_PER_TOKEN
+            expected_prompt = configured_prompt[-cap:]
+        assert kwargs.get("prompt", "") == expected_prompt
+        assert config == {"enabled": True, "provider": "local", "openai": {
+            "model": "whisper-1", "prompt": configured_prompt,
+        }}
+
+    @pytest.mark.parametrize("route", ["groq-correction", "empty-model", "default-model"])
+    @pytest.mark.parametrize("clear_prompt", [False, True], ids=["keep", "clear"])
+    def test_final_model_resolution_preserves_context_and_clear(
+        self, sample_wav, route, clear_prompt
+    ):
+        from copy import deepcopy
+
+        from tools.transcription_tools import (
+            _PROMPT_CHARS_PER_TOKEN,
+            _WHISPER_PROMPT_TOKEN_CAP,
+            _transcribe_audio_with_provider,
+        )
+
+        context = "configured context " * 80 + "Fachvokabular"
+        config = {"enabled": True, "provider": "local", "openai": {"prompt": context}}
+        model = None
+        hook_results = []
+        if route == "groq-correction":
+            hook_results = [{"model": "whisper-large-v3"}]
+        elif route == "empty-model":
+            config["openai"]["model"] = "gpt-transcribe"
+            model = "whisper-1"
+            hook_results = [{"model": ""}]
+        if clear_prompt:
+            if hook_results:
+                hook_results[0]["prompt"] = ""
+            else:
+                hook_results = [{"prompt": ""}]
+        original_config = deepcopy(config)
+        client = MagicMock()
+        client.base_url = "https://api.openai.com/v1/"
+        client.audio.transcriptions.create.return_value.text = "Hallo"
+        # DEFAULT_STT_MODEL is the import-time value of STT_OPENAI_MODEL.
+        # Patch that value, not the native resolution or request-building path.
+        with patch("tools.transcription_tools.DEFAULT_STT_MODEL", "gpt-transcribe"), \
+             patch("tools.transcription_tools._load_stt_config", return_value=config), \
+             patch("tools.transcription_tools._trim_silence_for_cloud_stt", return_value=None), \
+             patch("tools.transcription_tools._resolve_openai_audio_client_config", return_value=("test-key", None)), \
+             patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("openai.OpenAI", return_value=client), \
+             patch("hermes_cli.plugins.has_hook", return_value=bool(hook_results)), \
+             patch("hermes_cli.plugins.invoke_hook", return_value=hook_results) as hook:
+            result = _transcribe_audio_with_provider(
+                sample_wav, model=model, source="discord", provider="openai"
+            )
+
+        assert result["success"] is True
+        client.audio.transcriptions.create.assert_called_once()
+        kwargs = client.audio.transcriptions.create.call_args.kwargs
+        assert kwargs["model"] == "gpt-transcribe"
+        assert kwargs["file"].name == sample_wav
+        if clear_prompt:
+            assert "prompt" not in kwargs
+        else:
+            cap = _WHISPER_PROMPT_TOKEN_CAP * _PROMPT_CHARS_PER_TOKEN
+            assert kwargs.get("prompt") == context[-cap:]
+        if hook_results:
+            hook.assert_called_once()
+            assert hook.call_args.kwargs["source"] == "discord"
+            assert hook.call_args.kwargs["provider"] == "openai"
+            assert hook.call_args.kwargs["model"] == model
+        else:
+            hook.assert_not_called()
+        assert config == original_config
+
+    @pytest.mark.parametrize("guard", ["disabled", "secret", "oversized"])
+    def test_override_cannot_bypass_native_guards(
+        self, guard, sample_wav, oversized_wav
+    ):
+        from tools.transcription_tools import _transcribe_audio_with_provider
+
+        config = {"provider": "local", "enabled": guard != "disabled"}
+        path = oversized_wav if guard == "oversized" else sample_wav
+        with patch("tools.transcription_tools._load_stt_config", return_value=config), \
+             patch("agent.file_safety.get_read_block_error", return_value=(
+                 "secret store blocked" if guard == "secret" else None
+             )), \
+             patch("tools.transcription_tools._dispatch_stt_provider") as dispatch:
+            result = _transcribe_audio_with_provider(path, provider="openai")
+        assert result["success"] is False
+        dispatch.assert_not_called()
+
+    @pytest.mark.parametrize("context", [
+        {"languages": ["not-a-language"]},
+        {"languages": "[broken"},
+        {"keywords": ["<injected>"]},
+        {"prompt": "x" * 5001},
+    ])
+    def test_invalid_context_does_not_reach_provider(self, sample_wav, context):
+        from tools.transcription_tools import _transcribe_openai
+
+        client = MagicMock()
+        client.base_url = "https://api.openai.com/v1/"
+        with patch("tools.transcription_tools._load_stt_config", return_value={"openai": context}), \
+             patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("openai.OpenAI", return_value=client):
+            result = _transcribe_openai(sample_wav, "gpt-transcribe", api_key="test-key")
+        assert result["success"] is False
+        client.audio.transcriptions.create.assert_not_called()
+
+
+@pytest.fixture
+def native_context_wire(monkeypatch, sample_wav):
+    """Run the native sync pipeline and hooks with real SDK multipart, offline HTTP."""
+    from copy import deepcopy
+    from email import policy
+    from email.parser import BytesParser
+
+    import httpx
+    import openai
+    from hermes_cli import plugins
+    from tools import transcription_tools as stt
+
+    config = {
+        "provider": "local", "cloud_trim_silence": False, "prompt": "generic",
+        "openai": {"api_key": "offline-openai", "model": "gpt-transcribe",
+                   "base_url": "https://api.openai.com/v1", "prompt": "native",
+                   "keywords": ["Hermes"], "language": "de"},
+        "deepinfra": {"model": "gpt-transcribe", "language": "it",
+                     "base_url": "https://api.deepinfra.com/v1/openai"},
+    }
+    requests, clients, constructors, hook_calls = [], [], [], []
+    manager = plugins.PluginManager()
+    context = plugins.PluginContext(plugins.PluginManifest(name="native-context-test"), manager)
+    monkeypatch.setattr(plugins, "_delivery_manager", lambda: manager)
+    monkeypatch.setattr(stt, "_load_stt_config", lambda: config)
+    monkeypatch.setenv("DEEPINFRA_API_KEY", "offline-deepinfra")
+    monkeypatch.setattr("hermes_cli.models._fetch_deepinfra_models_by_tag",
+                        lambda *a, **kw: [{"id": "gpt-transcribe"}])
+    real_openai = openai.OpenAI
+
+    def respond(request):
+        requests.append(request)
+        if b'name="response_format"\r\n\r\ntext' in request.content:
+            return httpx.Response(200, text="offline transcript")
+        return httpx.Response(200, json={"text": "offline transcript"})
+
+    def construct(**kwargs):
+        constructors.append(dict(kwargs))
+        client = real_openai(**kwargs, http_client=httpx.Client(transport=httpx.MockTransport(respond)))
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(openai, "OpenAI", construct)
+
+    def hook(result):
+        def callback(**kwargs):
+            hook_calls.append(kwargs)
+            return result
+        context.register_hook("pre_transcription", callback)
+
+    def run(*, provider="openai", direct=False, **kwargs):
+        before = deepcopy(config)
+        if direct:
+            backend = stt._transcribe_deepinfra if provider == "deepinfra" else stt._transcribe_openai
+            result = backend(sample_wav, "gpt-transcribe", **kwargs)
+        else:
+            result = stt._transcribe_audio_with_provider(
+                sample_wav, source="discord", provider=provider, **kwargs)
+        assert config == before
+        assert clients and all(client.is_closed() for client in clients)
+        for invocation in hook_calls:
+            assert invocation["provider"] == provider
+            assert invocation["source"] == "discord"
+            assert invocation["file_path"] == sample_wav
+            assert "field_overrides" not in invocation
+        return result
+
+    def fields():
+        assert len(requests) == 1
+        request = requests[0]
+        message = BytesParser(policy=policy.default).parsebytes(
+            b"Content-Type: " + request.headers["content-type"].encode() + b"\r\n\r\n" + request.content)
+        values = {}
+        for part in message.iter_parts():
+            name = part.get_param("name", header="content-disposition")
+            if name != "file":
+                values.setdefault(name, []).append(part.get_payload(decode=True).decode("utf-8"))
+        return values
+
+    return types.SimpleNamespace(config=config, requests=requests, clients=clients,
+                                 constructors=constructors, hook_calls=hook_calls,
+                                 hook=hook, run=run, fields=fields)
+
+
+class TestFinalSourceTranscriptionContext:
+    @pytest.mark.parametrize("finish", ["whisper-1", "gpt-4o-transcribe"])
+    def test_model_only_hook_selects_final_model_context(self, native_context_wire, finish):
+        wire = native_context_wire
+        wire.hook({"language": "fr"})
+        wire.hook({"model": finish})
+        assert wire.run()["success"]
+        fields = wire.fields()
+        assert fields["model"] == [finish]
+        assert fields["prompt"] == ["generic"]
+        assert fields["language"] == ["fr"]
+        assert "keywords[]" not in fields
+        assert "languages[]" not in fields
+
+    @pytest.mark.parametrize("hooks,expected", [
+        ([{"prompt": ""}, {"model": "gpt-transcribe"}], None),
+        ([{"model": "gpt-transcribe"}, {"prompt": ""}], None),
+        ([{"prompt": ""}, {"model": "gpt-transcribe"}, {"prompt": "winner"}], ["winner"]),
+        ([{"model": "gpt-transcribe", "prompt": "winner"}], ["winner"]),
+    ])
+    def test_winning_hook_prompt_ignores_unused_oversized_config(
+        self, native_context_wire, hooks, expected,
+    ):
+        wire = native_context_wire
+        wire.config["openai"].update(model="whisper-1", prompt="n" * 5001)
+        wire.config["prompt"] = "g" * 5001
+        for result in hooks:
+            wire.hook(result)
+        assert wire.run()["success"]
+        assert wire.fields().get("prompt") == expected
+
+    @pytest.mark.parametrize("origin", ["hook", "native", "generic"])
+    @pytest.mark.parametrize("length", [5000, 5001])
+    def test_raw_winning_prompt_ceiling_precedes_tail_cap(
+        self, native_context_wire, origin, length,
+    ):
+        wire = native_context_wire
+        prompt = "ä" * (length - 4) + "TAIL"
+        if origin == "hook":
+            wire.hook({"prompt": prompt})
+        elif origin == "native":
+            wire.config["openai"]["prompt"] = prompt
+        else:
+            wire.config["openai"].pop("prompt")
+            wire.config["prompt"] = prompt
+        result = wire.run()
+        if length == 5001:
+            assert result["success"] is False
+            assert "5000" in result["error"]
+            assert wire.requests == []
+        else:
+            assert result["success"]
+            assert wire.fields()["prompt"] == [prompt[-896:]]
+
+    @pytest.mark.parametrize("keywords", [
+        "\nHermes", ["Hermes\r"], '\n["Hermes"]', '["Hermes\\n"]',
+        ["ok", 1], '["ok", null]', ("Hermes",), "[Hermes]",
+    ])
+    def test_raw_keywords_rejected_before_trimming_or_upload(self, native_context_wire, keywords):
+        wire = native_context_wire
+        wire.config["openai"]["keywords"] = keywords
+        result = wire.run()
+        assert result["success"] is False
+        assert "keywords" in result["error"]
+        assert wire.requests == []
+
+    @pytest.mark.parametrize("prompt", [42, {"text": "native"}])
+    def test_winning_native_prompt_must_be_string(self, native_context_wire, prompt):
+        wire = native_context_wire
+        wire.config["openai"]["prompt"] = prompt
+        result = wire.run()
+        assert result["success"] is False
+        assert "prompt" in result["error"]
+        assert wire.requests == []
+
+    @pytest.mark.parametrize("base", [
+        "http://api.openai.com/v1", "https://api.openai.com:444/v1",
+        "https://api.openai.com.evil.test/v1", "https://api.openai.com/V1",
+        "https://managed.example/v1", "https://api.openai.com/v1/?x=1",
+    ])
+    def test_custom_endpoint_ignores_native_prompt_and_keywords(self, native_context_wire, base):
+        wire = native_context_wire
+        wire.config["openai"].update(base_url=base, prompt="n" * 5001, keywords=[1])
+        wire.config["prompt"] = "generic" * 1000
+        assert wire.run()["success"]
+        fields = wire.fields()
+        assert fields["prompt"] == [wire.config["prompt"][-896:]]
+        assert fields["languages[]"] == ["de"]
+        assert "keywords[]" not in fields
+        assert wire.constructors[0]["base_url"] == base
+        assert wire.constructors[0]["api_key"] == "offline-openai"
+
+    @pytest.mark.parametrize("native", [True, False])
+    def test_direct_context_uses_actual_sdk_endpoint_not_response_label(
+        self, native_context_wire, monkeypatch, native,
+    ):
+        wire = native_context_wire
+        base = "https://API.OPENAI.COM:443/v1" if native else "https://compatible.example/v1"
+        monkeypatch.setenv("OPENAI_BASE_URL", base)
+        prompt = "x" * 4996 + "TAIL"
+        assert wire.run(direct=True, api_key="offline-direct", provider_label="compatible",
+                        prompt=prompt)["success"]
+        assert wire.constructors[0]["base_url"] is None
+        fields = wire.fields()
+        assert fields["prompt"] == [prompt[-896:] if native else prompt]
+        assert fields.get("keywords[]") == (["Hermes"] if native else None)
+
+    @pytest.mark.parametrize("intent", ["clear", "hook", "generic"])
+    def test_deepinfra_catalog_resolution_preserves_raw_context(self, native_context_wire, monkeypatch, intent):
+        wire = native_context_wire
+        wire.config["deepinfra"].pop("model")
+        wire.config["deepinfra"].pop("base_url")
+        wire.config["openai"].pop("prompt")
+        wire.config["prompt"] = "g" * 5001
+        monkeypatch.setenv("DEEPINFRA_BASE_URL", "https://api.openai.com/v1")
+        if intent != "generic":
+            wire.hook({"prompt": "" if intent == "clear" else "h" * 5001})
+        result = wire.run(provider="deepinfra")
+        assert wire.constructors[0]["api_key"] == "offline-deepinfra"
+        if intent == "clear":
+            assert result["success"]
+            assert "prompt" not in wire.fields()
+            assert wire.fields()["keywords[]"] == ["Hermes"]
+        else:
+            assert result["success"] is False
+            assert "5000" in result["error"]
+            assert wire.requests == []
+
+    @pytest.mark.parametrize("prompt", [None, "p" * 1000], ids=["unset", "explicit-long"])
+    def test_direct_deepinfra_retains_legacy_prompt_without_request_config(self, native_context_wire, prompt):
+        wire = native_context_wire
+        assert wire.run(provider="deepinfra", direct=True, prompt=prompt)["success"]
+        assert wire.fields().get("prompt") == ([prompt] if prompt else None)
+        assert wire.constructors[0]["api_key"] == "offline-deepinfra"
+
+    def test_deepinfra_forwards_request_config_without_reloading(self, native_context_wire, monkeypatch):
+        wire = native_context_wire
+        wire.config["prompt"] = "request context"
+        reads = iter([wire.config])
+        monkeypatch.setattr("tools.transcription_tools._load_stt_config", lambda: next(reads))
+        assert wire.run(provider="deepinfra")["success"]
+        assert wire.fields()["prompt"] == ["request context"]
+        assert wire.fields()["languages[]"] == ["it"]
+        assert wire.constructors[0]["base_url"] == wire.config["deepinfra"]["base_url"]
+
+
+class TestFinalSourceTranscriptionLanguages:
+    @pytest.mark.parametrize("languages", [[], "[]", ["fr"], '["fr"]'])
+    def test_present_array_precedes_legacy_language(self, native_context_wire, languages):
+        wire = native_context_wire
+        wire.config["openai"]["languages"] = languages
+        assert wire.run()["success"]
+        expected = ["fr"] if "fr" in str(languages) else None
+        assert wire.fields().get("languages[]") == expected
+        assert "language" not in wire.fields()
+
+    @pytest.mark.parametrize("origin", ["hook", "provider", "global", "env"])
+    def test_comma_codes_use_native_validation(self, native_context_wire, monkeypatch, origin):
+        wire = native_context_wire
+        wire.config["openai"].pop("language")
+        if origin == "hook":
+            wire.config["openai"]["languages"] = ["fr"]
+            wire.hook({"language": "de, en-US"})
+        elif origin == "provider":
+            wire.config["openai"]["language"] = "de, en-US"
+        elif origin == "global":
+            wire.config["language"] = "de, en-US"
+        else:
+            monkeypatch.setenv("HERMES_LOCAL_STT_LANGUAGE", "de, en-US")
+        assert wire.run()["success"]
+        assert wire.fields()["languages[]"] == ["de", "en-US"]
+
+    @pytest.mark.parametrize("language", ["de, english", "de, en-US-extra", "de, <en>"])
+    def test_comma_codes_cannot_bypass_existing_code_limits(self, native_context_wire, language):
+        wire = native_context_wire
+        wire.hook({"language": language})
+        result = wire.run()
+        assert result["success"] is False
+        assert "language code" in result["error"]
+        assert wire.requests == []
+
+    @pytest.mark.parametrize("languages", [[], ["fr"], ["invalid-code-format"]])
+    def test_other_provider_retains_legacy_language_payload(self, native_context_wire, languages):
+        wire = native_context_wire
+        wire.config["deepinfra"].update(language="de,en", languages=languages)
+        assert wire.run(provider="deepinfra")["success"]
+        assert wire.fields()["languages[]"] == ["de,en"]
+        assert "keywords[]" not in wire.fields()
+        assert wire.constructors[0]["api_key"] == "offline-deepinfra"
+
+
 class TestTranscribeLocalCommand:
     def test_command_provider_uses_sanitized_child_env(self, monkeypatch):
         """Salvage of #56332: command STT must not inherit Hermes secrets."""
