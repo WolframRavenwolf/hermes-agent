@@ -26,7 +26,7 @@ import pino from 'pino';
 import path from 'path';
 import { mkdirSync, readFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
 import { fileURLToPath } from 'url';
-import { randomBytes, createHash } from 'crypto';
+import { randomBytes } from 'crypto';
 import { execFileSync } from 'child_process';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
@@ -39,10 +39,11 @@ import {
   createVersionResolver,
   buildLocationPayload,
   buildTextSendPayload,
+  bridgeSourceHash,
   createBoundedMessageStore,
   extractBridgeEvent,
-  getMessageContent,
   inboundReadReceiptKeys,
+  getMessageContent,
   inferMediaType,
   mediaPayloadForFile,
   pollCreationMessageFromPayload,
@@ -97,18 +98,12 @@ const DOCUMENT_CACHE_DIR = process.env.HERMES_DOCUMENT_CACHE_DIR
 const AUDIO_CACHE_DIR = process.env.HERMES_AUDIO_CACHE_DIR
   || path.join(process.env.HOME || '~', '.hermes', 'audio_cache');
 
-// Self-hash of this script file.  Reported in /health so the Python gateway
-// can detect a running bridge that predates the current bridge.js and
-// restart it instead of silently reusing stale code (stale-bridge trap:
-// `hermes update` updates bridge.js on disk but a long-lived bridge process
-// keeps serving the old behavior forever).
-let SCRIPT_HASH = '';
-try {
-  SCRIPT_HASH = createHash('sha256')
-    .update(readFileSync(fileURLToPath(import.meta.url)))
-    .digest('hex')
-    .slice(0, 16);
-} catch {}
+// Aggregate source hash of this script and its existing bridge_helpers.js
+// sibling. Reported in /health so the Python gateway can detect a running
+// bridge that predates either current source file and restart it instead of
+// silently reusing stale code (stale-bridge trap: `hermes update` updates files
+// on disk but a long-lived bridge process keeps serving the old behavior).
+const SCRIPT_HASH = bridgeSourceHash(fileURLToPath(import.meta.url));
 const PAIR_ONLY = args.includes('--pair-only');
 const PAIR_JSON = args.includes('--pair-json');
 const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"

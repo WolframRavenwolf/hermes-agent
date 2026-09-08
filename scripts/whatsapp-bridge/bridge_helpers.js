@@ -1,7 +1,95 @@
 import path from 'path';
-import { mkdirSync, writeFileSync } from 'fs';
-import { randomBytes } from 'crypto';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { createHash, randomBytes } from 'crypto';
+import { fileURLToPath } from 'url';
 import { normalizeMessageContent } from '@whiskeysockets/baileys';
+
+const RUNTIME_INVENTORY_FIELD = 'hermesRuntimeFiles';
+const FRAMED_HASH_DOMAIN = Buffer.from('hermes-whatsapp-framed-files-v1\0', 'utf8');
+const MANIFEST_EDGE_WHITESPACE = new Set(
+  '\u0009\u000a\u000b\u000c\u000d\u001c\u001d\u001e\u001f\u0020'
+  + '\u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006'
+  + '\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff',
+);
+
+export function validatedRuntimeFiles(packageData) {
+  const files = packageData?.[RUNTIME_INVENTORY_FIELD];
+  if (!Array.isArray(files) || files.length === 0) return null;
+  const seen = new Set();
+  for (const name of files) {
+    if (
+      typeof name !== 'string'
+      || !name
+      || MANIFEST_EDGE_WHITESPACE.has(name[0])
+      || MANIFEST_EDGE_WHITESPACE.has(name[name.length - 1])
+      || name === '.'
+      || name === '..'
+      || name.includes('/')
+      || name.includes('\\')
+      || name.includes('\0')
+      || path.isAbsolute(name)
+      || seen.has(name)
+    ) {
+      return null;
+    }
+    seen.add(name);
+  }
+  if (
+    !seen.has('bridge.js')
+    || !seen.has('package.json')
+    || !seen.has('package-lock.json')
+  ) {
+    return null;
+  }
+  return files.slice();
+}
+
+function runtimeInventoryForDirectory(directory) {
+  const packagePath = path.join(directory, 'package.json');
+  try {
+    const packageData = JSON.parse(readFileSync(packagePath, 'utf8'));
+    if (!Object.prototype.hasOwnProperty.call(packageData, RUNTIME_INVENTORY_FIELD)) {
+      return undefined;
+    }
+    return validatedRuntimeFiles(packageData);
+  } catch {
+    return undefined;
+  }
+}
+
+// Tests and release checks may inspect the inventory, but package.json remains
+// the single source of truth.  Do not duplicate this sequence in JavaScript.
+export const BRIDGE_RUNTIME_FILES = Object.freeze(
+  runtimeInventoryForDirectory(path.dirname(fileURLToPath(import.meta.url))) || [],
+);
+
+export function framedFileHash(entries, truncate = null) {
+  const hash = createHash('sha256').update(FRAMED_HASH_DOMAIN);
+  for (const [name, value] of entries) {
+    const nameBytes = Buffer.from(name, 'utf8');
+    const content = Buffer.isBuffer(value) ? value : Buffer.from(value);
+    const nameLength = Buffer.alloc(4);
+    const contentLength = Buffer.alloc(8);
+    nameLength.writeUInt32BE(nameBytes.length);
+    contentLength.writeBigUInt64BE(BigInt(content.length));
+    hash.update(nameLength).update(nameBytes).update(contentLength).update(content);
+  }
+  const value = hash.digest('hex');
+  return truncate === null ? value : value.slice(0, truncate);
+}
+
+export function bridgeDependencyFingerprint(directory) {
+  try {
+    return framedFileHash(
+      ['package.json', 'package-lock.json'].map(name => [
+        name,
+        readFileSync(path.join(directory, name)),
+      ]),
+    );
+  } catch {
+    return '';
+  }
+}
 
 export const MIME_MAP = {
   jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
@@ -17,6 +105,64 @@ export const MIME_MAP = {
 export function normalizeWhatsAppId(value) {
   if (!value) return '';
   return String(value).replace(':', '@');
+}
+
+export function bridgeSourceHash(scriptPath) {
+  try {
+    const directory = path.dirname(scriptPath);
+    const packagePath = path.join(directory, 'package.json');
+    let runtimeFiles;
+    try {
+      const packageData = JSON.parse(readFileSync(packagePath, 'utf8'));
+      if (
+        packageData === null
+        || typeof packageData !== 'object'
+        || Array.isArray(packageData)
+      ) {
+        return '';
+      }
+      if (Object.prototype.hasOwnProperty.call(packageData, RUNTIME_INVENTORY_FIELD)) {
+        runtimeFiles = validatedRuntimeFiles(packageData);
+        if (!runtimeFiles) return '';
+      }
+    } catch {
+      if (existsSync(packagePath)) return '';
+      const managedMarkers = BRIDGE_RUNTIME_FILES.filter(
+        name => !['bridge.js', 'bridge_helpers.js', 'package.json'].includes(name),
+      );
+      if (
+        path.basename(scriptPath) === 'bridge.js'
+        && managedMarkers.some(name => existsSync(path.join(directory, name)))
+      ) {
+        // A damaged managed runtime may have lost package.json itself. Reuse
+        // the module's manifest-derived inventory so that missing file makes
+        // the hash invalid instead of masquerading as a custom bridge.
+        runtimeFiles = BRIDGE_RUNTIME_FILES;
+      }
+    }
+
+    if (runtimeFiles) {
+      return framedFileHash(
+        runtimeFiles.map(name => [name, readFileSync(path.join(directory, name))]),
+        16,
+      );
+    }
+    const helperPath = path.join(directory, 'bridge_helpers.js');
+    if (existsSync(helperPath)) {
+      return framedFileHash([
+        [path.basename(scriptPath), readFileSync(scriptPath)],
+        ['bridge_helpers.js', readFileSync(helperPath)],
+      ], 16);
+    }
+    // A truly single-file custom bridge has no byte-boundary ambiguity, so
+    // retain its historical handshake for compatibility.
+    return createHash('sha256')
+      .update(readFileSync(scriptPath))
+      .digest('hex')
+      .slice(0, 16);
+  } catch {
+    return '';
+  }
 }
 
 export function getMessageContent(msg) {

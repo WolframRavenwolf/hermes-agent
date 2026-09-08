@@ -22,6 +22,13 @@ import pytest
 from gateway.config import Platform
 
 
+@pytest.fixture(autouse=True)
+def _shared_installer_boundary(monkeypatch):
+    # Dependency transactions have their own suite; these tests exercise connect.
+    from plugins.platforms.whatsapp import adapter as module
+    monkeypatch.setattr(module, "ensure_whatsapp_bridge_dependencies", MagicMock(return_value=False))
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -206,11 +213,12 @@ class TestConnectCleanup:
         def _path_exists(path_obj):
             return not str(path_obj).endswith("node_modules")
 
-        install_result = MagicMock(returncode=1, stderr="install failed")
+        from gateway.platforms.whatsapp_common import WhatsAppBridgeDependencyError
+        install_error = WhatsAppBridgeDependencyError("install failed")
 
         with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
              patch.object(Path, "exists", autospec=True, side_effect=_path_exists), \
-             patch("subprocess.run", return_value=install_result), \
+             patch("plugins.platforms.whatsapp.adapter.ensure_whatsapp_bridge_dependencies", side_effect=install_error), \
              patch("gateway.status.acquire_scoped_lock", return_value=(True, None)), \
              patch("gateway.status.release_scoped_lock") as mock_release:
             result = await adapter.connect()
