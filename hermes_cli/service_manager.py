@@ -238,8 +238,9 @@ class LaunchdServiceManager(_RegistrationUnsupportedMixin):
         launchd_start()
 
     def stop(self, name: str) -> None:
-        from hermes_cli.gateway import launchd_stop
-        launchd_stop()
+        from hermes_cli.gateway import LaunchdStopError, launchd_stop
+        if launchd_stop() is False:
+            raise LaunchdStopError("launchd gateway did not stop")
 
     def restart(self, name: str) -> None:
         from hermes_cli.gateway import launchd_restart

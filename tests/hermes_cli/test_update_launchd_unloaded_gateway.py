@@ -44,6 +44,7 @@ def launchd(monkeypatch):
 
     monkeypatch.setattr(gateway_mod, "get_launchd_label", lambda: "ai.hermes.gateway", raising=False)
     monkeypatch.setattr(gateway_mod, "get_launchd_plist_path", lambda: state["plist"], raising=False)
+    monkeypatch.setattr(gateway_mod, "_launchd_reload_is_pending", lambda path: False)
 
     def fake_restart():
         if state["restart_exc"] is not None:

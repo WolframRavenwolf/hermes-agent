@@ -6664,6 +6664,8 @@ def _restart_launchd_gateway_after_update(
     is not "the gateway is supervised").
     """
     from hermes_cli.gateway import (
+        LaunchdReloadError,
+        _launchd_reload_is_pending,
         get_launchd_label,
         get_launchd_plist_path,
         launchd_restart,
@@ -6672,18 +6674,19 @@ def _restart_launchd_gateway_after_update(
 
     current_label = get_launchd_label()
     try:
-        if not get_launchd_plist_path().exists():
-            return [], []  # not a launchd install — nothing to do or warn
-        try:
-            launchd_restart()
-        except subprocess.CalledProcessError as e:
-            stderr = (getattr(e, "stderr", "") or "").strip()
-            print(
-                f"  ⚠ Gateway restart failed: {stderr}\n"
-                "    The gateway may be DOWN on pre-update code. "
-                "Recover manually: hermes gateway restart"
-            )
-            return [], [current_label]
+        plist_path = get_launchd_plist_path()
+        if not plist_path.exists() and not _launchd_reload_is_pending(plist_path):
+            return [], []  # no installed definition or pending launchd recovery
+        launchd_restart()
+    except (subprocess.CalledProcessError, LaunchdReloadError) as e:
+        # A failed current-profile refresh must not prevent sibling restarts.
+        stderr = (getattr(e, "stderr", "") or str(e)).strip()
+        print(
+            f"  ⚠ Gateway restart failed: {stderr}\n"
+            "    The gateway may be DOWN on pre-update code. "
+            "Recover manually: hermes gateway restart"
+        )
+        return [], [current_label]
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
         # A plist exists, so a gateway is SUPPOSED to be supervised here —
         # a broken/missing/wedged launchctl is not proof nothing needs

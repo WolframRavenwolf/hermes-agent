@@ -171,6 +171,7 @@ def _patch_launchd_env(
             return plist_exists
 
     monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: _Plist())
+    monkeypatch.setattr(gateway_cli, "_launchd_reload_is_pending", lambda path: False)
     monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: LABEL)
     monkeypatch.setattr(
         gateway_cli, "_launchd_service_registered", lambda label: registered
