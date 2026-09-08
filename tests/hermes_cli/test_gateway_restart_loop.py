@@ -858,6 +858,137 @@ class TestTerminalToolGatewayLifecycleGuard:
 # cron.lifecycle_guard module — the shared checker create_job/CLI/terminal use
 # ---------------------------------------------------------------------------
 
+class TestVerifiedRestartCorridor:
+    _make_fake_env = TestTerminalToolGatewayLifecycleGuard._make_fake_env
+    _minimal_config = TestTerminalToolGatewayLifecycleGuard._minimal_config
+    _patch_env = TestTerminalToolGatewayLifecycleGuard._patch_env
+    def _helper(self, tmp_path, monkeypatch):
+        import hashlib
+        import hermes_constants
+        import tools.terminal_tool as tt
+        helper = tmp_path / "scripts" / "restart-gateway.sh"
+        helper.parent.mkdir()
+        helper.write_text(
+            "#!/bin/bash\n"
+            "if false; then launchctl submit -l ai.hermes.restart -- /bin/true; fi\n"
+            "printf 'verified:%s:%s\\n' \"${1:-normal}\" \"${BASH_ENV:-clean}\"\n"
+        )
+        helper.chmod(0o700)
+        digest = hashlib.sha256(helper.read_bytes()).hexdigest()
+        # This fixture is harmless, never the operational restart helper.
+        monkeypatch.setattr(tt, "_CANONICAL_RESTART_HELPER_SHA256", digest, raising=False)
+        monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
+        from types import SimpleNamespace
+        env = SimpleNamespace(env={}, cwd=str(tmp_path), execute=lambda *a, **k: {"output": "shell-boundary crossed", "returncode": 0})
+        self._patch_env(monkeypatch, env, inside_gateway=True)
+        monkeypatch.setattr(tt, "_get_env_config", lambda: {**self._minimal_config(), "cwd": str(tmp_path)})
+        monkeypatch.setattr(tt, "_check_all_guards", lambda *a, **k: {"approved": True})
+        return helper, digest
+
+    @pytest.mark.parametrize("arg", ["", " --dry-run", " --delay 1 --stability 2"])
+    def test_verified_normal_helper_runs_without_environment_shell(self, tmp_path, monkeypatch, arg):
+        import tools.terminal_tool as tt
+        helper, _ = self._helper(tmp_path, monkeypatch)
+        injected = tmp_path / "startup-ran"
+        startup = tmp_path / "startup.sh"
+        startup.write_text(f"touch {injected}\n")
+        monkeypatch.setenv("BASH_ENV", str(startup))
+        monkeypatch.setenv("PYTHONPATH", str(tmp_path / "untrusted"))
+        result = json.loads(tt.terminal_tool(command=f"# scheduled restart\n{helper}{arg}"))
+        assert result["exit_code"] == 0, result
+        assert result["output"] == f"verified:{arg.split()[0] if arg else 'normal'}:clean"
+        assert not injected.exists()
+
+    @pytest.mark.parametrize("form", [
+        "{h} --worker-label injected", "bash {h}", "env {h}",
+        "{h} > /tmp/out", "{h} &", "{h};", "{h} && true",
+        "{h}\n--dry-run", "{h} --dry-run --dry-run",
+        "{h} --maintenance-script /tmp/unchecked.sh", "{h} --delay nope",
+    ])
+    def test_helper_exception_rejects_non_direct_or_incomplete_handoff(self, tmp_path, monkeypatch, form):
+        import tools.terminal_tool as tt
+        helper, _ = self._helper(tmp_path, monkeypatch)
+        result = json.loads(tt.terminal_tool(command=form.format(h=helper)))
+        assert result["exit_code"] != 0
+
+    @pytest.mark.parametrize("change", ["content", "mode", "symlink"])
+    def test_replaced_helper_is_not_trusted(self, tmp_path, monkeypatch, change):
+        import tools.terminal_tool as tt
+        helper, _ = self._helper(tmp_path, monkeypatch)
+        if change == "content":
+            helper.write_text(helper.read_text() + "# exchanged\n")
+        elif change == "mode":
+            helper.chmod(0o722)
+        else:
+            target = helper.with_suffix(".other")
+            helper.rename(target)
+            helper.symlink_to(target)
+        result = json.loads(tt.terminal_tool(command=str(helper)))
+        assert result["exit_code"] != 0
+
+    def test_background_never_reopens_verified_helper_in_shell(self, tmp_path, monkeypatch):
+        import tools.terminal_tool as tt
+        helper, _ = self._helper(tmp_path, monkeypatch)
+        result = json.loads(tt.terminal_tool(command=str(helper), background=True))
+        assert result["exit_code"] == 1
+        assert "foreground" in result["error"]
+
+    def test_broker_rechecks_bytes_after_authorization(self, tmp_path, monkeypatch):
+        import tools.terminal_tool as tt
+        helper, _ = self._helper(tmp_path, monkeypatch)
+        def swap_after_authorization(*args, **kwargs):
+            helper.write_text("#!/bin/bash\nprintf exchanged\n")
+            return {"approved": True}
+        monkeypatch.setattr(tt, "_check_all_guards", swap_after_authorization)
+        result = json.loads(tt.terminal_tool(command=str(helper)))
+        assert result["exit_code"] != 0
+        assert "SHA-256 changed" in result["output"]
+        assert "exchanged" not in result["output"]
+
+    def test_complete_maintenance_grammar_is_accepted_without_running_payload(self, tmp_path, monkeypatch):
+        from cron import lifecycle_guard as guard
+        helper, digest = self._helper(tmp_path, monkeypatch)
+        assert guard.is_direct_canonical_restart_helper_command(
+            f"{helper} --maintenance-script /safe/cutover.sh --maintenance-sha256 {'a' * 64} "
+            f"--expected-version 0.21.0 --expected-head {'b' * 40} --require-platform mattermost",
+            script_path=helper, expected_sha256=digest,
+        )
+
+    def test_terminal_descendant_cannot_restart_ancestor_with_marker_removed(self, tmp_path, monkeypatch):
+        import tools.terminal_tool as tt
+        import hermes_cli.gateway as gw
+        import gateway.status as status
+        from types import SimpleNamespace
+        env = SimpleNamespace(env={}, execute=lambda *a, **k: {"output": "unexpected dispatch", "returncode": 0})
+        self._patch_env(monkeypatch, env, inside_gateway=False)
+        monkeypatch.setattr(tt, "_check_all_guards", lambda *a, **k: {"approved": True})
+        monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+        monkeypatch.setattr(status, "get_running_pid", lambda **k: 424242)
+        monkeypatch.setattr(gw, "_is_pid_ancestor_of_current_process", lambda pid: pid == 424242)
+        result = json.loads(tt.terminal_tool(command="hermes gateway restart", force=True))
+        assert result["exit_code"] == 1 and "Blocked" in result["error"]
+
+
+@pytest.mark.parametrize("action", ["stop", "restart", "uninstall"])
+def test_gateway_cli_descendant_refuses_before_service_dispatch(monkeypatch, action):
+    import gateway.status as status
+    import hermes_cli.gateway as gw
+    from tools import process_registry
+    monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+    monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: False)
+    monkeypatch.setattr(status, "get_running_pid", lambda **k: 424242)
+    monkeypatch.setattr(gw, "_is_pid_ancestor_of_current_process", lambda pid: pid == 424242)
+    monkeypatch.setattr(gw, "is_managed", lambda: False)
+    def no_service(*a, **k):
+        pytest.fail("descendant reached service dispatch")
+    monkeypatch.setattr(gw, "_dispatch_via_service_manager_if_s6", no_service)
+    monkeypatch.setattr(gw, "_dispatch_all_via_service_manager_if_s6", no_service)
+    monkeypatch.setattr(gw, "launchd_uninstall", no_service)
+    with pytest.raises(SystemExit) as exc:
+        gw.gateway_command(Namespace(gateway_command=action, all=False, system=False))
+    assert exc.value.code == 1
+
+
 class TestLifecycleGuardModule:
     """Direct tests for cron.lifecycle_guard.check_gateway_lifecycle."""
 
@@ -2087,3 +2218,150 @@ class TestLifecycleGuardNeverRaises:
         if os.name != "nt":
             with pytest.raises(GatewayLifecycleBlocked):
                 check_gateway_lifecycle("clean prompt", "/dev/null")
+
+
+class TestP08GatewayLifecyclePreservation:
+    def test_shell_comment_does_not_block_canonical_restart_script(self):
+        command = "\n".join(
+            [
+                "# Execute the canonical Hermes gateway restart helper, no ad-hoc runner #",
+                "set -euo pipefail",
+                "/srv/hermes/scripts/restart-gateway.sh --dry-run",
+            ]
+        )
+
+        assert _contains_gateway_lifecycle_command(
+            command,
+            ignore_full_line_shell_comments=True,
+        ) is False
+
+    def test_cron_prompt_hash_heading_still_blocks_gateway_lifecycle(self):
+        assert _contains_gateway_lifecycle_command("# hermes gateway restart") is True
+
+    def test_terminal_comment_preamble_can_mention_new_systemctl_verbs(self):
+        command = (
+            "# Never run systemctl --user reload-or-restart hermes-gateway.service\n"
+            "# or systemctl --user disable --now hermes-gateway.service here\n"
+            "printf 'safe helper'"
+        )
+
+        assert _contains_gateway_lifecycle_command(command) is True
+        assert _contains_gateway_lifecycle_command(
+            command,
+            ignore_full_line_shell_comments=True,
+        ) is False
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "cat <<EOF\n# $(launchctl kickstart -k gui/501/ai.hermes.gateway)\nEOF",
+            "printf '%s\\n' \"\n# $(systemctl --user restart hermes-gateway)\n\"",
+        ],
+    )
+    def test_nonleading_hash_lines_in_shell_context_remain_scannable(self, command):
+        """Hash-prefixed lines after executable text may expand shell commands."""
+        assert _contains_gateway_lifecycle_command(
+            command,
+            ignore_full_line_shell_comments=True,
+        ) is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "hermes gateway restart",
+            "launchctl kickstart -k gui/501/ai.hermes.gateway",
+            "systemctl --user restart hermes-gateway",
+            "pkill -f hermes.*gateway",
+        ],
+    )
+    def test_executable_gateway_lifecycle_commands_stay_blocked(self, command):
+        assert _contains_gateway_lifecycle_command(command) is True
+        assert _contains_gateway_lifecycle_command(
+            command,
+            ignore_full_line_shell_comments=True,
+        ) is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "systemctl --user kill hermes-gateway.service",
+            "systemctl --user try-restart hermes-gateway",
+            "systemctl reload-or-restart --user hermes-gateway.service --no-block",
+            "systemctl --no-block --user 'reload-or-try-restart' 'hermes-gateway.service'",
+            'systemctl "--user" "condrestart" "hermes-gateway.service"',
+            "systemctl --user disable --now hermes-gateway.service",
+            "systemctl --now --user mask 'hermes-gateway.service'",
+            "systemctl mask hermes-gateway.service --user --now",
+            "/usr/bin/systemctl --user --no-block kill --kill-whom=main hermes-gateway.service",
+            (
+                "systemctl --user \\"
+                "\nreload-or-restart \\"
+                "\nhermes-gateway.service"
+            ),
+            (
+                'bash -c "systemctl --user\nreload-or-try-restart\n'
+                'hermes-gateway.service"'
+            ),
+        ],
+    )
+    def test_systemctl_lifecycle_variants_are_blocked(self, command):
+        assert _contains_gateway_lifecycle_command(command) is True
+        assert _contains_gateway_lifecycle_command(
+            command,
+            ignore_full_line_shell_comments=True,
+        ) is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "systemctl --user kill nginx.service",
+            "systemctl reload-or-restart --user hermes-meta.service",
+            "systemctl --user disable --now backup.service",
+            "systemctl --user mask --now hermes-cron-helper.service",
+            "systemctl --user disable hermes-gateway.service",
+            "systemctl --user mask hermes-gateway.service",
+            "systemctl --user status hermes-gateway.service --no-pager",
+        ],
+    )
+    def test_systemctl_unrelated_or_nonterminating_operations_are_allowed(
+        self, command
+    ):
+        assert _contains_gateway_lifecycle_command(command) is False
+        assert _contains_gateway_lifecycle_command(
+            command,
+            ignore_full_line_shell_comments=True,
+        ) is False
+
+
+class TestP08TerminalCommentPreamble:
+    _minimal_config = TestTerminalToolGatewayLifecycleGuard._minimal_config
+    _patch_env = TestTerminalToolGatewayLifecycleGuard._patch_env
+    @pytest.mark.parametrize("form", ["direct", "local-script", "shell-script"])
+    def test_p08_leading_comment_is_inert_only_for_terminal(self, monkeypatch, tmp_path, form):
+        import shlex
+        import tools.terminal_tool as tt
+        from cron.lifecycle_guard import GatewayLifecycleBlocked, check_gateway_lifecycle
+
+        body = "# Never run hermes gateway restart\nprintf safe"
+        script = tmp_path / "safe.sh"
+        script.write_text(body + "\n", encoding="utf-8")
+        command = body if form == "direct" else f"bash {shlex.quote(str(script))}"
+        if form == "shell-script":
+            command = "bash -c " + shlex.quote(command)
+        calls = []
+
+        class FakeEnv:
+            env = {}
+            cwd = str(tmp_path)
+
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                return {"output": "safe", "returncode": 0}
+
+        self._patch_env(monkeypatch, FakeEnv(), inside_gateway=True)
+        monkeypatch.setattr(tt, "_check_all_guards", lambda *a, **k: {"approved": True})
+        result = json.loads(tt.terminal_tool(command=command))
+        assert result["exit_code"] == 0, result
+        assert calls == [command]
+        with pytest.raises(GatewayLifecycleBlocked):
+            check_gateway_lifecycle(body)

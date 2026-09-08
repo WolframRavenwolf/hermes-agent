@@ -8633,6 +8633,20 @@ def _dispatch_all_via_service_manager_if_s6(action: str) -> bool:
 
 
 
+def _is_running_inside_gateway_process_tree() -> bool:
+    """Bind descendant lifecycle commands to the active profile's gateway PID.
+
+    The native own-PID/supervisor predicate remains authoritative for the
+    gateway itself; an inherited import-time marker alone grants no authority.
+    """
+    try:
+        from gateway.status import get_running_pid
+        pid = get_running_pid(cleanup_stale=False)
+        return pid is not None and pid != os.getpid() and _is_pid_ancestor_of_current_process(pid)
+    except Exception:
+        return False
+
+
 def gateway_command(args):
     """Handle gateway subcommands."""
     try:
@@ -8913,7 +8927,7 @@ def _gateway_command_inner(args):
         # gateway tree must stay able to manage it.
         from tools.process_registry import _is_supervised_gateway_process
 
-        if _is_supervised_gateway_process():
+        if _is_supervised_gateway_process() or _is_running_inside_gateway_process_tree():
             print_error(
                 "Refusing to uninstall the gateway from inside the gateway process.\n"
                 "This command was blocked to prevent the gateway from terminating itself.\n"
@@ -9037,7 +9051,7 @@ def _gateway_command_inner(args):
         # a one-shot exit rather than a respawn loop.
         from tools.process_registry import _is_supervised_gateway_process
 
-        if _is_supervised_gateway_process():
+        if _is_supervised_gateway_process() or _is_running_inside_gateway_process_tree():
             print_error(
                 "Refusing to stop the gateway from inside the gateway process.\n"
                 "This command was blocked to prevent restart loops.\n"
@@ -9136,7 +9150,7 @@ def _gateway_command_inner(args):
         # is a single relaunch rather than a respawn loop.
         from tools.process_registry import _is_supervised_gateway_process
 
-        if _is_supervised_gateway_process():
+        if _is_supervised_gateway_process() or _is_running_inside_gateway_process_tree():
             print_error(
                 "Refusing to restart the gateway from inside the gateway process.\n"
                 "This command was blocked to prevent restart loops.\n"

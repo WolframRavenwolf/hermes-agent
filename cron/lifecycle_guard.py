@@ -40,6 +40,8 @@ operations and stay allowed.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
 import os
 import re
@@ -212,7 +214,112 @@ def _contains_launchctl_gateway_lifecycle(normalized_text: str) -> bool:
     )
 
 
-def contains_gateway_lifecycle_command(text: str) -> bool:
+# systemctl accepts global options before or after its verb, and the verbs that
+# can stop a live service are broader than restart/stop.
+_SYSTEMCTL_ALWAYS_BLOCKED_ACTIONS = frozenset(
+    {
+        "start",
+        "stop",
+        "restart",
+        "kill",
+        "try-restart",
+        "reload-or-restart",
+        "reload-or-try-restart",
+        "condrestart",
+    }
+)
+_SYSTEMCTL_NOW_BLOCKED_ACTIONS = frozenset({"disable", "mask"})
+_SYSTEMCTL_GATEWAY_UNIT_RE = re.compile(
+    r"^(?:ai[.\-])?hermes[.\-]?gateway"
+    r"(?:[-@][a-z0-9_.@\-]+)?(?:\.service)?$",
+    re.IGNORECASE,
+)
+_SYSTEMCTL_SHELL_SEPARATORS = frozenset({";", "&", "|", "(", ")"})
+
+
+def _systemctl_shellish_tokens(text: str) -> list[str]:
+    """Tokenize one command-shaped line, retaining common shell separators."""
+    try:
+        lexer = shlex.shlex(text, posix=True, punctuation_chars=";&|()")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        return list(lexer)
+    except ValueError:
+        return re.findall(r"[A-Za-z0-9_@./:=+\-]+|[;&|()]+", text)
+
+
+def _is_systemctl_token(token: str) -> bool:
+    return token.rsplit("/", 1)[-1].casefold() == "systemctl"
+
+
+def _is_gateway_systemd_unit(token: str) -> bool:
+    normalized = token.strip("'\"`$,:")
+    normalized = normalized.rsplit("/", 1)[-1]
+    return bool(_SYSTEMCTL_GATEWAY_UNIT_RE.fullmatch(normalized))
+
+
+def _systemctl_tokens_target_gateway_lifecycle(tokens: list[str]) -> bool:
+    for index, token in enumerate(tokens):
+        if not _is_systemctl_token(token):
+            continue
+        invocation: list[str] = []
+        for candidate in tokens[index + 1 :]:
+            if candidate and set(candidate) <= _SYSTEMCTL_SHELL_SEPARATORS:
+                break
+            invocation.append(candidate)
+        normalized = {candidate.casefold() for candidate in invocation}
+        if not any(_is_gateway_systemd_unit(candidate) for candidate in invocation):
+            continue
+        if normalized & _SYSTEMCTL_ALWAYS_BLOCKED_ACTIONS:
+            return True
+        if normalized & _SYSTEMCTL_NOW_BLOCKED_ACTIONS and "--now" in normalized:
+            return True
+    return False
+
+
+def _contains_systemctl_gateway_lifecycle(text: str) -> bool:
+    """Scan systemctl invocations with token/quote/option normalization."""
+    normalized_text = _SHELL_LINE_CONTINUATION.sub(" ", text)
+    for line in normalized_text.splitlines() or [normalized_text]:
+        tokens = _systemctl_shellish_tokens(line)
+        if _systemctl_tokens_target_gateway_lifecycle(tokens):
+            return True
+        for token in tokens:
+            if "systemctl" not in token.casefold() or not any(
+                char.isspace() for char in token
+            ):
+                continue
+            nested = _systemctl_shellish_tokens(token)
+            if nested != [token] and _systemctl_tokens_target_gateway_lifecycle(nested):
+                return True
+    if "\n" in normalized_text:
+        for token in _systemctl_shellish_tokens(normalized_text):
+            if "\n" not in token or "systemctl" not in token.casefold():
+                continue
+            nested = _systemctl_shellish_tokens(token)
+            if nested != [token] and _systemctl_tokens_target_gateway_lifecycle(nested):
+                return True
+    return False
+
+
+def _strip_leading_full_line_shell_comments(text: str) -> str:
+    """Remove only inert leading shell comments, preserving later shell text."""
+    lines = text.splitlines(keepends=True)
+    first_executable = 0
+    while first_executable < len(lines):
+        stripped = lines[first_executable].lstrip()
+        if not stripped.strip() or stripped.startswith("#"):
+            first_executable += 1
+            continue
+        break
+    return "".join(lines[first_executable:])
+
+
+def contains_gateway_lifecycle_command(
+    text: str,
+    *,
+    ignore_full_line_shell_comments: bool = False,
+) -> bool:
     """Return True if *text* contains a gateway lifecycle command pattern.
 
     Matches in two passes. The first is the raw-text regex above — cheap,
@@ -237,6 +344,8 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
     """
     if not text:
         return False
+    if ignore_full_line_shell_comments:
+        text = _strip_leading_full_line_shell_comments(text)
     # Heredoc bodies that are provably inert data (quoted delimiter, data-sink
     # consumer like `cat > file <<'EOF'`) are masked before scanning (#88336):
     # a runbook line "a human can run: hermes gateway restart" inside such a
@@ -284,7 +393,10 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
     # segment (`label=${item%%:*}; launchctl bootout "gui/$uid/$label"`), so
     # neither the same-span regex nor same-segment tokenization sees verb
     # and label together. Check "verb anywhere AND label anywhere" instead.
-    return _contains_launchctl_gateway_lifecycle(normalized)
+    return (
+        _contains_launchctl_gateway_lifecycle(normalized)
+        or _contains_systemctl_gateway_lifecycle(normalized)
+    )
 
 
 _SHELL_EXECUTABLES = frozenset({"sh", "bash", "dash", "ksh", "zsh"})
@@ -594,6 +706,126 @@ def _command_token_index(segment: list[str]) -> Optional[int]:
     return None
 
 
+def is_direct_canonical_restart_helper_command(
+    command: str,
+    *,
+    script_path: str | Path,
+    cwd: Optional[str] = None,
+    expected_sha256: Optional[str] = None,
+) -> bool:
+    """Allow only one direct invocation of the trusted restart entrypoint.
+
+    The command may contain inert leading call-shot comments, but no environment
+    assignments, shell wrapper, control operator, redirection, or internal
+    worker arguments. Normal restart options and a complete hash-bound
+    maintenance handoff use a strict option grammar.
+    """
+    lines = command.splitlines()
+    while lines and (not lines[0].strip() or lines[0].lstrip().startswith("#")):
+        lines.pop(0)
+    if len(lines) != 1:
+        return False
+    try:
+        lexer = shlex.shlex(lines[0], posix=True, punctuation_chars=";&|()<>")
+        lexer.whitespace_split = True
+        lexer.commenters = "#"
+        segment = list(lexer)
+    except ValueError:
+        return False
+    if not segment or any(token and set(token) <= set(";&|()<>") for token in segment):
+        return False
+    arguments = segment[1:]
+    values: dict[str, str] = {}
+    flags: set[str] = set()
+    value_options = {
+        "--delay",
+        "--stability",
+        "--maintenance-script",
+        "--maintenance-sha256",
+        "--expected-version",
+        "--expected-head",
+        "--require-platform",
+    }
+    arg_index = 0
+    while arg_index < len(arguments):
+        option = arguments[arg_index]
+        if option == "--dry-run":
+            if option in flags:
+                return False
+            flags.add(option)
+            arg_index += 1
+            continue
+        if option not in value_options or option in values:
+            return False
+        if arg_index + 1 >= len(arguments):
+            return False
+        values[option] = arguments[arg_index + 1]
+        arg_index += 2
+
+    if any(
+        not value.isdigit()
+        for option, value in values.items()
+        if option in {"--delay", "--stability"}
+    ):
+        return False
+    maintenance_path = values.get("--maintenance-script")
+    maintenance_sha256 = values.get("--maintenance-sha256")
+    if bool(maintenance_path) != bool(maintenance_sha256):
+        return False
+    if maintenance_path and not Path(maintenance_path).is_absolute():
+        return False
+    if maintenance_sha256 and not re.fullmatch(
+        r"[0-9a-fA-F]{64}", maintenance_sha256
+    ):
+        return False
+    expected_head = values.get("--expected-head")
+    if expected_head and not re.fullmatch(r"[0-9a-fA-F]{40}", expected_head):
+        return False
+    expected_version = values.get("--expected-version")
+    if expected_version is not None and not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._+-]*", expected_version
+    ):
+        return False
+    if maintenance_path and not (expected_version and expected_head):
+        return False
+    required_platform = values.get("--require-platform")
+    if required_platform is not None:
+        if not maintenance_path:
+            return False
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", required_platform):
+            return False
+
+    candidate = _resolve_terminal_script_path(segment[0], cwd)
+    canonical = _expand_candidate_path(str(script_path))
+    if candidate is None or canonical is None or not expected_sha256:
+        return False
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha256):
+        return False
+    descriptor = None
+    try:
+        if not stat.S_ISREG(candidate.lstat().st_mode) or not stat.S_ISREG(canonical.lstat().st_mode):
+            return False
+        if candidate.resolve(strict=True) != canonical.resolve(strict=True):
+            return False
+        descriptor = os.open(candidate, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_mode & 0o022:
+            return False
+        if metadata.st_size > _MAX_REFERENCED_SCRIPT_BYTES:
+            return False
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = None
+            data = stream.read(_MAX_REFERENCED_SCRIPT_BYTES + 1)
+        return len(data) <= _MAX_REFERENCED_SCRIPT_BYTES and hmac.compare_digest(
+            hashlib.sha256(data).hexdigest(), expected_sha256.casefold()
+        )
+    except (OSError, ValueError):
+        return False
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 def contains_launchctl_submit_command(command: str) -> bool:
     """Detect an executed ``launchctl submit``/``bootstrap``, not quoted text.
 
@@ -707,8 +939,14 @@ def _lifecycle_command_scan_with_data_exemption(text: str) -> bool:
     return contains_gateway_lifecycle_command(_mask_data_sink_arguments(normalized))
 
 
-def _direct_lifecycle_scan(command: str) -> bool:
+def _direct_lifecycle_scan(
+    command: str,
+    *,
+    ignore_full_line_shell_comments: bool = False,
+) -> bool:
     """Pure-string direct scans: lifecycle regex (data-exempted) + submit."""
+    if ignore_full_line_shell_comments:
+        command = _strip_leading_full_line_shell_comments(command)
     return _lifecycle_command_scan_with_data_exemption(
         command
     ) or contains_launchctl_submit_command(command)
@@ -1032,8 +1270,12 @@ def _contains_unsafe_gateway_action(
     depth: int,
     visited: set[Path],
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
+    ignore_full_line_shell_comments: bool = False,
 ) -> bool:
-    if _direct_lifecycle_scan(command):
+    if _direct_lifecycle_scan(
+        command,
+        ignore_full_line_shell_comments=ignore_full_line_shell_comments,
+    ):
         return True
     if depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
         return True
@@ -1045,6 +1287,7 @@ def _contains_unsafe_gateway_action(
             depth=depth + 1,
             visited=visited,
             read_remote_script=read_remote_script,
+            ignore_full_line_shell_comments=ignore_full_line_shell_comments,
         ):
             return True
 
@@ -1093,6 +1336,7 @@ def _contains_unsafe_gateway_action(
             depth=depth + 1,
             visited=visited,
             read_remote_script=read_remote_script,
+            ignore_full_line_shell_comments=ignore_full_line_shell_comments,
         ):
             return True
     return False
@@ -1103,6 +1347,7 @@ def contains_gateway_lifecycle_command_or_referenced_script(
     *,
     cwd: Optional[str] = None,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
+    ignore_full_line_shell_comments: bool = False,
 ) -> bool:
     """Detect lifecycle/submit commands, including bounded nested scripts.
 
@@ -1127,6 +1372,7 @@ def contains_gateway_lifecycle_command_or_referenced_script(
             depth=0,
             visited=set(),
             read_remote_script=read_remote_script,
+            ignore_full_line_shell_comments=ignore_full_line_shell_comments,
         )
     except Exception:
         logger.warning(
@@ -1136,13 +1382,17 @@ def contains_gateway_lifecycle_command_or_referenced_script(
         )
         # Pure string scans of the top-level command — cannot raise.
         try:
-            return _direct_lifecycle_scan(command)
+            return _direct_lifecycle_scan(
+                command,
+                ignore_full_line_shell_comments=ignore_full_line_shell_comments,
+            )
         except Exception:
             # The data-argument masker tokenizes arbitrary text; if even
             # that fails, fall to the raw regex + submit scan so the guard
             # stays total.
             return contains_gateway_lifecycle_command(
-                command
+                command,
+                ignore_full_line_shell_comments=ignore_full_line_shell_comments,
             ) or contains_launchctl_submit_command(command)
 
 
