@@ -2080,6 +2080,7 @@ class RelayAdapter(BasePlatformAdapter):
             success=bool(result.get("success")),
             message_id=result.get("message_id"),
             error=result.get("error"),
+            raw_response=result,
         )
 
     def auto_thread_info_for_chat(
@@ -2296,6 +2297,7 @@ class RelayAdapter(BasePlatformAdapter):
             success=bool(result.get("success")),
             message_id=result.get("message_id") or message_id,
             error=result.get("error"),
+            raw_response=result,
         )
 
     async def delete_message(

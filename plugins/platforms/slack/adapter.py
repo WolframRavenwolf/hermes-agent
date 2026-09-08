@@ -2932,6 +2932,9 @@ class SlackAdapter(BasePlatformAdapter):
         if not self._app:
             return SendResult(success=False, error="Not connected")
 
+        metadata = dict(metadata) if metadata is not None else None
+        interim = metadata.pop("_interim_send", False) if metadata is not None else False
+        literal = (metadata or {}).get("_literal_text") is True
         chat_id = await self._ensure_dm_conversation(
             chat_id, team_id=self._metadata_team_id(metadata)
         )
@@ -2991,12 +2994,13 @@ class SlackAdapter(BasePlatformAdapter):
             # chat.startStream stream and this send carries its final
             # content, seal the stream instead of posting a duplicate
             # message (the streamed message IS the final message).
-            stream_result = await self._try_finalize_stream(chat_id, content)
-            if stream_result is not None:
-                return stream_result
+            if not interim:
+                stream_result = await self._try_finalize_stream(chat_id, content)
+                if stream_result is not None:
+                    return stream_result
 
-            # Convert standard markdown → Slack mrkdwn
-            formatted = self.format_message(content)
+            # Full progress is literal data; ordinary messages retain Markdown.
+            formatted = self.format_literal_message(content) if literal else self.format_message(content)
 
             # Guard against empty/whitespace-only messages — Slack API
             # returns ``no_text`` for chat.postMessage with blank text.
@@ -3008,8 +3012,9 @@ class SlackAdapter(BasePlatformAdapter):
                 await self._clear_thread_status_quietly(chat_id, metadata)
                 return SendResult(success=True)
 
-            # Split long messages, preserving code block boundaries
-            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            # Literal JSON must not acquire continuation labels or repaired fences.
+            chunks = (self._split_literal_text(formatted, self.MAX_MESSAGE_LENGTH) if literal
+                      else self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH))
 
             thread_ts = self._resolve_thread_ts(reply_to, metadata)
             last_result = None
@@ -3023,15 +3028,17 @@ class SlackAdapter(BasePlatformAdapter):
             # that had to be split is pathological for Block Kit's 50-block /
             # 3000-char limits, so those fall back to plain text. The ``text``
             # field is always kept as the notification/accessibility fallback.
-            blocks = self._maybe_blocks(content) if len(chunks) == 1 else None
+            blocks = self._maybe_blocks(content) if not literal and len(chunks) == 1 else None
 
             for i, chunk in enumerate(chunks):
                 kwargs = {
                     "channel": chat_id,
                     "text": chunk,
-                    "mrkdwn": True,
+                    "mrkdwn": not literal,
                     **_slack_unfurl_kwargs(self.config.extra),
                 }
+                if literal:
+                    kwargs.update(self._literal_payload(chunk), unfurl_links=False, unfurl_media=False)
                 if blocks and i == 0:
                     kwargs["blocks"] = blocks
                 if thread_ts:
@@ -3045,7 +3052,7 @@ class SlackAdapter(BasePlatformAdapter):
                         chat_id, team_id=team_id
                     ).chat_postMessage(**kwargs)
                 except Exception as e:
-                    if kwargs.get("blocks") and self._is_block_payload_rejection(e):
+                    if not literal and kwargs.get("blocks") and self._is_block_payload_rejection(e):
                         retry_kwargs = dict(kwargs)
                         retry_kwargs.pop("blocks", None)
                         logger.info(
@@ -3214,12 +3221,14 @@ class SlackAdapter(BasePlatformAdapter):
         if not self._app:
             return SendResult(success=False, error="Not connected")
         try:
-            formatted = self.format_message(content)
+            literal = (metadata or {}).get("_literal_text") is True
+            formatted = self.format_literal_message(content) if literal else self.format_message(content)
             # Slack's chat.update has the same ~40k char limit as postMessage.
             # Unlike send() we can't split into multiple messages (we're
             # editing an existing one), so truncate to fit — an oversized
             # payload fails the whole edit with ``msg_too_long``.
-            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            chunks = (self._split_literal_text(formatted, self.MAX_MESSAGE_LENGTH) if literal
+                      else self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH))
             formatted = chunks[0] if chunks else formatted
             update_kwargs: Dict[str, Any] = {
                 "channel": chat_id,
@@ -3230,7 +3239,9 @@ class SlackAdapter(BasePlatformAdapter):
             # edits stay plain mrkdwn — re-deriving a full block layout on every
             # progressive flush would be wasteful and jittery. ``text`` is kept
             # as the fallback either way.
-            if finalize:
+            if literal:
+                update_kwargs.update(self._literal_payload(formatted))
+            elif finalize:
                 blocks = self._maybe_blocks(content)
                 if blocks:
                     update_kwargs["blocks"] = blocks
@@ -3239,7 +3250,7 @@ class SlackAdapter(BasePlatformAdapter):
                     chat_id, team_id=self._metadata_team_id(metadata)
                 ).chat_update(**update_kwargs)
             except Exception as e:
-                if update_kwargs.get("blocks") and self._is_block_payload_rejection(e):
+                if not literal and update_kwargs.get("blocks") and self._is_block_payload_rejection(e):
                     retry_kwargs = dict(update_kwargs)
                     # Explicitly clear any stale blocks when falling back to the
                     # flat text update path; otherwise Slack can preserve the
@@ -4281,6 +4292,33 @@ class SlackAdapter(BasePlatformAdapter):
         except Exception:  # pragma: no cover - renderer already guards itself
             logger.debug("[Slack] block render failed; using plain text", exc_info=True)
             return None
+
+    @staticmethod
+    def format_literal_message(content: str) -> str:
+        """Escape only Slack's text control characters; never interpret Markdown."""
+        return content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    @staticmethod
+    def _split_literal_text(text: str, limit: int) -> list[str]:
+        """Split escaped text without trimming, fence repair or broken entities."""
+        chunks = []
+        start = 0
+        for match in re.finditer(r"&(?:amp|lt|gt);|.", text, re.DOTALL):
+            if match.end() - start > limit:
+                chunks.append(text[start:match.start()])
+                start = match.start()
+        if start < len(text):
+            chunks.append(text[start:])
+        return chunks
+
+    @classmethod
+    def _literal_payload(cls, text: str) -> Dict[str, Any]:
+        # chat.update has no documented mrkdwn switch. Native plain_text blocks
+        # preserve literal data on both send and edit, including with rich_blocks on.
+        return {"parse": "none", "link_names": False, "blocks": [
+            {"type": "section", "text": {"type": "plain_text", "text": chunk, "emoji": False}}
+            for chunk in cls._split_literal_text(text, 3000)
+        ]}
 
     def format_message(self, content: str) -> str:
         """Convert standard markdown to Slack mrkdwn format.

@@ -2624,6 +2624,20 @@ class SendResult:
     error_kind: Optional[str] = None
 
 
+def declined_send(result: Any) -> bool:
+    """Recognize the native definite destination-refusal SendResult contract."""
+    raw = getattr(result, "raw_response", None)
+    if isinstance(raw, dict):
+        if raw.get("success") or raw.get("ambiguous"):
+            return False
+        return (
+            str(raw.get("code") or "") == "egress_declined"
+            or "egress declined:" in str(raw.get("error") or "").lower()
+        )
+    error = str(getattr(result, "error", None) or "").lower()
+    return "ack lost" not in error and "egress declined:" in error
+
+
 # Machine-readable send-failure categories.  Kept platform-neutral so every
 # adapter can populate ``SendResult.error_kind`` from the same vocabulary and
 # the gateway can decide — once, in one place — whether a failure is worth

@@ -24,7 +24,7 @@ from gateway.run import _prepare_gateway_status_message
 
 # Chat surfaces the opt-in must deliver to (subset of the noise-filter
 # suite's CHAT_PLATFORMS; telegram + discord are the required anchors).
-CHAT_PLATFORMS = ["telegram", "discord", "slack", "whatsapp"]
+CHAT_PLATFORMS = ["telegram", "discord", "slack", "whatsapp", "mattermost"]
 
 # Noisy statuses that are NOT routine compression progress — they must stay
 # suppressed on chat platforms even when progress_notices is enabled.
