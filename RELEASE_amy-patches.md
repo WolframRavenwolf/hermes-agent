@@ -323,3 +323,15 @@ rebuilds cached agent/request state when only its projected token limit changes.
 - **P21 / ABSORBED:** native post-turn orchestration already owns streamed goal continuation.
 - **P27 / DROP_UPSTREAM:** no downstream Grok 4.6 production delta remains.
 - **P28 / LEDGER_UPDATE:** this file is the only changed path of the ledger commit.
+
+## Temporary backports after the Stable 0.21 reconstruction
+
+### P31 — Emoji ZWJ context scanning — TEMP_BACKPORT
+
+- **Problem:** a normal compound emoji containing U+200D caused an entire context file such as `AGENTS.md` or `SOUL.md` to be rejected; skill scanning had the same false positive.
+- **Solution:** backport [upstream PR #76857](https://github.com/NousResearch/hermes-agent/pull/76857), at head `22f0db934e8cba96916d21920353a65d7fd34a54`, as one downstream commit. The shared two-sided emoji-neighbor heuristic is used by the context, skill, and cron scanners. Bare/mixed text joiners and other invisible/bidi characters remain detectable. This is the upstream range-based heuristic, not a complete Unicode emoji-sequence validator.
+- **Provenance:** Oscar Estrada's commits `e21935c9181f6fd738deb3d7edb73abf4f0313f5`, `e7b33ac8f610d768b2fab62b5f2e2975e9f27942`, and `22f0db934e8cba96916d21920353a65d7fd34a54`. Production changes are unchanged; patch application preserves the newer `skills-guard-v2` version context. One additional downstream regression covers a light-skin/red-hair emoji and retained threat detection across all three scan scopes.
+- **Paths:** `tools/threat_patterns.py`, `tools/skills_guard.py`, `tools/cronjob_tools.py`, `tests/tools/test_threat_patterns.py`, `tests/tools/test_skills_guard.py`, and this ledger entry.
+- **Verification:** focused regressions fail before the fix; the bounded threat/skill/cron/context-loader suite passes (220 tests, one skipped). A fresh-process comparison verifies that an unchanged context file is blocked before and accepted verbatim by the scanner after the fix. Normal context-size limits still apply.
+- **Removal:** drop this entire temporary patch when a controlled update brings the equivalent merged upstream fix into the deployed base. A remote PR merge alone is not permission to upgrade or to remove the fix from an older deployed release.
+- **Session reference:** owner-approved emoji-scanner backport, 2026-09-09.
