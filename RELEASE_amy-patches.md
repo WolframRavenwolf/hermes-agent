@@ -335,3 +335,13 @@ rebuilds cached agent/request state when only its projected token limit changes.
 - **Verification:** focused regressions fail before the fix; the bounded threat/skill/cron/context-loader suite passes (220 tests, one skipped). A fresh-process comparison verifies that an unchanged context file is blocked before and accepted verbatim by the scanner after the fix. Normal context-size limits still apply.
 - **Removal:** drop this entire temporary patch when a controlled update brings the equivalent merged upstream fix into the deployed base. A remote PR merge alone is not permission to upgrade or to remove the fix from an older deployed release.
 - **Session reference:** owner-approved emoji-scanner backport, 2026-09-09.
+
+### P32 — Cua element-token schema compatibility — TEMP_BACKPORT
+
+- **Problem:** current cua-driver releases expose `element_token` in each action tool's live input schema without the older `accessibility.element_tokens` capability marker. Hermes therefore cached valid tokens after capture but omitted them from element-index actions, which cua-driver rejected with `snapshot_id_required`.
+- **Solution:** treat either the live `element_token` input property or the legacy capability marker as proof that an action accepts tokens. Older drivers that advertise neither surface still receive no unknown field. A focused regression covers the live-schema-only contract.
+- **Provenance:** local compatibility fix against cua-driver 0.25.0 after a live capture succeeded and a background element click reproduced the refusal. The same capability-only gate remains on the inspected `upstream/main` ref `fd6434b3b36592367ac5faa180b905d64e29214c`.
+- **Paths:** `tools/computer_use/cua_backend.py`, `tests/tools/test_computer_use.py`, and this ledger entry.
+- **Verification:** the new live-schema-only regression fails with a missing `element_token` before the fix and passes afterward; the complete affected computer-use test set passes 133 tests.
+- **Removal:** drop this temporary patch after a controlled upgrade brings an equivalent upstream fix into the deployed base.
+- **Session reference:** live cua-driver 0.25.0 compatibility repair, 2026-09-10.

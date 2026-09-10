@@ -2125,10 +2125,11 @@ class TestStructuredElementsConsumption:
 class TestCapabilityDiscovery:
     """Surface 4 (NousResearch/hermes-agent#47072): the wrapper learns
     what cua-driver supports from the per-tool `capabilities[]` array on
-    `tools/list` (trycua/cua#1961) instead of name-checking. The infra
-    here is consumed by other surfaces (e.g. Surface 6 only carries
-    element_token when `accessibility.element_tokens` is advertised);
-    these tests freeze the supports_capability contract.
+    `tools/list` (trycua/cua#1961) instead of name-checking. Other surfaces
+    retain this map as a compatibility fallback; Surface 6 uses the legacy
+    `accessibility.element_tokens` claim when a tool's live input schema does
+    not declare `element_token`. These tests freeze the supports_capability
+    contract.
     """
 
     def test_supports_capability_global_match_any_tool(self):
@@ -2172,9 +2173,10 @@ class TestElementTokenAttachment:
     1. capture() refreshes a per-snapshot {index -> token} map from
        structuredContent.elements.
     2. Whenever an action carrying element_index is about to hit cua-driver,
-       look up the matching token and attach it — but ONLY for tools that
-       advertise `accessibility.element_tokens` (Surface 4 gate). Older
-       drivers reject unknown args via additionalProperties=false.
+       look up the matching token and attach it for tools whose live schema
+       accepts `element_token`, with the older `accessibility.element_tokens`
+       capability as a compatibility fallback. Drivers advertising neither
+       surface receive no unknown arg because additionalProperties=false.
     3. cua-driver prefers token over index when both are supplied, so
        sending both is safe and stale-detection becomes explicit.
     """
@@ -2196,6 +2198,9 @@ class TestElementTokenAttachment:
                 return cap in capabilities.get(tool, set())
             return any(cap in caps for caps in capabilities.values())
         backend._session.supports_capability = _supports
+        backend._session.supports_input_property = (
+            lambda tool, property_name: False
+        )
         backend._active_pid = 111
         backend._active_window_id = 222
         return backend
@@ -2211,6 +2216,40 @@ class TestElementTokenAttachment:
         assert args["element_index"] == 5
         # The matching token rode along — cua-driver will prefer it.
         assert args["element_token"] == "s0001:5"
+
+    def test_token_attached_when_live_schema_accepts_property(self):
+        """Current drivers expose element_token in the input schema without
+        carrying the legacy accessibility.element_tokens capability marker.
+        """
+        backend = self._backend_with_session({
+            "click": {"input.pointer.click"},
+        })
+        backend._session.supports_input_property = (
+            lambda tool, property_name: (
+                tool == "click" and property_name == "element_token"
+            )
+        )
+        backend._snapshot_tokens = {5: "s0001:5"}
+
+        backend.click(element=5, button="left")
+
+        name, args = cast(Any, backend._session.call_tool).call_args.args
+        assert name == "click"
+        assert args["element_index"] == 5
+        assert args["element_token"] == "s0001:5"
+
+    def test_token_omitted_when_schema_and_capability_reject_it(self):
+        backend = self._backend_with_session({
+            "click": {"input.pointer.click"},
+        })
+        backend._snapshot_tokens = {5: "s0001:5"}
+
+        backend.click(element=5, button="left")
+
+        name, args = cast(Any, backend._session.call_tool).call_args.args
+        assert name == "click"
+        assert args["element_index"] == 5
+        assert "element_token" not in args
 
 
     def test_capture_refreshes_snapshot_tokens(self):
