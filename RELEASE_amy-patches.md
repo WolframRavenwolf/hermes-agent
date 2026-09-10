@@ -358,6 +358,32 @@ rebuilds cached agent/request state when only its projected token limit changes.
 - **Session reference:** owner-requested Tavily restore backport, 2026-09-10.
 
 
+## 2026-09-10 - Prefer the active live model catalog and highlight implicit provider changes
+
+- **Problem:** Typed `/model` could route a newly available subscription model to metered OpenRouter because the static active-provider catalog lacked the model. The normal success message did not prominently flag the provider change.
+- **Solution:** Backport the live-catalog check from [upstream PR #97487](https://github.com/NousResearch/hermes-agent/pull/97487), reviewed at `53d6caabb8a6193ceb72c2ce58133e3ffb45d287`, before the OpenRouter fallback. Preserve the existing fallback if the live catalog fails or has no match. Add a separate warning to successful shared switch results when the original command omitted `--provider` and the provider changed. CLI renders it red/bold; gateway replies lead with a red alarm emoji and bold text. Existing validation warnings and confirmation/cancellation behavior remain intact.
+- **Boundary:** The warning reports an applied switch; it is not a new confirmation gate. Catalog failures can still fall back to another provider. Explicit provider selection remains the deterministic routing option.
+- **Affected files:** `hermes_cli/models.py`, `hermes_cli/model_switch.py`, `cli.py`, `gateway/slash_commands.py`, `tests/hermes_cli/test_model_switch_provider_warning.py`, `tests/hermes_cli/test_model_switch_confirm_thread.py`, `tests/gateway/test_model_command_expensive_confirm.py`, and this ledger.
+- **Validation:** New failure-first coverage reproduced the Codex-to-OpenRouter misroute and missing warnings. The isolated targeted suite passed 123 tests across 11 files, including adjacent configured-provider, API-mode, variant-tag, gateway and CLI tests. No live inference or service restart was performed.
+- **Implementation reference:** live model catalog routing, 2026-09-10.
+- **Review synchronization, 2026-09-14:** Preserve the complete combined provider
+  and validation warnings in immediate native switch results. Deferred switches
+  emit a session-owned warning event when applied; Ink and Desktop display it
+  without changing routing, confirmation, scope or turn state. This aligns with
+  [upstream PR #108730](https://github.com/NousResearch/hermes-agent/pull/108730).
+  Additional files: `tui_gateway/server.py`,
+  `tests/tui_gateway/test_provider_switch_warning.py`,
+  `ui-tui/src/app/createGatewayEventHandler.ts`,
+  `ui-tui/src/__tests__/createGatewayEventHandler.test.ts`,
+  `apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/status.ts`,
+  `apps/desktop/src/app/session/hooks/use-message-stream/timeline-events.test.tsx`,
+  `apps/desktop/src/app/session/hooks/use-model-controls.ts`, and
+  `apps/desktop/src/app/session/hooks/use-model-controls.test.tsx`.
+  Verification: 31 isolated Python tests and 114 native frontend tests; the Ink
+  package built successfully. No live provider switch was used for verification.
+  Immediate and confirmed success warnings additionally reach the real Desktop
+  notification store and DOM; 30 consumer, 22 picker and 7 queued tests passed.
+
 ## Ordered web extraction and cache provenance - review synchronization 2026-09-14
 
 - Problem: reordered provider rows could be cached under another requested URL;

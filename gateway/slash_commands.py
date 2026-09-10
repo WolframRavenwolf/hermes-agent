@@ -2564,6 +2564,8 @@ class GatewaySlashCommandsMixin:
             # Build confirmation message with full metadata
             provider_label = result.provider_label or result.target_provider
             lines = [t("gateway.model.switched", model=format_model_for_display(result.new_model))]
+            if result.provider_switch_warning:
+                lines.insert(0, f"🚨 **{result.provider_switch_warning}**\n")
             lines.append(t("gateway.model.provider_label", provider=provider_label))
 
             # Context: always resolve via the provider-aware chain so Codex OAuth,

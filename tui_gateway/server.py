@@ -6530,7 +6530,9 @@ def _apply_model_switch(
         _persist_model_switch(result)
     return {
         "value": result.new_model,
-        "warning": result.warning_message or "",
+        "warning": "\n\n".join(w for w in (
+            getattr(result, "provider_switch_warning", ""), result.warning_message
+        ) if w),
         "confirm_required": False,
         "scope": "once" if one_turn else ("global" if persist_global else "session"),
     }
@@ -7026,6 +7028,16 @@ def _apply_pending_model_switch(sid: str, session: dict) -> None:
                 "error",
                 sid,
                 {"message": result.get("confirm_message") or result.get("warning") or ""},
+            )
+        elif result.get("warning"):
+            _emit(
+                "status.update",
+                sid,
+                {
+                    "kind": "model-switch-warning",
+                    "text": result["warning"],
+                    "timestamp": time.time(),
+                },
             )
     except Exception as e:
         _emit(

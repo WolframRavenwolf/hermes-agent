@@ -768,6 +768,7 @@ class ModelSwitchResult:
     runtime_capabilities: Optional[dict[str, bool]] = None
     model_info: Optional[ModelInfo] = None
     is_global: bool = False
+    provider_switch_warning: str = ""
 
 
 @dataclass(frozen=True)
@@ -1636,6 +1637,9 @@ def switch_model(
     )
     from hermes_cli.runtime_provider import resolve_runtime_provider
 
+    # Config-based routing may set explicit_provider internally later; preserve
+    # whether the caller actually supplied --provider.
+    provider_was_explicit = bool(explicit_provider)
     resolved_alias = ""
     request_overrides: dict = {}
     new_model = raw_input.strip()
@@ -2413,6 +2417,19 @@ def switch_model(
     except Exception:
         request_overrides = None
 
+    provider_switch_warning = ""
+    if provider_changed and not provider_was_explicit:
+        previous_def = resolve_provider_full(
+            current_provider, user_providers, custom_providers
+        )
+        previous_id = previous_def.id if previous_def else current_provider
+        if previous_id != target_provider:
+            provider_switch_warning = (
+                f"PROVIDER AUTOMATICALLY CHANGED: {previous_id} -> {target_provider}. "
+                "No --provider argument was supplied. This change may incur "
+                "additional costs. Specify --provider explicitly to choose your provider."
+            )
+
     # --- Build result ---
     return ModelSwitchResult(
         success=True,
@@ -2424,6 +2441,7 @@ def switch_model(
         api_mode=api_mode,
         request_overrides=dict(request_overrides or {}),
         warning_message=" | ".join(warnings) if warnings else "",
+        provider_switch_warning=provider_switch_warning,
         provider_label=provider_label,
         resolved_via_alias=resolved_alias,
         capabilities=capabilities,

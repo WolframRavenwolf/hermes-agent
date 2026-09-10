@@ -7,7 +7,7 @@ import { useI18n } from '@/i18n'
 import { isBusySessionModelSwitch } from '@/lib/gateway-rpc'
 import { surfaceModelSwitchConfirm } from '@/lib/guarded-model-switch'
 import { manualPickRemoved, modelOptionsQueryKey } from '@/lib/model-options'
-import { notifyError } from '@/store/notifications'
+import { notify, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile } from '@/store/profile'
 import {
   $activeSessionId,
@@ -32,6 +32,7 @@ interface ModelSwitchResponse {
   confirm_message?: string
   confirm_required?: boolean
   deferred?: boolean
+  warning?: string
 }
 
 export function useModelControls({ queryClient, requestGateway }: ModelControlsOptions) {
@@ -280,6 +281,11 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
         // re-syncs every surface.
         if (!result?.deferred) {
           void queryClient.invalidateQueries({ queryKey: modelOptionsQueryKey(liveGatewayProfile, liveSessionId) })
+
+          // Deferred warnings arrive with the queued application event instead.
+          if (result?.warning?.trim()) {
+            notify({ kind: 'warning', message: result.warning })
+          }
         }
       }
 

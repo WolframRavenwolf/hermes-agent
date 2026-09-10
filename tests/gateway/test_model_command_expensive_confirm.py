@@ -166,3 +166,36 @@ async def test_failed_inplace_swap_aborts_commit(tmp_path, monkeypatch):
     assert evicted == []
     # The agent stayed on its old model (rolled back).
     assert agent.model == "old-model"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("needs_confirmation", [False, True])
+async def test_provider_warning_precedes_success_only_after_applied(tmp_path, monkeypatch, needs_confirmation):
+    _setup_isolated_home(tmp_path, monkeypatch, warn=needs_confirmation)
+    resolved = _fake_switch_result()
+    resolved.provider_switch_warning = "PROVIDER AUTOMATICALLY CHANGED: openai-codex -> openrouter"
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", lambda **kw: resolved)
+    monkeypatch.setattr("hermes_cli.model_switch.resolve_display_context_length_async", _no_context)
+    runner = _make_runner()
+    runner._evict_cached_agent = lambda session_key: None
+    captured = {}
+
+    async def confirm(**kwargs):
+        captured.update(kwargs)
+        return "Confirmation required"
+
+    runner._request_slash_confirm = confirm
+    reply = await runner._handle_model_command(_make_event("/model gpt-6-astra --session"))
+    if needs_confirmation:
+        assert "🚨" not in reply
+        assert runner._session_model_overrides == {}
+        cancelled = await captured["handler"]("cancel")
+        assert "🚨" not in cancelled
+        assert runner._session_model_overrides == {}
+        reply = await captured["handler"]("once")
+    assert reply.startswith("🚨 **PROVIDER AUTOMATICALLY CHANGED: openai-codex -> openrouter**")
+    assert runner._session_model_overrides
+
+
+async def _no_context(*args, **kwargs):
+    return None

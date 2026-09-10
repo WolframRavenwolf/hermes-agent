@@ -3637,6 +3637,17 @@ def detect_provider_for_model(
     if _model_in_provider_catalog(name.lower(), _provider_keys(current_provider)):
         return None
 
+    # Consult the active provider's live catalog before the aggregator fallback.
+    # New subscription models can be missing from the static catalog while
+    # already appearing on OpenRouter (upstream PR #97487).
+    try:
+        live_ids = provider_model_ids(current_provider)
+        live_lower = {_strip_ollama_cloud_suffix(m.lower()) for m in live_ids}
+        if name.lower() in live_lower:
+            return None
+    except Exception:
+        pass  # Preserve existing detection when the live catalog is unavailable.
+
     # --- Step 2: check OpenRouter catalog ---
     # First try exact match (handles provider/model format)
     or_slug = _find_openrouter_slug(name)

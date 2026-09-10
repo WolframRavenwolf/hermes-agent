@@ -159,3 +159,29 @@ def test_confirm_stays_synchronous_without_app(monkeypatch):
     assert called_on.get("is_main") is True
     assert stub.model == "claude-sonnet-4.6"
     assert stub.provider == "anthropic"
+
+
+def test_provider_warning_is_red_bold_and_precedes_success(monkeypatch):
+    printed = []
+    cli_mod = _patch_deps(monkeypatch, printed)
+    stub = _StubCLI()
+    result = _make_result()
+    result.provider_switch_warning = "PROVIDER AUTOMATICALLY CHANGED: openrouter -> anthropic"
+    cli_mod.HermesCLI._confirm_and_apply_cli_model_switch(stub, result, False, False)
+    warning_index = next((i for i, text in enumerate(printed) if "🚨" in text), None)
+    assert warning_index is not None
+    assert "\033[1;31m" in printed[warning_index]
+    assert "\033[0m" in printed[warning_index]
+    assert warning_index < next(i for i, text in enumerate(printed) if "Model switched:" in text)
+
+
+def test_cancelled_switch_never_prints_provider_changed(monkeypatch):
+    printed = []
+    cli_mod = _patch_deps(monkeypatch, printed)
+    stub = _StubCLI()
+    stub._confirm_expensive_model_switch = lambda result: False
+    result = _make_result()
+    result.provider_switch_warning = "PROVIDER AUTOMATICALLY CHANGED: openrouter -> anthropic"
+    cli_mod.HermesCLI._confirm_and_apply_cli_model_switch(stub, result, False, False)
+    assert not any("🚨" in text or "PROVIDER AUTOMATICALLY" in text for text in printed)
+    assert stub.provider == "openrouter"

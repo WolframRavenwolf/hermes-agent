@@ -1,9 +1,11 @@
 import { QueryClient } from '@tanstack/react-query'
-import { act, cleanup, render, renderHook, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, renderHook, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { NotificationStack } from '@/components/notifications'
 import { getGlobalModelInfo } from '@/hermes'
 import { modelOptionsQueryKey } from '@/lib/model-options'
+import { $notifications, clearNotifications } from '@/store/notifications'
 import { $activeGatewayProfile } from '@/store/profile'
 import {
   $activeSessionId,
@@ -21,9 +23,6 @@ import { deferred } from '../../../test/deferred'
 import { useModelControls } from './use-model-controls'
 
 const setGlobalModel = vi.fn()
-const notify = vi.fn()
-const notifyError = vi.fn()
-const dismissNotification = vi.fn()
 
 vi.mock('@/hermes', () => ({
   getGlobalModelInfo: vi.fn(),
@@ -48,15 +47,13 @@ vi.mock('@/i18n', () => ({
       },
       desktop: {
         modelSwitchFailed: 'Model switch failed'
+      },
+      notifications: {
+        region: 'Notifications',
+        dismiss: 'Dismiss'
       }
     }
   })
-}))
-
-vi.mock('@/store/notifications', () => ({
-  dismissNotification: (...args: Parameters<typeof dismissNotification>) => dismissNotification(...args),
-  notify: (...args: Parameters<typeof notify>) => notify(...args),
-  notifyError: (...args: Parameters<typeof notifyError>) => notifyError(...args)
 }))
 
 type Controls = ReturnType<typeof useModelControls>
@@ -80,6 +77,7 @@ function Harness({
 
 describe('useModelControls', () => {
   beforeEach(() => {
+    clearNotifications()
     $activeGatewayProfile.set('default')
     $activeSessionId.set(null)
     setCurrentModel('')
@@ -89,6 +87,7 @@ describe('useModelControls', () => {
 
   afterEach(() => {
     cleanup()
+    clearNotifications()
     vi.restoreAllMocks()
     $activeGatewayProfile.set('default')
     $activeSessionId.set(null)
@@ -292,7 +291,7 @@ describe('useModelControls', () => {
     expect($currentModel.get()).toBe('grok-4.5')
     expect($currentProvider.get()).toBe('xai')
     expect(invalidate).not.toHaveBeenCalled()
-    expect(notifyError).not.toHaveBeenCalled()
+    expect($notifications.get()).toEqual([])
   })
 
   it('still refetches after a switch that applied immediately', async () => {
@@ -306,6 +305,133 @@ describe('useModelControls', () => {
     await controls.selectModel({ model: 'grok-4.5', provider: 'xai' })
 
     expect(invalidate).toHaveBeenCalled()
+  })
+
+  it.each([undefined, 'tile-runtime'])('presents the complete immediate warning for session %s', async sessionId => {
+    $activeGatewayProfile.set('compass')
+    $activeSessionId.set('session-1')
+    setCurrentModel('old-model')
+    setCurrentProvider('xai')
+    const warning =
+      'Switching provider from the current session route to the explicitly selected provider.\n\n' +
+      'Catalog validation: <catalog-entry> could not be verified; the selected model may still work with this provider.'
+    const requestGateway = vi.fn().mockResolvedValue({ confirm_required: false, warning })
+    const queryClient = new QueryClient()
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
+    const { result } = renderHook(() => useModelControls({ queryClient, requestGateway }))
+    render(<NotificationStack />)
+
+    await act(async () => {
+      await expect(
+        result.current.selectModel({ model: 'grok-4.5', provider: 'xai', ...(sessionId ? { sessionId } : {}) })
+      ).resolves.toBe(true)
+    })
+
+    expect(requestGateway.mock.calls).toEqual([
+      [
+        'config.set',
+        {
+          session_id: sessionId ?? 'session-1',
+          key: 'model',
+          value: `grok-4.5 --provider xai ${sessionId ? '--session' : '--global'}`
+        }
+      ]
+    ])
+    expect($currentModel.get()).toBe(sessionId ? 'old-model' : 'grok-4.5')
+    expect($currentProvider.get()).toBe('xai')
+    expect(invalidate).toHaveBeenCalledExactlyOnceWith({
+      queryKey: modelOptionsQueryKey('compass', sessionId ?? 'session-1')
+    })
+    expect($notifications.get()).toEqual([expect.objectContaining({ kind: 'warning', message: warning })])
+    expect(screen.getAllByRole('status')).toHaveLength(1)
+    expect(screen.getByRole('status').querySelector('p')?.textContent).toBe(warning)
+    expect(screen.queryByRole('button', { name: 'Confirm' })).toBeNull()
+    expect(document.querySelector('catalog-entry')).toBeNull()
+  })
+
+  it.each([false, true])('presents the confirmed completion warning only when applied (deferred=%s)', async deferred => {
+    $activeSessionId.set('session-1')
+    setCurrentModel('old-model')
+    setCurrentProvider('old-provider')
+    const warning = 'Provider changed.\n\nCatalog validation could not verify the selected model.'
+    const requestGateway = vi
+      .fn()
+      .mockResolvedValueOnce({
+        confirm_required: true,
+        confirm_message: 'Confirm the guarded model.',
+        warning: 'This pending result is not a completed switch.'
+      })
+      .mockResolvedValueOnce({ deferred, warning })
+    const queryClient = new QueryClient()
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
+    const { result } = renderHook(() => useModelControls({ queryClient, requestGateway }))
+    render(<NotificationStack />)
+
+    await act(async () => {
+      await expect(result.current.selectModel({ model: 'grok-4.5', provider: 'xai' })).resolves.toBe(false)
+    })
+
+    expect($currentModel.get()).toBe('old-model')
+    expect($currentProvider.get()).toBe('old-provider')
+    expect(invalidate).not.toHaveBeenCalled()
+    expect($notifications.get()).toEqual([
+      expect.objectContaining({ kind: 'warning', message: 'Confirm the guarded model.' })
+    ])
+    expect(screen.getByRole('status').querySelector('p')?.textContent).toBe('Confirm the guarded model.')
+
+    // Click the real notification action so its dismissal and the shared
+    // confirmation owner both run before the completion warning is rendered.
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Confirm' }))
+    })
+
+    const params = { session_id: 'session-1', key: 'model', value: 'grok-4.5 --provider xai --global' }
+    expect(requestGateway.mock.calls).toEqual([
+      ['config.set', params],
+      ['config.set', { ...params, confirm_expensive_model: true }]
+    ])
+    expect($currentModel.get()).toBe('grok-4.5')
+    expect($currentProvider.get()).toBe('xai')
+    expect(screen.queryByRole('button', { name: 'Confirm' })).toBeNull()
+
+    if (deferred) {
+      expect(invalidate).not.toHaveBeenCalled()
+      expect($notifications.get()).toEqual([])
+      expect(screen.queryByRole('status')).toBeNull()
+    } else {
+      expect(invalidate).toHaveBeenCalledExactlyOnceWith({ queryKey: modelOptionsQueryKey('default', 'session-1') })
+      expect($notifications.get()).toEqual([expect.objectContaining({ kind: 'warning', message: warning })])
+      expect(screen.getAllByRole('status')).toHaveLength(1)
+      expect(screen.getByRole('status').querySelector('p')?.textContent).toBe(warning)
+    }
+  })
+
+  it.each([
+    { label: 'absent result', response: undefined },
+    { label: 'absent warning', response: {} },
+    { label: 'empty warning', response: { warning: '' } },
+    { label: 'blank warning', response: { warning: ' \n ' } },
+    { label: 'queued warning', response: { deferred: true, warning: 'Shown by the queued application event.' } }
+  ])('does not present an immediate notification for $label', async ({ response }) => {
+    $activeSessionId.set('session-1')
+    const requestGateway = vi.fn().mockResolvedValue(response)
+    const queryClient = new QueryClient()
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
+    const { result } = renderHook(() => useModelControls({ queryClient, requestGateway }))
+    render(<NotificationStack />)
+
+    await act(async () => {
+      await expect(result.current.selectModel({ model: 'grok-4.5', provider: 'xai' })).resolves.toBe(true)
+    })
+
+    expect(requestGateway.mock.calls).toEqual([
+      ['config.set', { session_id: 'session-1', key: 'model', value: 'grok-4.5 --provider xai --global' }]
+    ])
+    expect($currentModel.get()).toBe('grok-4.5')
+    expect($currentProvider.get()).toBe('xai')
+    expect(invalidate).toHaveBeenCalledTimes(response?.deferred ? 0 : 1)
+    expect($notifications.get()).toEqual([])
+    expect(screen.queryByRole('status')).toBeNull()
   })
 
   it('confirms a guarded model switch before retrying it', async () => {
@@ -333,15 +459,15 @@ describe('useModelControls', () => {
 
     expect($currentModel.get()).toBe('gpt-5.6-sol')
     expect($currentProvider.get()).toBe('openai-codex')
-    expect(notify).toHaveBeenCalledWith(
+    expect($notifications.get()).toEqual([
       expect.objectContaining({
         action: expect.objectContaining({ label: 'Confirm' }),
         kind: 'warning',
         message: 'This contributor model trains on your data.'
       })
-    )
+    ])
 
-    const action = notify.mock.calls.at(-1)?.[0]?.action
+    const action = $notifications.get()[0]?.action
 
     await act(async () => {
       await action?.onClick()
@@ -378,7 +504,7 @@ describe('useModelControls', () => {
 
     expect($currentModel.get()).toBe('grok-4.5')
     expect($currentProvider.get()).toBe('xai')
-    expect(notifyError).not.toHaveBeenCalled()
+    expect($notifications.get()).toEqual([])
   })
 
   it('still rolls back and reports a real switch failure', async () => {
@@ -398,7 +524,7 @@ describe('useModelControls', () => {
 
     expect($currentModel.get()).toBe('fable-5')
     expect($currentProvider.get()).toBe('nous')
-    expect(notifyError).toHaveBeenCalled()
+    expect($notifications.get()).toEqual([expect.objectContaining({ kind: 'error', message: 'no such model' })])
   })
 
   it('session-scopes MoA preset selections so they cannot persist as the global gateway default', async () => {

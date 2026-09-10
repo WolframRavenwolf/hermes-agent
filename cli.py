@@ -12190,6 +12190,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         # Display confirmation with full metadata
         provider_label = result.provider_label or result.target_provider
+        if result.provider_switch_warning:
+            _cprint(f"\033[1;31m  🚨 {result.provider_switch_warning}\033[0m")
         _cprint(f"  ✓ Model switched: {_display_new}")
         _cprint(f"    Provider: {provider_label}")
 
