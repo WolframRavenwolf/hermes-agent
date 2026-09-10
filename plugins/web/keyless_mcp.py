@@ -431,6 +431,7 @@ def exa_extract_keyless(urls: List[str]) -> List[Dict[str, Any]]:
                 "title": title,
                 "content": text,
                 "raw_content": text,
+                "final_url": None,
                 "metadata": {"sourceURL": url, "title": title},
             }
         )
@@ -485,6 +486,7 @@ def firecrawl_extract_keyless(urls: List[str]) -> List[Dict[str, Any]]:
             results.append(
                 {
                     "url": url,
+                    "final_url": metadata.get("sourceURL") or None,
                     "title": title,
                     "content": content,
                     "raw_content": content,
@@ -596,6 +598,7 @@ def keenable_extract_keyless(urls: List[str]) -> List[Dict[str, Any]]:
             results.append(
                 {
                     "url": data.get("url") or url,
+                    "final_url": data.get("url") or None,
                     "title": title,
                     "content": content,
                     "raw_content": content,

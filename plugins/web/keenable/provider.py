@@ -178,6 +178,7 @@ class KeenableWebSearchProvider(WebSearchProvider):
                     results.append(
                         {
                             "url": data.get("url") or url,
+                            "final_url": data.get("url") or None,
                             "title": title,
                             "content": content,
                             "raw_content": content,

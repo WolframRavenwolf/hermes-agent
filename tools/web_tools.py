@@ -15,6 +15,7 @@ Backend compatibility:
 - Exa: https://exa.ai (search, extract)
 - Firecrawl: https://docs.firecrawl.dev/introduction (search, extract; direct or derived firecrawl-gateway.<domain> for Nous Subscribers)
 - Parallel: https://docs.parallel.ai (search, extract)
+- Tavily: https://tavily.com (search, extract; keyed or opt-in keyless)
 
 LLM Processing:
 - Uses OpenRouter API with Gemini 3 Flash Preview for intelligent content extraction
@@ -56,6 +57,13 @@ from plugins.web.firecrawl.provider import (
     _get_firecrawl_gateway_url,
     _is_tool_gateway_ready,
     check_firecrawl_api_key,
+)
+# Tavily helpers re-exported for backward-compat with existing unit tests
+# (tests/tools/test_web_tools_tavily.py imports these names directly).
+from plugins.web.tavily.provider import (  # noqa: F401 — backward-compat names
+    _normalize_tavily_documents,
+    _normalize_tavily_search_results,
+    _tavily_request,
 )
 # Parallel + Exa clients re-exported for backward-compat with existing
 # unit tests (tests/tools/test_web_tools_config.py imports _get_parallel_client
@@ -161,7 +169,7 @@ def _load_web_config() -> dict:
 # WebSearchProvider. Keep the two sets aligned by hand: if xai ever ships as
 # a registered provider, drop it here so the registry path takes over.
 _LEGACY_WEB_BACKENDS = frozenset(
-    {"parallel", "firecrawl", "exa", "searxng", "brave-free", "ddgs", "xai", "keenable"}
+    {"parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs", "xai", "keenable"}
 )
 
 
@@ -244,13 +252,14 @@ def _get_backend() -> str:
         return "firecrawl"
 
     # Never-configured install — pick the highest-priority available
-    # backend. Explicit user credentials (EXA_API_KEY etc.)
+    # backend. Explicit user credentials (TAVILY_API_KEY etc.)
     # beat the managed-tool-gateway probe so a deliberate setup is not
     # pre-empted by a Nous OAuth token whose subscription tier may not
     # actually grant web-search access (the gateway then fails at runtime
     # with "no subscription" and the tool returns an error to the agent
     # without falling back). Free-tier backends trail the paid ones.
     backend_candidates = (
+        ("tavily", _has_env("TAVILY_API_KEY")),
         ("exa", _has_env("EXA_API_KEY")),
         ("parallel", _has_env("PARALLEL_API_KEY")),
         ("keenable", _has_env("KEENABLE_API_KEY")),
@@ -350,6 +359,13 @@ def _get_capability_backend(capability: str) -> str:
     return _get_backend()
 
 
+def _tavily_explicitly_configured() -> bool:
+    cfg = _load_web_config()
+    return any(
+        (cfg.get(key) or "").lower().strip() == "tavily"
+        for key in ("backend", "search_backend", "extract_backend")
+    )
+
 
 def _is_backend_available(backend: str) -> bool:
     """Return True when the selected backend is currently usable.
@@ -376,6 +392,8 @@ def _is_backend_available(backend: str) -> bool:
         return _has_env("KEENABLE_API_KEY")
     if backend == "firecrawl":
         return check_firecrawl_api_key()
+    if backend == "tavily":
+        return _has_env("TAVILY_API_KEY") or _tavily_explicitly_configured()
     if backend == "searxng":
         return _has_env("SEARXNG_URL")
     if backend == "brave-free":
@@ -585,6 +603,7 @@ def _web_requires_env() -> list[str]:
     return [
         "EXA_API_KEY",
         "PARALLEL_API_KEY",
+        "TAVILY_API_KEY",
         "KEENABLE_API_KEY",
         "FIRECRAWL_API_KEY",
         "FIRECRAWL_API_URL",
@@ -595,10 +614,11 @@ def _web_requires_env() -> list[str]:
     ]
 
 
-# ─── Parallel / Firecrawl helpers — moved into plugins ───────────────────────
+# ─── Parallel / Tavily / Firecrawl helpers — moved into plugins ──────────────
 # After PR #25182, the per-vendor client construction, request helpers, and
 # response normalizers all live in plugins.web.<vendor>.provider:
 #   - parallel: plugins/web/parallel/provider.py
+#   - tavily:   plugins/web/tavily/provider.py
 #   - firecrawl: plugins/web/firecrawl/provider.py
 # The names from the firecrawl plugin (Firecrawl proxy, _get_firecrawl_client,
 # _to_plain_object, _normalize_result_list, _extract_web_search_results,
@@ -790,7 +810,7 @@ def _ensure_web_plugins_loaded() -> None:
     """Idempotently trigger plugin discovery so the web registry is populated.
 
     Every bundled web provider (brave-free, ddgs, searxng, exa, parallel,
-    firecrawl, keenable) registers itself via ``plugins/web/<vendor>/__init__.py``
+    tavily, firecrawl, keenable) registers itself via ``plugins/web/<vendor>/__init__.py``
     during plugin discovery. Tool dispatch can be reached from contexts that
     haven't already triggered discovery — subprocess agent runs, delegate
     children, standalone scripts, certain test paths — and without it the
@@ -871,9 +891,9 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         if is_interrupted():
             return tool_error("Interrupted", success=False)
 
-        # Dispatch through the web search registry. All 7 providers
-        # (brave-free, ddgs, searxng, exa, parallel, firecrawl, keenable)
-        # now live as plugins; the dispatcher is just a registry lookup +
+        # Dispatch through the web search registry. All bundled providers
+        # (brave-free, ddgs, searxng, exa, parallel, tavily, firecrawl,
+        # keenable) now live as plugins; the dispatcher is just a registry lookup +
         # delegation. Sync only — every provider's search() is sync.
         _ensure_web_plugins_loaded()
         from agent.web_search_registry import (
@@ -1025,6 +1045,123 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         return tool_error(error_msg)
 
 
+def _result_entry(url: str, error: Optional[str]) -> Dict[str, Any]:
+    return {"url": url, "title": "", "content": "", "error": error}
+
+
+def _raw_userinfo(url: str) -> str:
+    """Keep authority credentials verbatim, even with a missing scheme or malformed host."""
+    authority = re.sub(r"^[A-Za-z][A-Za-z0-9+.-]*://", "", url).removeprefix("//")
+    userinfo, separator, _ = re.split(r"[/?#]", authority, maxsplit=1)[0].rpartition("@")
+    return userinfo + separator
+
+
+def _url_key(url: Any, *, loose: bool = False) -> str:
+    """Preserve userinfo, path and query; loose rewrites require unambiguous ownership."""
+    from urllib.parse import urlsplit
+    if not isinstance(url, str) or not url.strip():
+        return ""
+    raw = url.strip()
+    userinfo = _raw_userinfo(raw)
+    if userinfo and "://" not in raw and not raw.startswith("//"):
+        raw = "//" + raw
+    try:
+        parts = urlsplit(normalize_url_for_request(raw))
+        scheme, host, port = parts.scheme.lower(), (parts.hostname or "").lower(), parts.port
+    except ValueError:
+        return url.strip()
+    if port == {"http": 80, "https": 443}.get(scheme):
+        port = None
+    if loose and host.startswith("www."):
+        host = host[4:]
+    if ":" in host:
+        host = f"[{host}]"
+    prefix = "" if loose else f"{scheme}://"
+    query = f"?{parts.query}" if parts.query else ""
+    path = parts.path.rstrip("/") if loose else parts.path
+    if path == "/":
+        path = ""
+    return f"{prefix}{userinfo}{host}{f':{port}' if port else ''}{path}{query}"
+
+
+def _pair_results(urls: List[str], results: List[dict]) -> List[dict]:
+    """Pair by request identity, never provider position. Source ownership precedes
+    final aliases; exact matches precede unambiguous loose rewrites. Consume rows
+    immediately, sharing only with duplicate exact requests. A success can replace
+    an error for the same owner. One unknown successful redirect is accepted only
+    for an unmatched single-URL fetch.
+    """
+    request_keys = [_url_key(url) for url in urls]
+    exact_requests = set(request_keys)
+    loose_owners: Dict[str, set[str]] = {}
+    for url, key in zip(urls, request_keys):
+        loose_owners.setdefault(_url_key(url, loose=True), set()).add(key)
+    entries = [r for r in results if isinstance(r, dict)]
+    by_key: Dict[tuple, List[int]] = {}
+    for index, entry in enumerate(entries):
+        meta = entry.get("metadata")
+        source = meta.get("sourceURL") if isinstance(meta, dict) else None
+        source_matches = _url_key(source) in exact_requests or len(
+            loose_owners.get(_url_key(source, loose=True), ())
+        ) == 1
+        # Native per-request providers can distinguish request ownership from
+        # metadata.sourceURL, which may name a redirect destination.
+        owner_url = entry.get("requested_url") or (source if source_matches else entry.get("url"))
+        for loose in (False, True):
+            key = _url_key(owner_url, loose=loose)
+            if key:
+                by_key.setdefault((loose, key), []).append(index)
+    paired: Dict[str, dict] = {}
+    used: set[int] = set()
+    for loose in (False, True):
+        for url, exact_key in zip(urls, request_keys):
+            current = paired.get(exact_key)
+            if current is not None and not current.get("error"):
+                continue
+            key = _url_key(url, loose=loose)
+            if loose and len(loose_owners[key]) != 1:
+                continue
+            candidates = [i for i in by_key.get((loose, key), ()) if i not in used]
+            if not candidates:
+                continue
+            selected = entries[next((i for i in candidates if not entries[i].get("error")), candidates[0])]
+            if current is None or not selected.get("error"):
+                paired[exact_key] = selected
+            used.update(candidates)
+    leftover = [i for i in range(len(entries)) if i not in used]
+    if len(urls) == 1 and request_keys[0] not in paired and len(leftover) == 1 and not entries[leftover[0]].get("error"):
+        paired[request_keys[0]] = entries[leftover.pop()]
+    if leftover:
+        logger.warning("web_extract: dropping %d result(s) matching no requested URL", len(leftover))
+    return [paired.get(key) or _result_entry(url, "Extract backend returned no result for this URL")
+            for url, key in zip(urls, request_keys)]
+
+
+def _policy_refusal(url: str, *, requested_url: Optional[str] = None) -> Optional[dict]:
+    """Fresh content-free refusal from the native website policy loader."""
+    from tools.website_policy import check_website_access
+    blocked = check_website_access(url)
+    if blocked is None:
+        return None
+    return {
+        **_result_entry(requested_url or url, blocked["message"]),
+        "blocked_by_policy": {k: blocked[k] for k in ("host", "rule", "source")},
+    }
+
+
+def _pair_and_check_results(urls: List[str], results: List[dict]) -> List[dict]:
+    """Associate first, then remove blocked final content before cache, storage or output."""
+    paired = _pair_results(urls, results)
+    for position, (url, result) in enumerate(zip(urls, paired)):
+        # Explicit None means the normalizer had only request provenance.
+        final_url = result.get("final_url", result.get("url"))
+        if isinstance(final_url, str) and final_url:
+            refusal = _policy_refusal(final_url, requested_url=url)
+            if refusal is not None:
+                paired[position] = refusal
+    return paired
+
+
 async def web_extract_tool(
     urls: List[Any],
     format: str = None,
@@ -1034,7 +1171,7 @@ async def web_extract_tool(
     Extract content from specific web pages using available extraction API backend.
 
     Returns clean page content (markdown/text) with NO LLM summarization. The
-    extract backends (Firecrawl, Exa, Parallel, Keenable) already return clean,
+    extract backends (Firecrawl, Tavily, Exa, Parallel, Keenable) already return clean,
     boilerplate-stripped content, so we return it directly and fast. Pages over
     ``char_limit`` are head+tail truncated with an explicit footer; the full
     text is stored under cache/web and the footer tells the model how to
@@ -1101,6 +1238,9 @@ async def web_extract_tool(
                     "browser session when this access is explicitly required."
                 ),
             })
+        if _raw_userinfo(normalized_url) != _raw_userinfo(_url):
+            invalid_urls[index] = _result_entry(_url, "Invalid URL: normalization changes userinfo")
+            continue
         normalized_urls.append(normalized_url)
         normalized_indices.append(index)
 
@@ -1127,7 +1267,14 @@ async def web_extract_tool(
         safe_indices = []
         ssrf_blocked: Dict[int, Dict[str, Any]] = {}
         for index, url in zip(normalized_indices, normalized_urls):
-            if not await async_is_safe_url(url):
+            # Fixed refusal slots precede provider resolution and even DNS I/O.
+            try:
+                refusal = _policy_refusal(url)
+            except ValueError:
+                refusal = _result_entry(url, "Invalid URL: malformed authority")
+            if refusal is not None:
+                ssrf_blocked[index] = refusal
+            elif not await async_is_safe_url(url):
                 ssrf_blocked[index] = {
                     "url": url, "title": "", "content": "",
                     "error": "Blocked: URL targets a private or internal network address",
@@ -1136,16 +1283,23 @@ async def web_extract_tool(
                 safe_urls.append(url)
                 safe_indices.append(index)
 
+        def resolution_error(error: str) -> str:
+            fixed = {**invalid_urls, **ssrf_blocked}
+            if not fixed:
+                return json.dumps({"success": False, "error": error}, ensure_ascii=False)
+            fixed.update({index: _result_entry(url, error) for index, url in zip(safe_indices, safe_urls)})
+            return json.dumps({"results": [fixed[i] for i in range(len(urls))]}, ensure_ascii=False)
+
         # Dispatch only safe URLs to the configured backend
         if not safe_urls:
             results = []
         else:
             backend = _get_extract_backend()
 
-            # All seven providers (brave-free, ddgs, searxng, exa, parallel,
-            # firecrawl, keenable) now live as plugins. The dispatcher is a
+            # All bundled providers (brave-free, ddgs, searxng, exa, parallel,
+            # tavily, firecrawl, keenable) now live as plugins. The dispatcher is a
             # registry lookup + delegation. Some providers' extract() is
-            # async (parallel, firecrawl), others sync (exa, keenable) — we
+            # async (parallel, firecrawl), others sync (exa, tavily, keenable) — we
             # detect coroutine functions and await; sync functions run
             # inline (the policy gate, SSRF re-check, etc. live inside the
             # provider itself for the firecrawl per-URL loop).
@@ -1165,17 +1319,11 @@ async def web_extract_tool(
                 # isn't registered at all (typo / uninstalled plugin), fall
                 # through to the active-provider walk.
                 if provider is not None and not provider.supports_extract():
-                    return json.dumps(
-                        {
-                            "success": False,
-                            "error": (
-                                f"{provider.display_name} is a search-only "
-                                "backend and cannot extract URL content. "
-                                "Set web.extract_backend to firecrawl, "
-                                "keenable, exa, or parallel."
-                            ),
-                        },
-                        ensure_ascii=False,
+                    return resolution_error(
+                        f"{provider.display_name} is a search-only "
+                        "backend and cannot extract URL content. "
+                        "Set web.extract_backend to firecrawl, "
+                        "tavily, keenable, exa, or parallel."
                     )
                 from tools.tool_backend_helpers import (
                     selection_error,
@@ -1202,10 +1350,7 @@ async def web_extract_tool(
                             f"'{backend}'",
                             "no registered web extract provider has that name",
                         )
-                    return json.dumps(
-                        {"success": False, "error": error_text},
-                        ensure_ascii=False,
-                    )
+                    return resolution_error(error_text)
                 provider = get_active_extract_provider()
                 if provider is None:
                     # If the configured backend is a bundled web plugin the
@@ -1216,29 +1361,17 @@ async def web_extract_tool(
                     disabled_key = _disabled_web_plugin_for(capability="extract")
                     if disabled_key:
                         _vendor = disabled_key.split("/", 1)[-1]
-                        return json.dumps(
-                            {
-                                "success": False,
-                                "error": (
-                                    f"web.extract_backend is set to '{_vendor}', "
-                                    f"but its plugin ('{disabled_key}') is disabled "
-                                    "in config. Re-enable it with "
-                                    f"`hermes plugins enable {disabled_key}` "
-                                    "(or remove it from plugins.disabled)."
-                                ),
-                            },
-                            ensure_ascii=False,
+                        return resolution_error(
+                            f"web.extract_backend is set to '{_vendor}', "
+                            f"but its plugin ('{disabled_key}') is disabled "
+                            "in config. Re-enable it with "
+                            f"`hermes plugins enable {disabled_key}` "
+                            "(or remove it from plugins.disabled)."
                         )
-                    return json.dumps(
-                        {
-                            "success": False,
-                            "error": (
-                                "No web extract provider configured. "
-                                "Set web.extract_backend to firecrawl, "
-                                "keenable, exa, or parallel."
-                            ),
-                        },
-                        ensure_ascii=False,
+                    return resolution_error(
+                        "No web extract provider configured. "
+                        "Set web.extract_backend to firecrawl, "
+                        "tavily, keenable, exa, or parallel."
                     )
 
 
@@ -1248,28 +1381,22 @@ async def web_extract_tool(
             # AFTER the secret-URL gate, SSRF gate, provider resolution, and
             # strict-selection validation, and gated per-URL on the website
             # blocklist policy — a hit skips only the vendor call, never a
-            # control. Policy-blocked URLs are treated as cache misses so
-            # dispatch handles them exactly as it would without a cache.
+            # control. Policy-blocked URLs occupy fixed refusal slots.
             # Keys include the provider and format, so switching backends or
             # formats within the TTL never serves the other's content.
             from tools.web_result_cache import (
                 extract_cache_get as _extract_cache_get,
                 extract_cache_put as _extract_cache_put,
             )
-            from tools.website_policy import check_website_access as _check_site
             cached_results: Dict[int, Dict[str, Any]] = {}
             fetch_urls: List[str] = []
             fetch_positions: List[int] = []
             for position, url in enumerate(safe_urls):
-                hit = None
-                try:
-                    _policy_block = _check_site(url)
-                except Exception:  # noqa: BLE001 — policy errors fail open like dispatch
-                    _policy_block = None
-                if _policy_block is None:
-                    hit = _extract_cache_get(
-                        url, format=format, provider=provider.name
-                    )
+                refusal = _policy_refusal(url)
+                if refusal is not None:
+                    cached_results[position] = refusal
+                    continue
+                hit = _extract_cache_get(url, format=format, provider=provider.name)
                 if hit is not None:
                     cached_results[position] = hit
                 else:
@@ -1284,7 +1411,7 @@ async def web_extract_tool(
                 )
 
                 # Async-or-sync dispatch: parallel + firecrawl have async
-                # extract(); exa + keenable are sync.
+                # extract(); exa + tavily + keenable are sync.
                 import inspect
                 _extract_rescued = False
                 try:
@@ -1297,30 +1424,37 @@ async def web_extract_tool(
                             provider.extract, fetch_urls, format=format
                         )
                 except Exception as exc:  # noqa: BLE001 — candidate for rescue
+                    failed = [_result_entry(u, str(exc)) for u in fetch_urls]
                     if _rescue_eligible(provider):
                         _extract_rescued = True
-                        failed = [
-                            {"url": u, "title": "", "content": "", "error": str(exc)}
-                            for u in fetch_urls
-                        ]
-                        results = await asyncio.to_thread(
+                        rescued = await asyncio.to_thread(
                             _rescue_extract, provider.name, fetch_urls, failed
                         )
+                        results = _pair_and_check_results(fetch_urls, rescued)
                     else:
-                        raise
+                        results = failed
                 else:
+                    raw_results = results
+                    results = _pair_and_check_results(fetch_urls, raw_results)
                     # One-shot keyless rescue when the WHOLE batch failed
                     # (backend-level outage, not per-page problems). Stateless:
                     # the next web_extract call uses the chosen backend again.
                     if (
-                        results
-                        and all(r.get("error") for r in results)
+                        raw_results
+                        and all(r.get("error") for r in raw_results)
+                        and any(not _policy_blocked_result(r) for r in results)
                         and _rescue_eligible(provider)
                     ):
                         _extract_rescued = True
-                        results = await asyncio.to_thread(
-                            _rescue_extract, provider.name, fetch_urls, results
+                        # Pair only the rescued subset; never re-pair a preserved refusal.
+                        rescue_positions = [i for i, r in enumerate(results) if not _policy_blocked_result(r)]
+                        rescue_urls = [fetch_urls[i] for i in rescue_positions]
+                        failed = [results[i] for i in rescue_positions]
+                        rescued = await asyncio.to_thread(
+                            _rescue_extract, provider.name, rescue_urls, failed
                         )
+                        for position, result in zip(rescue_positions, _pair_and_check_results(rescue_urls, rescued)):
+                            results[position] = result
 
                 # Cache each successful fetch's full clean text for TTL reuse
                 # (best-effort; oversized pages are skipped by the cache).
@@ -1344,6 +1478,7 @@ async def web_extract_tool(
                                 title=fetched.get("title", ""),
                                 format=format,
                                 provider=provider.name,
+                                final_url=fetched.get("final_url", fetched.get("url")),
                             )
 
                 # Merge fetched results back with cache hits, restoring the
@@ -1366,8 +1501,7 @@ async def web_extract_tool(
                     results = merged
 
         # Reconstruct the original input order across invalid, blocked, and
-        # provider-processed entries. Providers are expected to preserve the
-        # order of the safe URL list they receive.
+        # provider-processed entries, already paired to the safe URL list.
         if invalid_urls or ssrf_blocked:
             safe_results = {
                 index: (
@@ -1568,6 +1702,11 @@ if __name__ == "__main__":
             print("   Using Exa API (https://exa.ai)")
         elif backend == "parallel":
             print("   Using Parallel API (https://parallel.ai)")
+        elif backend == "tavily":
+            if _has_env("TAVILY_API_KEY"):
+                print("   Using Tavily API (https://tavily.com)")
+            else:
+                print("   Using Tavily keyless (https://docs.tavily.com/documentation/keyless)")
         elif backend == "searxng":
             print(f"   Using SearXNG (search only): {_env_value('SEARXNG_URL')}")
         elif backend == "brave-free":
@@ -1585,7 +1724,7 @@ if __name__ == "__main__":
     else:
         print("❌ No web search backend configured")
         print(
-            "Set EXA_API_KEY, PARALLEL_API_KEY, KEENABLE_API_KEY, FIRECRAWL_API_KEY, FIRECRAWL_API_URL"
+            "Set EXA_API_KEY, PARALLEL_API_KEY, TAVILY_API_KEY, KEENABLE_API_KEY, FIRECRAWL_API_KEY, FIRECRAWL_API_URL"
             f"{_firecrawl_backend_help_suffix()}"
         )
 

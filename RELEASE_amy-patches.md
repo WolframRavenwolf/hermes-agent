@@ -345,3 +345,47 @@ rebuilds cached agent/request state when only its projected token limit changes.
 - **Verification:** the new live-schema-only regression fails with a missing `element_token` before the fix and passes afterward; the complete affected computer-use test set passes 133 tests.
 - **Removal:** drop this temporary patch after a controlled upgrade brings an equivalent upstream fix into the deployed base.
 - **Session reference:** live cua-driver 0.25.0 compatibility repair, 2026-09-10.
+
+### P33 - Restore Tavily web search and extraction - TEMP_BACKPORT
+
+- **Problem:** upstream 0.21.0 removed the complete Tavily backend while existing keyed installations retained `web.search_backend: tavily` and `web.extract_backend: tavily`; both tools failed with an unregistered-provider error.
+- **Solution:** backport [upstream PR #100552](https://github.com/NousResearch/hermes-agent/pull/100552), head `740071626fd24ccdb5cd3edc4de2ff9c414bd716`, as one downstream patch. Restore the bundled provider, credential/config/setup/status integration, and corresponding docs/tests. Existing keyed selection works again; opt-in keyless Tavily remains outside the unchanged four-provider free ring. No live configuration, credentials, billing route, or gateway lifecycle is changed by this patch.
+- **Provenance:** the Tavily restore and documentation commits `9117f663be82a2fa35d1f31a8733dc7696981579` and `fe90cc8e2f696cfaffffdccc04ab76cbe51e49eb` are preserved. The final reconciliation commit `740071626fd24ccdb5cd3edc4de2ff9c414bd716` changes a removed-backend warning registry introduced after our release base; that registry and its tests do not exist here, so only those two file changes are omitted. All other upstream file changes are applied unchanged except the two approved downstream extraction corrections and their regression tests described below.
+- **Downstream corrections:** Tavily extraction now filters the existing website policy before either keyed or opt-in keyless HTTP requests, preserves policy metadata on errors, and matches results by requested URL before the positional wrapper/cache receives them. Missing, shuffled, extra, failed, and duplicate results retain correct input slots. These corrections are provider-local; other providers and the shared dispatcher are unchanged. Open upstream overlap: [#96859](https://github.com/NousResearch/hermes-agent/pull/96859), [#97430](https://github.com/NousResearch/hermes-agent/pull/97430), and [#55938](https://github.com/NousResearch/hermes-agent/pull/55938). Coordinate any later submission with those existing efforts.
+- **Paths:** `plugins/web/tavily/`; `agent/web_search_{provider,registry}.py`; `tools/web_tools.py`; credential discovery/setup/status modules under `hermes_cli/`; related web-provider comments, test fixtures, regression tests, and web documentation. The commit manifest is authoritative for the complete file list.
+- **Verification:** four restored routing regressions fail before the backport; nine new extraction-contract cases fail before the downstream corrections. The same nine-file affected suite then passes 352 tests (10 skipped: four native-Windows cases and six first-release-badge cases); two Parallel SDK failures are deselected after identical reproduction on the untouched baseline. One dependency `audioop` deprecation warning remains. Changed Python files pass Ruff. The real wrapper/cache tests verify failure/success batches and later cache reads, shuffled/sparse/duplicate responses, keyed/keyless policy filtering, and transport errors. Fresh-process real keyed search and Example Domain extraction passed with rescue disabled; the documentation URL returned a page-specific Tavily fetch error. Live configuration and credentials are outside this patch.
+- **Removal:** after a separately approved upgrade, remove the upstream restore portion when its equivalent is in the deployed base. Retain these downstream ordering/policy corrections until equivalent fixes are also present and verified; the restore alone in upstream 0.21.1 does not satisfy that condition.
+- **Session reference:** owner-requested Tavily restore backport, 2026-09-10.
+
+
+## Ordered web extraction and cache provenance - review synchronization 2026-09-14
+
+- Problem: reordered provider rows could be cached under another requested URL;
+  blocked inputs could reach transport, and mismatched cache-body/index writes
+  could associate content with stale provenance.
+- Solution: pair request and source identities before reconstruction, reject
+  blocked input/final URLs, restrict rescue to eligible slots, and bind cached
+  text to its reported final URL using a content digest. Unknown provenance and
+  legacy or mismatched digests miss the cache. Native timeouts and Tavily's
+  stricter per-input filtering remain unchanged.
+- Files: `tools/web_tools.py`, `tools/web_result_cache.py`,
+  `plugins/web/firecrawl/provider.py`, `plugins/web/keenable/provider.py`,
+  `plugins/web/keyless_mcp.py`, `plugins/web/tavily/provider.py`,
+  `tests/tools/test_web_result_cache.py`,
+  `tests/tools/test_web_extract_native_parity.py`,
+  `tests/tools/test_website_policy.py`, and this ledger.
+- Validation: 249 affected tests passed in isolation. Two unchanged Parallel
+  client-construction tests remain blocked by the isolated SDK dependency gate;
+  no dependency installation or live provider request was used.
+- Redirect closure, 2026-09-15: direct Firecrawl results now retain their native
+  requested URL separately from the reported final URL. Pairing prefers this
+  explicit request owner, and unsafe-redirect refusals retain the original
+  request slot. SDK metadata, website rules, selection, timeouts and cache final
+  provenance remain intact. Native Firecrawl cases cover collision and
+  unrelated redirects in both input orders plus policy/SSRF refusals. The
+  final quality check additionally found an IPv6 key collision; preserving
+  hostname brackets separates address and port without changing default-port
+  equivalence. Its native provider/cache regression fails before that two-line
+  correction. The three-file cohort then passes 149 tests.
+- Implementation reference: ordered web extraction synchronization, 2026-09-14;
+  bounded Firecrawl request ownership and IPv6 authority normalization, 2026-09-15.

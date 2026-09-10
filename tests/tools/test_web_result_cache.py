@@ -7,9 +7,12 @@ slicing, single-flight coalescing, error non-caching, the disable flag, and
 extract index integrity (tamper = miss, oversized = not indexed).
 """
 
+import hashlib
 import json
 import threading
 import time
+from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -147,8 +150,8 @@ def test_single_flight_coalesces_concurrent_identical_queries():
 
 # ── extract cache ────────────────────────────────────────────────────────
 
-def test_extract_cache_roundtrip(_isolated_cache):
-    extract_cache_put("https://example.com/a", "hello world", title="T")
+def test_extract_cache_original_roundtrip(_isolated_cache):
+    extract_cache_put("https://example.com/a", "hello world", title="T", final_url="https://example.com/a")
     hit = extract_cache_get("https://example.com/a")
     assert hit is not None
     assert hit["content"] == "hello world"
@@ -156,14 +159,88 @@ def test_extract_cache_roundtrip(_isolated_cache):
     assert hit["cached"] is True
 
 
+@pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
+def test_extract_cache_roundtrip(_isolated_cache, newline):
+    content = f"héllo{newline}world{newline}"
+    canonical = "héllo\nworld\n"
+    extract_cache_put("https://example.com/a", content, title="T", final_url="https://example.com/a")
+    hit = extract_cache_get("https://example.com/a")
+    assert hit is not None
+    assert hit["content"] == canonical
+    assert hit["title"] == "T"
+    assert hit["cached"] is True
+    entry = next(iter(wrc._load_index().values()))
+    assert Path(entry["file"]).read_bytes() == canonical.encode("utf-8")
+    assert entry["content_sha256"] == hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+@pytest.mark.parametrize("digest", ["legacy", None, 42, "", "g" * 64, "0" * 64, {}])
+def test_extract_cache_missing_malformed_or_mismatched_digest_is_miss(digest):
+    url = "https://example.com/digest"
+    extract_cache_put(url, "body", final_url=url)
+    index = wrc._load_index()
+    entry = next(iter(index.values()))
+    if digest == "legacy":
+        entry.pop("content_sha256", None)
+    else:
+        entry["content_sha256"] = digest
+    wrc._save_index(index)
+    assert extract_cache_get(url) is None
+
+
+@pytest.mark.parametrize("replace_before_read", [False, True])
+def test_extract_cache_binds_single_read_to_policy_checked_entry(monkeypatch, replace_before_read):
+    from tools import website_policy
+    url, final_a, final_b = "https://example.com/start", "https://a.com/end", "https://b.com/end"
+    extract_cache_put(url, "body A", title="A", final_url=final_a)
+    index_a = wrc._load_index()
+    extract_cache_put(url, "body B", title="B", final_url=final_b)
+    index_b = wrc._load_index()
+    wrc._save_index(index_a)
+    body_path = Path(next(iter(index_a.values()))["file"])
+    body_path.write_text("body A", encoding="utf-8")
+    read = Path.read_text
+    body_reads = []
+
+    def replace():
+        body_path.write_text("body B", encoding="utf-8")
+        wrc._save_index(index_b)
+
+    def read_with_replacement(path, *args, **kwargs):
+        if path != body_path:
+            return read(path, *args, **kwargs)
+        body_reads.append(path)
+        if replace_before_read:
+            replace()
+        content = read(path, *args, **kwargs)
+        if not replace_before_read:
+            replace()
+        return content
+
+    load = Mock(wraps=wrc._load_index)
+    policy = Mock(wraps=website_policy.check_website_access)
+    monkeypatch.setattr(wrc, "_load_index", load)
+    monkeypatch.setattr(website_policy, "check_website_access", policy)
+    monkeypatch.setattr(Path, "read_text", read_with_replacement)
+    hit = extract_cache_get(url)
+    if replace_before_read:
+        assert hit is None
+    else:
+        assert hit is not None
+        assert (hit["url"], hit["final_url"], hit["title"], hit["content"]) == (final_a, final_a, "A", "body A")
+    assert body_reads == [body_path]
+    load.assert_called_once()
+    assert [call.args[0] for call in policy.call_args_list] == [url, final_a]
+
+
 def test_extract_cache_expired_entry_is_miss(monkeypatch, _isolated_cache):
-    extract_cache_put("https://e.com", "x")
+    extract_cache_put("https://e.com", "x", final_url="https://e.com")
     monkeypatch.setattr(wrc, "ttl_seconds", lambda: 0.0)
     assert extract_cache_get("https://e.com") is None
 
 
 def test_extract_cache_format_participates_in_key(_isolated_cache):
-    extract_cache_put("https://e.com", "md content", format="markdown")
+    extract_cache_put("https://e.com", "md content", format="markdown", final_url="https://e.com")
     assert extract_cache_get("https://e.com", format="html") is None
     assert extract_cache_get("https://e.com", format="markdown") is not None
 
@@ -172,8 +249,8 @@ def test_extract_cache_formats_do_not_overwrite_each_other(_isolated_cache):
     """Regression (#94618 review finding 3): html and markdown copies of one
     URL must be stored independently — the original implementation shared a
     URL-keyed backing file, so the later write clobbered the earlier one."""
-    extract_cache_put("https://e.com/page", "# MARKDOWN VERSION", format="markdown")
-    extract_cache_put("https://e.com/page", "<h1>HTML VERSION</h1>", format="html")
+    extract_cache_put("https://e.com/page", "# MARKDOWN VERSION", format="markdown", final_url="https://e.com/page")
+    extract_cache_put("https://e.com/page", "<h1>HTML VERSION</h1>", format="html", final_url="https://e.com/page")
     md = extract_cache_get("https://e.com/page", format="markdown")
     html = extract_cache_get("https://e.com/page", format="html")
     assert md is not None and md["content"] == "# MARKDOWN VERSION"
@@ -183,7 +260,7 @@ def test_extract_cache_formats_do_not_overwrite_each_other(_isolated_cache):
 def test_extract_cache_provider_participates_in_key(_isolated_cache):
     """Switching extract backends within the TTL must not serve the old
     backend's rendering (#94618 review, additional risk 3)."""
-    extract_cache_put("https://e.com/p", "firecrawl version", provider="firecrawl")
+    extract_cache_put("https://e.com/p", "firecrawl version", provider="firecrawl", final_url="https://e.com/p")
     assert extract_cache_get("https://e.com/p", provider="keenable") is None
     hit = extract_cache_get("https://e.com/p", provider="firecrawl")
     assert hit is not None and hit["content"] == "firecrawl version"
@@ -192,7 +269,7 @@ def test_extract_cache_provider_participates_in_key(_isolated_cache):
 def test_extract_cache_oversized_page_not_indexed(_isolated_cache):
     import tools.web_tools as wt
     big = "x" * (wt.MAX_STORED_TEXT_CHARS + 1)
-    extract_cache_put("https://big.com", big)
+    extract_cache_put("https://big.com", big, final_url="https://big.com")
     assert extract_cache_get("https://big.com") is None
 
 
@@ -212,7 +289,7 @@ def test_extract_cache_never_caches_local_dev_urls(url, _isolated_cache):
     """Local/private URLs are dev servers and chat-GUI artifact previews —
     they change on every save, so freshness beats dedup. Neither put nor
     get may touch the cache for them."""
-    extract_cache_put(url, "stale build output")
+    extract_cache_put(url, "stale build output", final_url=url)
     assert extract_cache_get(url) is None
 
 
@@ -221,7 +298,7 @@ def test_extract_cache_never_caches_local_dev_urls(url, _isolated_cache):
     "https://docs.python.org/3/",
 ])
 def test_extract_cache_public_urls_still_cache(url, _isolated_cache):
-    extract_cache_put(url, "public content")
+    extract_cache_put(url, "public content", final_url=url)
     hit = extract_cache_get(url)
     assert hit is not None and hit["content"] == "public content"
 
@@ -245,12 +322,12 @@ class TestCacheExemptHosts:
     def test_exempt_host_never_cached(self, monkeypatch, _isolated_cache,
                                       pattern, url):
         self._config(monkeypatch, [pattern])
-        extract_cache_put(url, "stale staging build")
+        extract_cache_put(url, "stale staging build", final_url=url)
         assert extract_cache_get(url) is None
 
     def test_non_matching_host_still_caches(self, monkeypatch, _isolated_cache):
         self._config(monkeypatch, ["mysite.vercel.app"])
-        extract_cache_put("https://docs.python.org/3/", "cached fine")
+        extract_cache_put("https://docs.python.org/3/", "cached fine", final_url="https://docs.python.org/3/")
         assert extract_cache_get("https://docs.python.org/3/") is not None
 
     def test_suffix_cannot_match_lookalike_domain(self, monkeypatch,
@@ -258,20 +335,20 @@ class TestCacheExemptHosts:
         """'mysite.dev' must not exempt 'evilmysite.dev' — suffix matching
         is label-boundary aware."""
         self._config(monkeypatch, ["mysite.dev"])
-        extract_cache_put("https://evilmysite.dev/x", "content")
+        extract_cache_put("https://evilmysite.dev/x", "content", final_url="https://evilmysite.dev/x")
         assert extract_cache_get("https://evilmysite.dev/x") is not None
 
     def test_garbage_config_fails_open_to_caching(self, monkeypatch,
                                                   _isolated_cache):
         self._config(monkeypatch, "not-a-list")
-        extract_cache_put("https://example.com/a", "content")
+        extract_cache_put("https://example.com/a", "content", final_url="https://example.com/a")
         assert extract_cache_get("https://example.com/a") is not None
 
     def test_exemption_applies_at_get_time_too(self, monkeypatch,
                                                _isolated_cache):
         """Adding an exemption mid-TTL takes effect immediately: an entry
         cached before the config change must not be served after it."""
-        extract_cache_put("https://mysite.vercel.app/p", "old build")
+        extract_cache_put("https://mysite.vercel.app/p", "old build", final_url="https://mysite.vercel.app/p")
         self._config(monkeypatch, ["mysite.vercel.app"])
         assert extract_cache_get("https://mysite.vercel.app/p") is None
 
@@ -283,7 +360,9 @@ def test_extract_cache_tampered_index_path_is_miss(_isolated_cache, tmp_path):
     index = {
         wrc._url_digest("https://evil.com", None): {
             "url": "https://evil.com",
+            "final_url": "https://evil.com",
             "file": str(outside),
+            "content_sha256": hashlib.sha256(b"secret").hexdigest(),
             "title": "",
             "fetched_at": time.time(),
         }
@@ -296,7 +375,9 @@ def test_extract_cache_missing_file_is_miss(_isolated_cache):
     index = {
         wrc._url_digest("https://gone.com", None): {
             "url": "https://gone.com",
+            "final_url": "https://gone.com",
             "file": str(_isolated_cache / "pruned.md"),
+            "content_sha256": hashlib.sha256(b"pruned body").hexdigest(),
             "title": "",
             "fetched_at": time.time(),
         }
@@ -311,7 +392,7 @@ def test_extract_cache_corrupt_index_is_empty(_isolated_cache):
 
 
 def test_extract_cache_disabled_by_config(monkeypatch, _isolated_cache):
-    extract_cache_put("https://e.com", "x")
+    extract_cache_put("https://e.com", "x", final_url="https://e.com")
     monkeypatch.setattr(wrc, "_web_config", lambda: {"cache_enabled": False})
     assert extract_cache_get("https://e.com") is None
 
@@ -320,13 +401,17 @@ def test_index_eviction_keeps_newest(monkeypatch, _isolated_cache):
     monkeypatch.setattr(wrc, "_INDEX_MAX_ENTRIES", 3)
     now = time.time()
     index = {
-        f"digest{i}": {"url": f"u{i}", "file": "f", "fetched_at": now + i}
+        f"digest{i}": {
+            "url": f"u{i}", "file": "f", "fetched_at": now + i, "final_url": f"https://e.com/{i}",
+            "content_sha256": hashlib.sha256(f"body{i}".encode()).hexdigest(),
+        }
         for i in range(6)
     }
     wrc._save_index(index)
     saved = json.loads((_isolated_cache / wrc._INDEX_FILENAME).read_text())
     assert len(saved) == 3
     assert set(saved) == {"digest3", "digest4", "digest5"}
+    assert wrc._load_index() == {key: index[key] for key in saved}
 
 
 def test_ttl_clamping(monkeypatch):
@@ -336,3 +421,27 @@ def test_ttl_clamping(monkeypatch):
     assert wrc.ttl_seconds() == 1440 * 60.0   # ceiling 24h
     monkeypatch.setattr(wrc, "_web_config", lambda: {"cache_ttl_minutes": "bogus"})
     assert wrc.ttl_seconds() == 20 * 60.0     # default on garbage
+
+
+@pytest.mark.parametrize("final_url", [None, "", 42])
+def test_unknown_final_provenance_is_never_written(_isolated_cache, final_url):
+    extract_cache_put("https://e.com/unknown", "unverified", final_url=final_url)
+    assert wrc._load_index() == {}
+    assert list(_isolated_cache.glob("*.cache.md")) == []
+
+
+def test_omitted_final_provenance_is_never_written(_isolated_cache):
+    extract_cache_put("https://e.com/unknown", "unverified")
+    assert wrc._load_index() == {}
+
+
+def test_redirect_roundtrip_retains_final_provenance(_isolated_cache):
+    extract_cache_put("https://e.com/start", "redirect body", final_url="https://other.com/end")
+    entry = next(iter(wrc._load_index().values()))
+    assert entry["url"] == "https://e.com/start"
+    assert entry["final_url"] == "https://other.com/end"
+    hit = extract_cache_get("https://e.com/start")
+    assert hit is not None
+    assert hit["url"] == "https://other.com/end"
+    assert hit["final_url"] == "https://other.com/end"
+    assert hit["content"] == "redirect body"

@@ -711,7 +711,8 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
                         metadata = {}
 
                 title = metadata.get("title", "")
-                final_url = metadata.get("sourceURL", url)
+                reported_final_url = metadata.get("sourceURL") or None
+                final_url = reported_final_url or url
 
                 # Re-check SSRF safety after any redirect reported by Firecrawl.
                 if not is_safe_url(final_url):
@@ -721,7 +722,8 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
                     )
                     results.append(
                         {
-                            "url": final_url,
+                            "url": url,
+                            "final_url": reported_final_url,
                             "title": title,
                             "content": "",
                             "raw_content": "",
@@ -743,8 +745,8 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
                     )
                     results.append(
                         {
-                            "url": final_url,
-                            "title": title,
+                            "url": url,
+                            "title": "",
                             "content": "",
                             "raw_content": "",
                             "error": final_blocked["message"],
@@ -766,10 +768,12 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
                 results.append(
                     {
                         "url": final_url,
+                        "requested_url": url,
                         "title": title,
                         "content": chosen_content,
                         "raw_content": chosen_content,
                         "metadata": metadata,
+                        "final_url": reported_final_url,
                     }
                 )
             except Exception as scrape_err:  # noqa: BLE001

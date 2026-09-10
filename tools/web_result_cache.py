@@ -356,10 +356,13 @@ def extract_cache_get(
     format: Optional[str] = None,
     provider: str = "",
 ) -> Optional[dict]:
-    """Return {'url','title','content'} for a fresh cached page, else None."""
+    """Return digest-bound text with known final provenance and allowed URLs, else None."""
+    from tools.website_policy import check_website_access
     if not cache_enabled():
         return None
     if _is_local_dev_url(url) or _is_cache_exempt_host(url):
+        return None
+    if check_website_access(url) is not None:
         return None
     with _index_lock:
         index = _load_index()
@@ -367,6 +370,14 @@ def extract_cache_get(
     if not entry:
         return None
     if (time.time() - float(entry.get("fetched_at", 0))) >= ttl_seconds():
+        return None
+    # Legacy/request-only entries cannot establish a redirect's current policy.
+    final_url = entry.get("final_url")
+    if not isinstance(final_url, str) or not final_url.strip():
+        return None
+    if _is_local_dev_url(final_url) or _is_cache_exempt_host(final_url):
+        return None
+    if check_website_access(final_url) is not None:
         return None
     try:
         file_path = Path(entry["file"])
@@ -376,11 +387,15 @@ def extract_cache_get(
         if cache_root is None or cache_root.resolve() not in file_path.resolve().parents:
             return None
         content = file_path.read_text(encoding="utf-8")
+        # Bind this single read to the entry whose final URL passed policy.
+        if entry.get("content_sha256") != hashlib.sha256(content.encode("utf-8")).hexdigest():
+            return None
     except Exception:  # noqa: BLE001 — evicted/pruned file == miss
         return None
     logger.info("web_extract cache hit: %s", url)
     return {
-        "url": url,
+        "url": final_url,
+        "final_url": final_url,
         "title": entry.get("title", ""),
         "content": content,
         "error": None,
@@ -394,6 +409,8 @@ def extract_cache_put(
     title: str = "",
     format: Optional[str] = None,
     provider: str = "",
+    *,
+    final_url: Optional[str] = None,
 ) -> None:
     """Store one successful extraction's full clean text for TTL reuse.
 
@@ -401,11 +418,19 @@ def extract_cache_put(
     ``_entry_file_path``) — never the URL-keyed truncate-store file, which
     different formats/providers would overwrite. Pages larger than the
     truncate-store ceiling are not cached: serving a capped copy back as if
-    whole would silently lose the tail.
+    whole would silently lose the tail. The caller must supply the reported
+    final URL; request fallback alone is not provenance.
     """
+    from tools.website_policy import check_website_access
+    if not isinstance(final_url, str) or not final_url.strip():
+        return
     if not cache_enabled() or not content:
         return
     if _is_local_dev_url(url) or _is_cache_exempt_host(url):
+        return
+    if _is_local_dev_url(final_url) or _is_cache_exempt_host(final_url):
+        return
+    if check_website_access(url) is not None or check_website_access(final_url) is not None:
         return
     try:
         from tools.web_tools import MAX_STORED_TEXT_CHARS
@@ -415,11 +440,16 @@ def extract_cache_put(
         if file_path is None:
             return
         from tools.spill_safety import write_text_exclusive
+        # read_text uses universal newlines; hash our text, never the shared file.
+        content = content.replace("\r\n", "\n").replace("\r", "\n")
+        content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
         write_text_exclusive(file_path, content, private=False, overwrite=True)
         with _index_lock:
             index = _load_index()
             index[_url_digest(url, format, provider)] = {
                 "url": url,
+                "final_url": final_url,
+                "content_sha256": content_sha256,
                 "file": str(file_path),
                 "title": title or "",
                 "fetched_at": time.time(),
