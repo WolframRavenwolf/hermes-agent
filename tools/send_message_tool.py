@@ -508,10 +508,13 @@ async def _send_chunks(chunks, send_one):
     return result
 
 
-def _platform_max_length(platform):
+def _platform_max_length(platform, pconfig=None):
     """Chunking limit: Signal's adapter constant (its raw JSON-RPC path bypasses the adapter's
     chunking), the registry's ``max_message_length`` for plugins, else None (no chunking)."""
     from gateway.config import Platform
+    if platform == Platform.MATTERMOST:
+        from plugins.platforms.mattermost.adapter import _resolve_max_post_length
+        return _resolve_max_post_length(getattr(pconfig, "extra", None))
     if platform == Platform.SIGNAL:
         try:
             from gateway.platforms.signal import MAX_MESSAGE_LENGTH
@@ -600,7 +603,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             pconfig.token, chat_id, message, media_files=media_files, thread_id=thread_id, force_document=force_document,
             disable_link_previews=bool(getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews")))
     from gateway.platforms.base import BasePlatformAdapter
-    max_len = _platform_max_length(platform)
+    max_len = _platform_max_length(platform, pconfig)
     chunks = BasePlatformAdapter.truncate_message(message, max_len) if max_len else [message]
     if platform_name == "discord" or (media_files and platform_name in _PLUGIN_STANDALONE_MEDIA):
         return await _send_plugin_standalone(platform_name, pconfig, chat_id, message, chunks, media_files,

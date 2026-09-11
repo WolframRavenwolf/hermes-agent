@@ -161,6 +161,28 @@ class TestEditMessageFinalizeSignature:
 class TestSendOrEditMediaStripping:
     """Verify _send_or_edit strips MEDIA: before sending to the platform."""
 
+    @pytest.mark.parametrize("cursor", [" ▉", "x" * 600])
+    @pytest.mark.asyncio
+    async def test_minimum_post_limit_includes_bounded_cursor(self, cursor):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.mattermost.adapter import MattermostAdapter
+        from gateway.stream_consumer import _Tick
+        adapter = MattermostAdapter(PlatformConfig(extra={"max_post_length": 500}))
+        # Keep this regression independent of Mattermost's config plumbing.
+        adapter.MAX_MESSAGE_LENGTH = 500
+        adapter._api_post = AsyncMock(return_value={"id": "ack"})
+        cfg = StreamConsumerConfig(cursor=cursor)
+        consumer = GatewayStreamConsumer(adapter, "channel", cfg)
+        consumer._len_fn, consumer._safe_limit = consumer._resolve_length_budget()
+        assert 0 < consumer._safe_limit <= 500 - len(consumer.cfg.cursor)
+        consumer._accumulated = "a" * consumer._safe_limit
+        await consumer._push_update(_Tick())
+        posts = [call.args[1]["message"] for call in adapter._api_post.await_args_list]
+        assert len(posts) == 1
+        assert len(posts[0]) <= 500
+        assert cfg.cursor == cursor
+
+
     @pytest.mark.asyncio
     async def test_first_send_strips_media(self):
         """Initial send removes MEDIA: tags from visible text."""

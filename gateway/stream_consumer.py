@@ -18,7 +18,7 @@ import secrets
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Optional
 
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
@@ -562,6 +562,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                     if not self._use_native_streaming and self._first_send_overflows():
                         if await self._split_first_send(tick):
                             return
+                        # Failed heads leave the buffer intact; yield so finish/cancel
+                        # can arrive instead of spinning on the same failed send.
+                        await asyncio.sleep(0.05)
                         continue
                     await self._seal_overflow_heads()
                     await self._push_update(tick)
@@ -596,7 +599,12 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         isinstance gate: MagicMock auto-attributes aren't callables; test doubles use len."""
         len_fn = (self.adapter.message_len_fn_for_chat(self.chat_id)
                   if isinstance(self.adapter, _BasePlatformAdapter) else len)
-        return len_fn, max(500, self._raw_message_limit() - len_fn(self.cfg.cursor) - 100)
+        raw_limit = self._raw_message_limit()
+        # A cursor is cosmetic: omit an oversized one rather than crowd out text.
+        # Copy the config because several consumers may share it.
+        if len_fn(self.cfg.cursor) >= max(1, raw_limit - 100):
+            self.cfg = replace(self.cfg, cursor="")
+        return len_fn, max(1, raw_limit - len_fn(self.cfg.cursor) - 100)
 
     async def _start_transports(self) -> None:
         """Resolve native/draft transport; native wins (adapters declaring it can't edit).
