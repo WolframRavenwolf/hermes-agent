@@ -2516,49 +2516,77 @@ class TestCodexAuxiliaryAdapterTimeout:
         assert fake_client.responses.kwargs["timeout"] == 12.5
         assert response.choices[0].message.content == "summary"
 
-    def test_enforces_total_timeout_while_stream_keeps_emitting_events(self):
-        closed = threading.Event()
+    def test_enforces_total_timeout_while_stream_keeps_emitting_events(self, monkeypatch):
+        import threading
 
-        class SlowAliveStream:
+        clock = SimpleNamespace(now=0.0)
+        emitted_events = []
+        started_timers = []
+        cancelled_timers = []
+        stream_close_threads = []
+        client_close_threads = []
+        owner_tid = threading.get_ident()
+
+        class _RecordingTimer:
+            def __init__(self, interval, function):
+                self.interval = interval
+                self.function = function
+
+            def start(self):
+                # Let the real per-event deadline check win without a watchdog thread.
+                started_timers.append(self)
+
+            def cancel(self):
+                cancelled_timers.append(self)
+
+        monkeypatch.setattr("agent.auxiliary_client.time.monotonic", lambda: clock.now)
+        monkeypatch.setattr("agent.auxiliary_client.threading.Timer", _RecordingTimer)
+
+        class _SlowAliveCreateStream:
             def __enter__(self):
                 return self
 
             def __exit__(self, exc_type, exc, tb):
+                self.close()
                 return False
 
             def __iter__(self):
-                # Keep emitting progress well past the requested timeout, but
-                # use short sleeps so the test exercises total-timeout behavior
-                # without depending on a narrow wall-clock margin under xdist.
-                for _ in range(100):
-                    time.sleep(0.005)
-                    yield SimpleNamespace(type="response.in_progress")
+                for _ in range(5):
+                    clock.now += 0.03
+                    event = SimpleNamespace(type="response.in_progress")
+                    emitted_events.append(event.type)
+                    yield event
+
+            def close(self):
+                stream_close_threads.append(threading.get_ident())
 
             def get_final_response(self):
-                return SimpleNamespace(
-                    output=[SimpleNamespace(
-                        type="message",
-                        content=[SimpleNamespace(type="output_text", text="late")],
-                    )],
-                    usage=None,
-                )
+                raise AssertionError("The stream deadline must interrupt iteration")
 
         class FakeResponses:
-            def stream(self, **kwargs):
-                return SlowAliveStream()
+            def create(self, **kwargs):
+                return _SlowAliveCreateStream()
 
-        fake_client = SimpleNamespace(responses=FakeResponses(), close=closed.set)
+            def stream(self, **kwargs):
+                return self.create(**kwargs)
+
+        fake_client = SimpleNamespace(
+            responses=FakeResponses(),
+            close=lambda: client_close_threads.append(threading.get_ident()),
+        )
         adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
 
-        started = time.monotonic()
         with pytest.raises(TimeoutError):
             adapter.create(
                 messages=[{"role": "user", "content": "summarize this"}],
                 timeout=0.05,
             )
 
-        assert closed.is_set()
-        assert time.monotonic() - started < 0.2
+        assert emitted_events == ["response.in_progress", "response.in_progress"]
+        assert stream_close_threads and all(tid == owner_tid for tid in stream_close_threads)
+        assert client_close_threads and all(tid == owner_tid for tid in client_close_threads)
+        assert started_timers
+        assert all(timer in cancelled_timers for timer in started_timers)
 
 
 # ---------------------------------------------------------------------------
