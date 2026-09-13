@@ -339,6 +339,8 @@ class MattermostAdapter(BasePlatformAdapter):
             return data
         if not (isinstance(metadata, dict) and metadata.get("notify")):
             return data
+        if metadata.get("mattermost_explicit_thread") or metadata.get("cron_attach"):
+            return data
         if data.get("_post_rejected"):
             body = str(data.get("_post_error") or "").lower()
             broken_root = data.get("_post_status") in {400, 404} and any(
@@ -391,7 +393,11 @@ class MattermostAdapter(BasePlatformAdapter):
             payloads = [{**payload, "message": self.format_message(chunk)} for chunk in source_chunks]
         confirmed = 0
         message_ids: List[str] = []
+        cron_attach = isinstance(metadata, dict) and metadata.get("cron_attach") is True
+        cron_root_id: Optional[str] = None
         for chunk_index, chunk_payload in enumerate(payloads):
+            if cron_attach and not payload.get("root_id") and cron_root_id:
+                chunk_payload["root_id"] = cron_root_id
             try:
                 data = await self._post_preserving_thread(chat_id, chunk_payload, metadata)
             except asyncio.CancelledError:
@@ -417,10 +423,24 @@ class MattermostAdapter(BasePlatformAdapter):
             if source_chunks is not None:
                 confirmed += len(source_chunks[chunk_index])
             message_ids.append(str(data["id"]))
+            if cron_attach and cron_root_id is None:
+                # Bind continuation to the accepted post's actual root.
+                cron_root_id = str(data.get("root_id") or data["id"])
 
         raw_response: Dict[str, Any] = {"message_ids": tuple(message_ids)}
         if source is not None:
             raw_response.update(source_confirmed_prefix=source, source_attempted_prefix=source)
+        if cron_attach:
+            raw_response["cron_root_id"] = cron_root_id
+            try:
+                channel = await self._api_get(f"channels/{chat_id}")
+                if channel.get("id") == str(chat_id) and channel.get("type") in _CHANNEL_TYPE_MAP:
+                    raw_response["cron_chat_type"] = _CHANNEL_TYPE_MAP[channel["type"]]
+                else:
+                    logger.warning("Mattermost: unverified channel type for cron receipt")
+            except Exception:
+                # Metadata lookup failure must not invalidate successful delivery.
+                logger.warning("Mattermost: could not resolve chat type for cron receipt")
         return SendResult(
             success=True,
             message_id=message_ids[-1],

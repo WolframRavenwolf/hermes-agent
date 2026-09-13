@@ -7563,6 +7563,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     )
             if not messages:
                 raise RuntimeError("Compression child handoff must not be empty")
+            self._stamp_compression_origins(conn, parent_session_id, messages)
             system_prompt_hash = self._store_system_prompt(conn, system_prompt)
 
             conn.execute(
@@ -7625,18 +7626,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 ).fetchall()
                 if tail_rows:
                     tail_ids = [int(r["id"]) for r in tail_rows]
-                    placeholders = ",".join("?" for _ in tail_ids)
                     clone_cols = [
                         c for c in self._message_column_names(conn)
                         if c not in ("id", "session_id", "active", "compacted")
                     ]
                     col_list = ", ".join(clone_cols)
-                    conn.execute(
-                        f"INSERT INTO messages ({col_list}, session_id, active, compacted) "
-                        f"SELECT {col_list}, ?, 1, 0 FROM messages "
-                        f"WHERE id IN ({placeholders}) ORDER BY id",
-                        [child_session_id, *tail_ids],
-                    )
+                    selected = ", ".join("?" if c == "display_metadata" else c for c in clone_cols)
+                    for row_id in tail_ids:
+                        row = conn.execute("SELECT display_metadata FROM messages WHERE id=?", (row_id,)).fetchone()
+                        meta = dict(self._decode_display_metadata(row[0]) or {})
+                        meta["_compression_origin"] = self._compression_origin(conn, parent_session_id, row_id)
+                        conn.execute(
+                            f"INSERT INTO messages ({col_list}, session_id, active, compacted) "
+                            f"SELECT {selected}, ?, 1, 0 FROM messages WHERE id=?",
+                            [self._encode_display_metadata(meta), child_session_id, row_id])
                     total_messages += len(tail_ids)
                     for r in tail_rows:
                         raw = r["tool_calls"]
@@ -7650,6 +7653,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
                 (total_messages, total_tool_calls, child_session_id),
             )
+            seed_end = conn.execute("SELECT MAX(id) FROM messages WHERE session_id=?",
+                                    (child_session_id,)).fetchone()[0]
+            child_config = dict(model_config or {})
+            child_config["_compression_seed"] = {"version": 1,
+                "parent_session_id": parent_session_id, "last_row_id": seed_end}
+            conn.execute("UPDATE sessions SET model_config=? WHERE id=?",
+                         (json.dumps(child_config), child_session_id))
             updated = conn.execute(
                 "UPDATE sessions SET ended_at = ?, end_reason = 'compression' "
                 "WHERE id = ? AND ended_at IS NULL",
@@ -12044,6 +12054,84 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return row[0] if row else None
 
+    _COMPRESSION_ORIGIN_LINEAGE_SQL = """
+        WITH RECURSIVE lineage(id, depth) AS (
+            SELECT ?, 0
+            UNION ALL
+            SELECT parent.id, lineage.depth + 1 FROM lineage
+            JOIN sessions child ON child.id = lineage.id
+            JOIN sessions parent ON parent.id = child.parent_session_id
+            WHERE parent.end_reason = 'compression' AND lineage.depth < 100
+              AND COALESCE(child.source, '') != 'tool'
+              AND CASE WHEN json_valid(child.model_config)
+                  THEN json_extract(child.model_config, '$._branched_from') END IS NULL
+              AND CASE WHEN json_valid(child.model_config)
+                  THEN json_extract(child.model_config, '$._delegate_from') END IS NULL
+              AND CASE WHEN json_valid(child.model_config)
+                  THEN json_extract(child.model_config, '$._reset_from') END IS NULL
+        )
+    """
+
+    def _compression_origin(self, conn, session_id, row_id):
+        """Resolve a native source row, never incoming metadata, in the publication txn."""
+        unknown = {"version": 1, "session_id": None, "row_id": None}
+        lineage = {r[0] for r in conn.execute(
+            self._COMPRESSION_ORIGIN_LINEAGE_SQL + "SELECT id FROM lineage", (session_id,))}
+        seen = set()
+        for _ in range(100):
+            if (session_id not in lineage or type(row_id) is not int
+                    or row_id <= 0 or (session_id, row_id) in seen):
+                return unknown
+            seen.add((session_id, row_id))
+            row = conn.execute("SELECT display_metadata FROM messages WHERE session_id=? AND id=?",
+                               (session_id, row_id)).fetchone()
+            if row is None:
+                return unknown
+            try:
+                meta = json.loads(row[0]) if row[0] is not None else {}
+            except (TypeError, ValueError):
+                return unknown
+            if not isinstance(meta, dict):
+                return unknown
+            if "_compression_origin" not in meta:
+                session = conn.execute("SELECT parent_session_id, model_config FROM sessions WHERE id=?",
+                                       (session_id,)).fetchone()
+                parent = conn.execute("SELECT end_reason FROM sessions WHERE id=?",
+                                      (session[0],)).fetchone() if session else None
+                if parent and parent[0] == "compression":
+                    try:
+                        config = json.loads(session[1]) if session[1] else {}
+                        seed = config.get("_compression_seed")
+                    except (TypeError, ValueError, AttributeError):
+                        return unknown
+                    if (not isinstance(seed, dict) or type(seed.get("version")) is not int
+                            or seed["version"] != 1 or seed.get("parent_session_id") != session[0]
+                            or type(seed.get("last_row_id")) is not int
+                            or not 0 < seed["last_row_id"] < row_id):
+                        return unknown
+                return {"version": 1, "session_id": session_id, "row_id": row_id}
+            origin = meta["_compression_origin"]
+            if (not isinstance(origin, dict) or set(origin) != {"version", "session_id", "row_id"}
+                    or type(origin.get("version")) is not int or origin["version"] != 1
+                    or not isinstance(origin.get("session_id"), str)
+                    or type(origin.get("row_id")) is not int or not 0 < origin["row_id"] < row_id):
+                return unknown
+            session_id, row_id = origin["session_id"], origin["row_id"]
+        return unknown
+
+    def _stamp_compression_origins(self, conn, session_id, messages):
+        """Stamp all handoff rows before insertion overwrites their native row IDs."""
+        for message in messages:
+            row_id = message.get("_row_id")
+            visible = type(row_id) is int and 0 < row_id <= 9223372036854775807 and conn.execute(
+                "SELECT 1 FROM messages WHERE session_id=? AND id=? AND (active=1 OR compacted=1)",
+                (session_id, row_id)).fetchone()
+            origin = self._compression_origin(conn, session_id, row_id) if visible else {
+                "version": 1, "session_id": None, "row_id": None}
+            meta = dict(self._decode_display_metadata(message.get("display_metadata")) or {})
+            meta["_compression_origin"] = origin
+            message["display_metadata"] = meta
+
     def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
         """Insert *messages* as fresh active rows for *session_id*.
 
@@ -12353,6 +12441,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         "commit; refusing to publish a stale compaction"
                     )
 
+            self._stamp_compression_origins(conn, session_id, compacted_messages)
             patched_model_config = None
             if model_config_patch is not None:
                 # on_missing="raise": a prune/compaction must not commit
@@ -12451,18 +12540,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # Re-sequence the concurrent tail after the compacted set via
                 # a pure-SQL column clone: no decode/re-encode round trip, no
                 # field drift — new id, active=1, compacted=0, all else exact.
-                placeholders = ",".join("?" for _ in tail_ids)
                 clone_cols = [
                     c for c in self._message_column_names(conn)
                     if c not in ("id", "active", "compacted")
                 ]
                 col_list = ", ".join(clone_cols)
-                conn.execute(
-                    f"INSERT INTO messages ({col_list}, active, compacted) "
-                    f"SELECT {col_list}, 1, 0 FROM messages "
-                    f"WHERE id IN ({placeholders}) ORDER BY id",
-                    tail_ids,
-                )
+                selected = ", ".join("?" if c == "display_metadata" else c for c in clone_cols)
+                for row_id in tail_ids:
+                    row = conn.execute("SELECT display_metadata FROM messages WHERE id=?", (row_id,)).fetchone()
+                    meta = dict(self._decode_display_metadata(row[0]) or {})
+                    meta["_compression_origin"] = self._compression_origin(conn, session_id, row_id)
+                    conn.execute(
+                        f"INSERT INTO messages ({col_list}, active, compacted) "
+                        f"SELECT {selected}, 1, 0 FROM messages WHERE id=?",
+                        [self._encode_display_metadata(meta), row_id])
                 inserted += len(tail_ids)
                 tool_calls_total += tail_tool_calls
 
@@ -12672,6 +12763,78 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
             result.append(msg)
         return result
+
+    def get_context_messages(
+        self, session_id: str, *, limit: int = 100, after_id: int = 0,
+        matching_content: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Read at most 100 original text rows (16 KiB each), via visible carriers.
+
+        Compression metadata is producer-authored and flattened. Unknown copies
+        and legacy child seeds fail closed; carrier text is never exported.
+        """
+        limit = max(0, min(int(limit), 100))
+        safe_meta = "CASE WHEN json_valid(m.display_metadata) THEN m.display_metadata ELSE 'null' END"
+        original_meta = "CASE WHEN json_valid(o.display_metadata) THEN o.display_metadata ELSE 'null' END"
+        config = "CASE WHEN json_valid(s.model_config) THEN s.model_config ELSE '{}' END"
+        match_clause = " AND o.content = ? AND o.role = 'user'" if matching_content is not None else ""
+        params = [session_id, session_id, int(after_id), self._CONTENT_JSON_PREFIX.encode("utf-8")]
+        if matching_content is not None:
+            params.append(matching_content)
+        params.append(limit)
+        sql = self._COMPRESSION_ORIGIN_LINEAGE_SQL + f""",
+            carriers AS (
+                SELECT m.id, m.session_id, {safe_meta} AS meta,
+                       m.display_metadata IS NULL AS unmarked_null
+                FROM messages m WHERE m.session_id=? AND (m.active=1 OR m.compacted=1)
+            ), resolved AS (
+                SELECT id, CASE WHEN unmarked_null OR (json_type(meta)='object'
+                    AND json_type(meta, '$._compression_origin') IS NULL) THEN id
+                    WHEN json_type(meta, '$._compression_origin')='object'
+                      AND json_type(meta, '$._compression_origin.version')='integer'
+                      AND json_extract(meta, '$._compression_origin.version')=1
+                      AND json_type(meta, '$._compression_origin.row_id')='integer'
+                      AND json_extract(meta, '$._compression_origin.row_id')>0
+                      AND json_extract(meta, '$._compression_origin.row_id')<id
+                      AND json_type(meta, '$._compression_origin.session_id')='text'
+                      AND (SELECT COUNT(*) FROM json_each(meta, '$._compression_origin'))=3
+                    THEN json_extract(meta, '$._compression_origin.row_id') END AS origin_id,
+                    CASE WHEN json_type(meta, '$._compression_origin') IS NULL
+                        THEN session_id ELSE json_extract(meta, '$._compression_origin.session_id') END AS origin_session
+                FROM carriers
+            )
+            SELECT MAX(c.id) AS id, o.id AS origin_row_id, o.session_id AS origin_session_id,
+                o.timestamp, o.role, substr(CAST(o.content AS BLOB), 1, 16384) AS content,
+                substr(o.display_kind, 1, 128) AS display_kind
+            FROM resolved c JOIN messages o ON o.id=c.origin_id AND o.session_id=c.origin_session
+            JOIN sessions s ON s.id=o.session_id
+            WHERE o.session_id IN (SELECT id FROM lineage) AND o.id>?
+              AND (o.display_metadata IS NULL OR (json_type({original_meta})='object'
+                   AND json_type({original_meta}, '$._compression_origin') IS NULL))
+              AND (NOT EXISTS (SELECT 1 FROM sessions parent WHERE parent.id=s.parent_session_id
+                               AND parent.end_reason='compression')
+                   OR (json_type({config}, '$._compression_seed')='object'
+                       AND json_type({config}, '$._compression_seed.version')='integer'
+                       AND json_extract({config}, '$._compression_seed.version')=1
+                       AND json_type({config}, '$._compression_seed.last_row_id')='integer'
+                       AND json_extract({config}, '$._compression_seed.last_row_id')>0
+                       AND o.id>json_extract({config}, '$._compression_seed.last_row_id')
+                       AND json_extract({config}, '$._compression_seed.parent_session_id')=s.parent_session_id))
+              AND o.role IN ('user', 'assistant') AND COALESCE(o._compressed_summary, 0)=0
+              AND COALESCE(o.tool_calls, '') IN ('', '[]')
+              AND COALESCE(o.tool_call_id, '')='' AND COALESCE(o.tool_name, '')=''
+              AND (o.role='user' OR o.finish_reason IS NULL OR o.finish_reason='stop')
+              AND COALESCE(o.display_kind, '') NOT IN
+                  ('hidden', 'context_summary', 'model_switch', 'personality_switch',
+                   'async_delegation_complete', 'auto_continue', 'internal_notification')
+              AND typeof(o.content)='text' AND substr(CAST(o.content AS BLOB), 1, 6)!=?
+              {match_clause}
+            GROUP BY o.id ORDER BY o.id DESC LIMIT ?
+        """
+        with self._read_ctx() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [dict(row, content=row["content"].decode("utf-8", errors="ignore"))
+                for row in reversed(rows)]
 
     def find_pr_url_messages(self, session_ids: List[str]) -> List[Dict[str, Any]]:
         """Tool results in these sessions that mention a GitHub PR url.

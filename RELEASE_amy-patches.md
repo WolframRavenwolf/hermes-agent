@@ -1,5 +1,55 @@
 # Amy's Patches — Stable 0.21 Ledger
 
+## Cron final-output and conversation continuity - 2026-09-13
+
+- Problem: chained runs read the beginning of nested log artifacts instead of
+  final answers, and Mattermost report roots did not seed the incoming reply
+  session. Attachment alone did not provide subsequent replies to later runs.
+- Solution: store final text and verified session anchors alongside run logs;
+  load bounded discussion from selected jobs' report conversations; return and
+  seed Mattermost's actual first-post root and channel type. Preserve explicit
+  roots and Telegram private-DM delivery. Newly created jobs snapshot an enabled
+  mirror default while explicit false and broadcast boundaries remain intact.
+- Files: `cron/context.py`, `cron/jobs.py`, `cron/scheduler.py`,
+  `hermes_state.py`, `plugins/platforms/mattermost/adapter.py`,
+  `tests/cron/test_conversation_context.py`,
+  `tests/cron/test_conversation_defaults.py`,
+  `tests/cron/test_mattermost_conversation_delivery.py`,
+  `tests/cron/test_discussion_identity.py`,
+  `tests/gateway/test_mattermost_cron_roots.py`,
+  `website/docs/user-guide/features/cron.md`, this ledger.
+- Validation: isolated regression tests cover final-only output, real SQLite
+  reply visibility, compression lineage and exclusion boundaries, exact
+  Mattermost reply keys/chunk roots, default overrides and Telegram DM routing.
+  Runtime activation requires a separately approved gateway restart.
+- Implementation reference: cron conversation continuity, 2026-09-13.
+- Review synchronization, 2026-09-14: preserve complete bounded legacy reports
+  with ambiguous Response headings, skip oversized ambiguous records, and ignore
+  individual output files that disappear or become unreadable during selection.
+  The release-native `.context.json` storage remains the final-output owner.
+  Discussion references now bind verified route identity. Older unbound dialog
+  references are not re-exported; their final-output text remains readable.
+  Continuation seeding verifies profile, participant and root, and an explicitly
+  rejected root cannot silently fall back to a rootless post.
+  `tests/cron/test_conversation_context.py` and
+  `tests/cron/test_cron_context_from.py` passed 53 isolated tests. Public behavior
+  reference: [final-output contribution](https://github.com/tachyon-r/hermes-agent/pull/2).
+- Bounded provenance closure, 2026-09-15: both native compression publication
+  owners stamp original-row references in existing message metadata and commit
+  the child seed boundary with its messages. Cron selects and deduplicates
+  original insertion IDs, never copied text or timestamps. Unresolved copies,
+  old unproved descendant seeds and legacy discussion references are excluded;
+  saved version-1 final report text remains available. No pre-compression input
+  persistence, new table, backfill or migration was added. Unique native output
+  names prevent simultaneous runs from overwriting each other's report anchors.
+  Additional regression file: `tests/test_compression_watermark_commit.py`.
+  The local Cron/identity/compression cohort passes 251 isolated tests; the
+  corresponding public candidate passes 267. Both retain one existing audioop
+  deprecation warning. In-flight copies without an independently stored original
+  are deliberately omitted by this bounded context contract.
+  Implementation reference: bounded original-row discussion context, 2026-09-15.
+  Installation and service activation remain separate operations.
+
 This ledger documents the downstream contracts retained on `amy/patches` above upstream Hermes Agent 0.21.0 (`29112bef099274229cadff79cdff7bf7b99c4b77`). It was rebuilt from the target branch's actual Git history; detailed test receipts and rollback records remain outside the public branch.
 
 ## Scope and verification boundary

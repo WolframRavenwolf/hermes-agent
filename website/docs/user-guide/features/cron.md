@@ -506,9 +506,18 @@ cron:
   mirror_delivery: false   # set true to make cron deliveries continuable
 ```
 
+New jobs created while `cron.mirror_delivery: true` is enabled store
+`attach_to_session: true` unless the caller explicitly selects false. Existing
+jobs are not rewritten; their existing per-job override still takes precedence.
+
 Behaviour is **thread-preferred**, scoped to the job's own conversation:
 
-- **Thread-capable platforms** (Telegram topics, Discord/Slack threads): each
+- **Mattermost**: the first report post becomes the conversation root. Further
+  chunks and attachments stay in that thread, and its actual channel type is
+  used to create the matching reply session. Existing explicit roots are kept.
+- **Telegram private DMs**: reports stay in their configured DM; attachment
+  does not silently create a private topic. Explicit topics are preserved.
+- **Other thread-capable destinations** (Telegram groups, Discord/Slack threads): each
   delivery opens its own dedicated thread and the brief is seeded into that
   thread's session, so a reply in-thread continues with full context. A
   recurring job (e.g. a daily brief) opens a fresh thread per run, keeping each
@@ -526,7 +535,8 @@ Only the job's **own conversation** is ever touched:
 - a job's **single explicit `platform:chat` target**, but only when the job
   itself opts in with `attach_to_session: true` — the job author declares that
   target a conversation. The global `mirror_delivery` flag alone never makes an
-  explicitly-addressed chat continuable.
+  existing explicitly-addressed chat continuable. New jobs can inherit the
+  enabled creation default described above.
 
 Broadcast / fan-out targets (`all`, bare-platform home channels) are never made
 continuable. The mirror is
@@ -755,6 +765,25 @@ cronjob(
 ```
 
 The first run has no previous output, so the prompt runs as-is. On later runs the previous output is prepended with continuity framing ("avoid repeating what was already reported"). It combines freely with upstream jobs (`context_from=["<other_job_id>"]` plus `continuity=true`), and `continuity=false` on update turns it off while preserving other `context_from` entries. Internally the flag is stored as the reserved `self` entry in `context_from`.
+
+Context uses the last useful successful **final response**, excluding nested
+job prompts, skill text and raw tool logs. New run files have a sibling
+`.context.json` containing that response and verified delivery-session anchors.
+When attachment succeeded, continuity also reads subsequent user and final
+assistant messages from those exact conversations. Explicitly selected sibling
+jobs contribute the same context, so a follow-up briefing can see corrections
+made in another briefing's thread. Attachment alone does not enable this input;
+select `continuity` or `context_from` on the consuming job.
+
+The lookup examines the eight most recent saved runs per source job, retaining
+late replies to their reports. Per source, final output and discussion each have
+an 8,000-character budget; each session query loads at most 100 eligible text
+messages. Compression continuations are followed, but forks, resets, unrelated
+chats, tool calls and synthetic summaries are not. It is bounded text context,
+not a complete conversation archive or media analysis. Old Markdown run files
+can supply their final response but have no delivery anchors to backfill replies.
+Historical discussion informs the current task; it does not grant new permission
+for actions, and current source data should still be checked.
 
 From the CLI: `hermes cron create "every 6h" "Scan for news" --continuity`, and `hermes cron edit <job_id> --continuity` / `--no-continuity` to toggle it on an existing job. The same toggle appears in the dashboard's cron editor and the desktop Bot Mode routine dialog.
 

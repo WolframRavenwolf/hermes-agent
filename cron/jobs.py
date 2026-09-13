@@ -2326,6 +2326,10 @@ def create_job(
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
+    if normalized_attach is None:
+        from hermes_cli.config import load_config
+        if (load_config().get("cron") or {}).get("mirror_delivery") is True:
+            normalized_attach = True
     normalized_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
     normalized_monitor_script = str(monitor_script).strip() if isinstance(monitor_script, str) else None
     normalized_monitor_script = normalized_monitor_script or None
@@ -2434,7 +2438,7 @@ def create_job(
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
     }
-    # Only persist attach_to_session when explicitly set, so existing jobs and
+    # Persist explicit choices and enabled creation defaults. Existing jobs and
     # the common case stay byte-identical (absent key => fall back to the
     # global cron.mirror_delivery config, default off).
     if normalized_attach is not None:
@@ -4254,8 +4258,8 @@ def save_job_output(job_id: str, output: str):
     _ensure_cron_dir(job_output_dir)
     _secure_dir(job_output_dir)
 
-    timestamp = _hermes_now().strftime("%Y-%m-%d_%H-%M-%S")
-    output_file = job_output_dir / f"{timestamp}.md"
+    timestamp = _hermes_now().strftime("%Y-%m-%d_%H-%M-%S_%f")
+    output_file = job_output_dir / f"{timestamp}-{uuid.uuid4().hex[:12]}.md"
 
     fd, tmp_path = tempfile.mkstemp(dir=str(job_output_dir), suffix='.tmp', prefix='.output_')
     try:
