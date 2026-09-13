@@ -149,59 +149,107 @@ class TestDingTalkAllowedChats:
 
 
 # ---------------------------------------------------------------------------
-# Mattermost (env-var only — no config.yaml bridge)
+# Mattermost (profile-local YAML, scoped environment fallback)
 # ---------------------------------------------------------------------------
 
 class TestMattermostAllowedChannels:
-    """Mattermost whitelist logic — replicated since the adapter reads config
-    with env-var fallback inline inside _handle_post rather than through a
-    helper method."""
-
-    @staticmethod
-    def _would_process(channel_id, channel_type="O", allowed_cfg=None, allowed_env=""):
-        """Replicate the whitelist gate from gateway/platforms/mattermost.py."""
-        if channel_type == "D":
-            return True
-        # config-first, env-var fallback (matching the adapter)
-        allowed_raw = allowed_cfg
-        if allowed_raw is None:
-            allowed_raw = allowed_env
-        if isinstance(allowed_raw, list):
-            allowed = {str(c).strip() for c in allowed_raw if str(c).strip()}
-        else:
-            allowed = {c.strip() for c in str(allowed_raw).split(",") if c.strip()}
-        if allowed and channel_id not in allowed:
-            return False
-        return True
-
-    def test_empty_config_is_no_restriction(self):
-        assert self._would_process("chan123", allowed_cfg=None, allowed_env="") is True
-
-
-    def test_config_bridge(self, monkeypatch, tmp_path):
+    @pytest.mark.parametrize("runtime", ["single", "default", "secondary"])
+    @pytest.mark.parametrize("env_mention", [None, "true", "false"])
+    def test_yaml_profiles_keep_gating_isolated_after_reload(
+        self, monkeypatch, tmp_path, runtime, env_mention
+    ):
+        """Upstream config.yaml/extra is authoritative, including false and empty lists."""
+        import os
+        from contextvars import Context
+        from unittest.mock import patch
+        import yaml
+        from agent.secret_scope import is_multiplex_active, set_multiplex_active, set_secret_scope
         from gateway.config import load_gateway_config
+        from plugins.platforms.mattermost.adapter import MattermostAdapter
 
-        hermes_home = tmp_path / ".hermes"
-        hermes_home.mkdir()
-        (hermes_home / "config.yaml").write_text(
-            "mattermost:\n"
-            "  allowed_channels:\n"
-            "    - chanABC\n"
-            "    - chanDEF\n",
-            encoding="utf-8",
-        )
-        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-        # Pre-register the key with monkeypatch so teardown cleans it up
-        # even though load_gateway_config mutates os.environ directly
-        # (monkeypatch only restores keys it's touched via setenv/delenv;
-        # delenv on an absent key is a no-op for teardown purposes).
-        monkeypatch.setenv("MATTERMOST_ALLOWED_CHANNELS", "__sentinel__")
-        monkeypatch.delenv("MATTERMOST_ALLOWED_CHANNELS")
+        keys = ("MATTERMOST_REQUIRE_MENTION", "MATTERMOST_FREE_RESPONSE_CHANNELS",
+                "MATTERMOST_ALLOWED_CHANNELS", "MATTERMOST_MAX_POST_LENGTH")
+        contexts = {name: Context() for name in ("alpha", "beta")}
+        previous_multiplex = is_multiplex_active()
+        set_multiplex_active(runtime != "single")
+        try:
+            with patch.dict(os.environ, {}, clear=False):
+                for key in keys:
+                    os.environ.pop(key, None)
+                for name, context in contexts.items():
+                    # None models a profile with no Mattermost environment settings.
+                    scope = dict(zip(keys, (env_mention, f"{name}-env-free",
+                                           f"{name}-env-free,{name}-env", "9000"))) if env_mention is not None else {}
+                    context.run(set_secret_scope, scope if runtime == "secondary" else None)
+                    (tmp_path / name).mkdir()
+                if runtime == "secondary":
+                    # A scoped miss must not borrow the default profile's settings.
+                    os.environ.update(dict(zip(keys, ("false", "foreign", "foreign", "9000"))))
+                elif env_mention is not None:
+                    os.environ.update(dict(zip(keys, (env_mention, "env-free", "env-free,env", "9000"))))
 
-        load_gateway_config()
+                before = {key: os.environ.get(key) for key in keys}
 
-        import os as _os
-        assert _os.environ["MATTERMOST_ALLOWED_CHANNELS"] == "chanABC,chanDEF"
+                def load(name, settings):
+                    home = tmp_path / name
+                    (home / "config.yaml").write_text(yaml.safe_dump({
+                        "platforms": {"mattermost": {"enabled": True, "token": "test-token",
+                                                      "extra": {"url": "https://mm.example.com"}}},
+                        "mattermost": settings,
+                    }), encoding="utf-8")
+                    monkeypatch.setenv("HERMES_HOME", str(home))
+                    config = contexts[name].run(load_gateway_config).platforms[Platform.MATTERMOST]
+                    adapter = contexts[name].run(MattermostAdapter, config)
+                    adapter._bot_username = "hermes"
+                    adapter._bot_user_id = "bot-id"
+                    return adapter
+
+                def gate(name, adapter, channel, text="hello"):
+                    return contexts[name].run(adapter._apply_channel_gating, channel, text)
+
+                settings = {
+                    "alpha": {"require_mention": False, "allowed_channels": ["alpha"],
+                              "free_response_channels": ["outside"], "max_post_length": 500},
+                    "beta": {"require_mention": True, "allowed_channels": ["beta", "beta-free"],
+                             "free_response_channels": ["beta-free", "outside"], "max_post_length": 8000},
+                }
+                alpha = load("alpha", settings["alpha"])
+                beta = load("beta", settings["beta"])
+                # Interleave loads and gating; neither existing adapter may adopt its neighbor's YAML.
+                reloaded_alpha = load("alpha", settings["alpha"])
+                for adapter in (alpha, reloaded_alpha):
+                    assert gate("alpha", adapter, "alpha") == "hello"
+                    assert gate("alpha", adapter, "outside", "@hermes hello") is None
+                    assert adapter.MAX_MESSAGE_LENGTH == 500
+                assert gate("beta", beta, "beta") is None
+                assert gate("beta", beta, "beta", "@hermes hello") == "hello"
+                assert gate("beta", beta, "beta-free") == "hello"
+                assert gate("beta", beta, "outside") is None
+                assert gate("beta", beta, "outside", "@hermes hello") is None
+                assert beta.MAX_MESSAGE_LENGTH == 8000
+
+                empty = load("beta", {"require_mention": True, "allowed_channels": [],
+                                      "free_response_channels": []})
+                env_free = "beta-env-free" if runtime == "secondary" else "env-free"
+                assert gate("beta", empty, env_free) is None
+                assert gate("beta", empty, "anywhere", "@hermes hello") == "hello"
+                for name in contexts:
+                    cleared = load(name, {})
+                    assert cleared.MAX_MESSAGE_LENGTH == 4000  # max_post_length remains YAML-only.
+                    if env_mention is None:
+                        assert gate(name, cleared, "anywhere") is None
+                        assert gate(name, cleared, "anywhere", "@hermes hello") == "hello"
+                    else:
+                        prefix = f"{name}-" if runtime == "secondary" else ""
+                        assert gate(name, cleared, prefix + "env-free") == "hello"
+                        assert gate(name, cleared, prefix + "env") == (
+                            "hello" if env_mention == "false" else None)
+                        assert gate(name, cleared, "outside", "@hermes hello") is None
+                assert gate("alpha", alpha, "alpha") == "hello"
+                assert gate("beta", beta, "beta") is None
+                assert {key: os.environ.get(key) for key in keys} == before
+        finally:
+            set_multiplex_active(previous_multiplex)
 
 
 # ---------------------------------------------------------------------------
