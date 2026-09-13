@@ -24,7 +24,7 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms.base import gateway_trust_env, BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType
-from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret, profile_scoped as _profile_scoped_config_load
+from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret
 
 logger = logging.getLogger(__name__)
 
@@ -70,10 +70,6 @@ def _channel_id_set(raw: Any) -> set:
     """Parse a list or comma-separated string of channel IDs into a stripped set."""
     items = raw if isinstance(raw, list) else str(raw).split(",")
     return {str(c).strip() for c in items if str(c).strip()}
-
-
-def _csv(value: Any) -> str:
-    return ",".join(str(v) for v in value) if isinstance(value, list) else str(value)
 
 
 def _post_result(data: Dict[str, Any], error: str) -> SendResult:
@@ -861,36 +857,23 @@ def interactive_setup() -> None:
     print_info("   Open config in your editor:  hermes config edit")
 
 
-# --- YAML → env config bridge (apply_yaml_config_fn) ---
-
-_YAML_BRIDGE = (  # (yaml key, env var, yaml value → env string); allowed_channels is a whitelist
-    ("require_mention", "MATTERMOST_REQUIRE_MENTION", lambda v: str(v).lower()),
-    ("free_response_channels", "MATTERMOST_FREE_RESPONSE_CHANNELS", _csv),
-    ("allowed_channels", "MATTERMOST_ALLOWED_CHANNELS", _csv))
+# --- Profile-local YAML settings (apply_yaml_config_fn) ---
 
 
 def _apply_yaml_config(yaml_cfg: dict, mattermost_cfg: dict) -> dict | None:
-    """Translate ``config.yaml`` ``mattermost:`` keys into env vars + ``PlatformConfig.extra``.
+    """Seed this profile's ``PlatformConfig.extra`` without changing process env.
 
-    Env vars win over YAML (writes guarded by ``not os.getenv``). Under a multiplexed secondary
-    profile the env write is skipped (it would leak into every profile via ``os.environ``); the
-    values are returned so the caller seeds this profile's ``extra``, which read sites check first.
-
-    Implements the ``apply_yaml_config_fn`` contract (#24836 / #25443). Mirrors the legacy
-    ``mattermost_cfg`` block that used to live in ``gateway/config.py::load_gateway_config()`` before this
-    migration.
+    Read sites prefer these YAML values, with scoped env fallback for missing settings.
     """
-    skip_env_bridge = _profile_scoped_config_load()
     seeded: dict = {}
     if "max_post_length" in mattermost_cfg:
         seeded["max_post_length"] = _resolve_max_post_length(mattermost_cfg)
-    for key, env, to_env in _YAML_BRIDGE:
+    for key in ("require_mention", "free_response_channels", "allowed_channels"):
         value = mattermost_cfg.get(key)
         if value is None and not (key == "require_mention" and key in mattermost_cfg):
             continue
         seeded[key] = value
-        if not skip_env_bridge and not os.getenv(env):
-            os.environ[env] = to_env(value)
+
     return seeded or None
 
 
@@ -912,7 +895,7 @@ def register(ctx) -> None:
         check_fn=check_mattermost_requirements, validate_config=validate_mattermost_config,
         is_connected=_is_connected, required_env=["MATTERMOST_URL", "MATTERMOST_TOKEN"],
         install_hint="pip install aiohttp", setup_fn=interactive_setup,
-        apply_yaml_config_fn=_apply_yaml_config,  # YAML→env bridge (see _YAML_BRIDGE)
+        apply_yaml_config_fn=_apply_yaml_config,
         allowed_users_env="MATTERMOST_ALLOWED_USERS", allow_all_env="MATTERMOST_ALLOW_ALL_USERS",
         cron_deliver_env_var="MATTERMOST_HOME_CHANNEL",
         standalone_sender_fn=_standalone_send,  # out-of-process cron; without it `deliver=mattermost` fails

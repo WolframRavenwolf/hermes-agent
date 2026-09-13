@@ -1159,18 +1159,49 @@ class TestMultiplexProfileScope:
         # profile's env bridge saying require_mention=true.
         assert adapter.handle_message.called
 
-    def test_apply_yaml_config_scoped_skips_env_write_and_seeds_extra(
-        self, multiplex_scope
+    @pytest.mark.parametrize("runtime", ["single", "default", "secondary"])
+    @pytest.mark.parametrize("env_state", ["missing", "empty", "conflicting"])
+    def test_apply_yaml_config_keeps_profile_values_out_of_process_env(
+        self, runtime, env_state
     ):
+        from agent.secret_scope import (
+            is_multiplex_active, reset_secret_scope, set_multiplex_active, set_secret_scope,
+        )
         from plugins.platforms.mattermost.adapter import _apply_yaml_config
 
-        multiplex_scope()
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("MATTERMOST_REQUIRE_MENTION", None)
-            seeded = _apply_yaml_config({}, {"require_mention": False, "allowed_channels": ["c1"]})
-            assert seeded == {"require_mention": False, "allowed_channels": ["c1"]}
-            # Under a secondary profile's scope the env bridge must be
-            # skipped -- writing here would leak into every other profile's
-            # os.environ.
-            assert "MATTERMOST_REQUIRE_MENTION" not in os.environ
+        previous_multiplex = is_multiplex_active()
+        set_multiplex_active(runtime != "single")
+        token = set_secret_scope({} if runtime == "secondary" else None)
+        try:
+            with patch.dict(os.environ, {}, clear=False):
+                for key, value in {
+                    "MATTERMOST_REQUIRE_MENTION": "true",
+                    "MATTERMOST_FREE_RESPONSE_CHANNELS": "env-free",
+                    "MATTERMOST_ALLOWED_CHANNELS": "env-only",
+                    "MATTERMOST_MAX_POST_LENGTH": "9000",
+                }.items():
+                    if env_state == "missing":
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = "" if env_state == "empty" else value
+                before = dict(os.environ)
+                for settings in [
+                    {"require_mention": False, "allowed_channels": ["alpha"],
+                     "free_response_channels": ["alpha"], "max_post_length": 500},
+                    {"require_mention": True, "allowed_channels": ["beta"],
+                     "free_response_channels": [], "max_post_length": 8000},
+                    {"require_mention": False, "allowed_channels": [], "free_response_channels": []},
+                    {},
+                ]:
+                    assert _apply_yaml_config({}, settings) == (settings or None)
+                    assert dict(os.environ) == before
+                # Preserve the existing null handling: only require_mention is seeded.
+                assert _apply_yaml_config({}, {
+                    "require_mention": None, "allowed_channels": None,
+                    "free_response_channels": None,
+                }) == {"require_mention": None}
+                assert dict(os.environ) == before
+        finally:
+            reset_secret_scope(token)
+            set_multiplex_active(previous_multiplex)
 
