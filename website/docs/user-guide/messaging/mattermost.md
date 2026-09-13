@@ -150,10 +150,10 @@ MATTERMOST_ALLOWED_USERS=3uo8dkh1p7g1mfk49ear5fzs5c
 # Optional: reply mode (thread or off, default: off)
 # MATTERMOST_REPLY_MODE=thread
 
-# Optional: respond without @mention (default: true = require mention)
+# Legacy fallback when YAML is unset: respond without @mention
 # MATTERMOST_REQUIRE_MENTION=false
 
-# Optional: channels where bot responds without @mention (comma-separated channel IDs)
+# Legacy fallback when YAML is unset: channels that need no @mention
 # MATTERMOST_FREE_RESPONSE_CHANNELS=channel_id_1,channel_id_2
 ```
 
@@ -164,6 +164,55 @@ group_sessions_per_user: true
 ```
 
 - `group_sessions_per_user: true` keeps each participant's context isolated inside shared channels and threads
+
+### Channel Settings and Profiles
+
+Set channel behavior in the active profile's `config.yaml`:
+
+```yaml
+mattermost:
+  require_mention: true
+  free_response_channels: []
+  allowed_channels: []
+```
+
+These are the defaults when neither YAML nor environment settings are present.
+YAML values take precedence over the corresponding `MATTERMOST_REQUIRE_MENTION`,
+`MATTERMOST_FREE_RESPONSE_CHANNELS`, and `MATTERMOST_ALLOWED_CHANNELS` legacy
+environment settings. Explicit `false` and empty lists are values, not missing
+settings. An absent or `null` setting uses the existing environment fallback.
+In a multiplexed profile, this fallback reads that profile's scope; a missing
+scoped value never borrows another profile's environment.
+
+Loading these YAML settings now stores them only in the profile's adapter
+configuration, without writing process environment variables, including for the
+default profile. Reloading after removing a YAML setting therefore uses the
+existing environment fallback or default, rather than a value left behind by an
+earlier YAML load. This changes the old YAML-to-environment side effect; it
+preserves YAML precedence and support for existing environment-only setups.
+
+### Post Length
+
+Set the outbound post limit in the active profile's `config.yaml`:
+
+```yaml
+mattermost:
+  max_post_length: 4000
+```
+
+The default is 4000 characters. Integer values from 500 through 16383 are
+accepted; invalid values or values below 500 fall back to 4000, and values above
+16383 are clamped. This YAML-only setting has no environment-variable override.
+It applies to gateway replies, streaming previews, direct sends and cron
+messages within that profile. Streaming reserves room for its cursor.
+
+Oversized edits update the first post within this limit and send only the
+overflow as continuation posts. Text delivery receipts retain every acknowledged
+post ID, with the last editable post as `message_id`. If a continuation is
+rejected, streaming can send the known missing tail using an exact source
+prefix. If its acknowledgement is lost, streaming stops rather than replaying
+content that may already be visible. This prevents immediate retry duplicates;
+it does not guarantee exactly-once delivery across separate sends or restarts.
 
 ### Start the Gateway
 
@@ -216,10 +265,10 @@ MATTERMOST_REPLY_MODE=thread
 
 By default, the bot only responds in channels when `@mentioned`. You can change this:
 
-| Variable | Default | Description |
+| YAML setting | Default | Description |
 |----------|---------|-------------|
-| `MATTERMOST_REQUIRE_MENTION` | `true` | Set to `false` to respond to all messages in channels (DMs always work). |
-| `MATTERMOST_FREE_RESPONSE_CHANNELS` | _(none)_ | Comma-separated channel IDs where the bot responds without `@mention`, even when require_mention is true. |
+| `mattermost.require_mention` | `true` | Set to `false` to respond to all messages in channels (DMs always work). |
+| `mattermost.free_response_channels` | `[]` | Channel IDs where the bot responds without `@mention`, even when `require_mention` is true. |
 
 To find a channel ID in Mattermost: open the channel, click the channel name header, and look for the ID in the URL or channel details.
 
@@ -238,7 +287,7 @@ mattermost:
     - "xyz987uvw654rst321opq098nml"   # #incident-response
 ```
 
-Or via env var (comma-separated):
+Existing environment-only setups can use this fallback when the YAML setting is absent or `null` (comma-separated):
 
 ```bash
 MATTERMOST_ALLOWED_CHANNELS="abc123def456ghi789jkl012mno,xyz987uvw654rst321opq098nml"
