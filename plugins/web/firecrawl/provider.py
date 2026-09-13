@@ -240,6 +240,11 @@ _UNSAFE_REDIRECT_MSG = "Blocked: URL targets a private or internal network addre
 
 
 async def _scrape_one(url: str, formats: List[str], format: Optional[str]) -> Dict[str, Any]:
+    """Only the local call argument proves ownership, including early refusals/errors."""
+    return {**await _scrape_one_result(url, formats, format), "_request_url": url}
+
+
+async def _scrape_one_result(url: str, formats: List[str], format: Optional[str]) -> Dict[str, Any]:
     """Scrape one URL (60s timeout) and re-check SSRF + website policy against the
     post-redirect URL. Never raises for scrape errors; returns an error entry instead."""
     if blocked := check_website_access(url):
@@ -306,13 +311,13 @@ class FirecrawlWebSearchProvider(BaseWebSearchProvider):
         ``format``: "markdown" | "html" | both (markdown preferred)."""
         from tools.interrupt import is_interrupted as _is_interrupted
         if _is_interrupted():
-            return [{"url": u, "error": "Interrupted", "title": ""} for u in urls]
+            return [{"url": u, "error": "Interrupted", "title": "", "_request_url": u} for u in urls]
         if _use_keyless_ring():
             return await asyncio.to_thread(keyless_extract, "Firecrawl", "firecrawl", urls, logger)
         format = kwargs.get("format")
         formats = [format] if format in ("markdown", "html") else ["markdown", "html"]
         return [
-            {"url": url, "error": "Interrupted", "title": ""} if _is_interrupted() else await _scrape_one(url, formats, format)
+            {"url": url, "error": "Interrupted", "title": "", "_request_url": url} if _is_interrupted() else await _scrape_one(url, formats, format)
             for url in urls
         ]
 

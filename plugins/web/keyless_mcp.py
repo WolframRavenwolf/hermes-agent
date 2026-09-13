@@ -67,9 +67,9 @@ def _per_url(urls: List[str], fetch: Callable[[str], Dict[str, Any]], vendor: st
     """Per-URL extract loop: a ``catch`` failure becomes an error entry (``hint`` adds the ``hermes tools`` hint)."""
     def _one(url: str) -> Dict[str, Any]:
         try:
-            return fetch(url)
+            return {**fetch(url), "_request_url": url}
         except catch as exc:  # noqa: BLE001 — per-URL error entry
-            return _page_error(url, _fail_msg(vendor, "extract", exc, other_backends=hint))
+            return {**_page_error(url, _fail_msg(vendor, "extract", exc, other_backends=hint)), "_request_url": url}
 
     return [_one(u) for u in urls]
 
@@ -182,7 +182,7 @@ def parallel_extract_keyless(urls: List[str]) -> List[Dict[str, Any]]:
         data = json.loads(mcp_call(PARALLEL_MCP_URL, "web_fetch", {"urls": list(urls), "objective": "Full page content", "session_id": _SESSION_ID}))
     except (KeylessMCPError, json.JSONDecodeError, TypeError) as exc:
         message = _fail_msg("parallel", "extract", exc)
-        return [_page_error(u, message) for u in urls]
+        return [{**_page_error(u, message), "_request_url": u} for u in urls]
     results = [
         _page(r.get("url") or "", r.get("title") or "", r.get("full_content") or r.get("content") or "\n\n".join(r.get("excerpts") or []))
         for r in data.get("results") or []
@@ -192,7 +192,7 @@ def parallel_extract_keyless(urls: List[str]) -> List[Dict[str, Any]]:
         results.append({**_page_error(url, str(error.get("content") or error.get("error_type") or "extraction failed")), "metadata": {"sourceURL": url}})
     # URLs the endpoint silently dropped still get an error entry (per-URL contract).
     seen = {r["url"] for r in results}
-    results.extend(_page_error(u, "no content returned") for u in urls if u not in seen)
+    results.extend({**_page_error(u, "no content returned"), "_request_url": u} for u in urls if u not in seen)
     return results
 
 
@@ -381,5 +381,5 @@ def extract_with_failover(name: str, urls: List[str]) -> List[Dict[str, Any]]:
 
     order, _vendor, results, _exhausted = _walk_ring(name, "extract", lambda v: _KEYLESS_EXTRACTORS[v](list(urls)), _all_throttled)
     if not order:
-        return [_page_error(u, _ALL_PAID_MSG) for u in urls]
+        return [{**_page_error(u, _ALL_PAID_MSG), "_request_url": u} for u in urls]
     return results

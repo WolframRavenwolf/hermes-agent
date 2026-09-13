@@ -9,12 +9,13 @@ one-shot keyless rescue. Logs under the origin (tools.web_tools) logger.
 import asyncio
 import json
 import logging
+import re
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 
 from tools.tool_backend_helpers import selection_error, selection_exists
 from tools.url_safety import normalize_url_for_request, sensitive_query_param_name
-from tools.web_tools_rescue import _rescue_eligible, _rescue_extract
+from tools.web_tools_rescue import _policy_blocked_result, _rescue_eligible, _rescue_extract
 
 logger = logging.getLogger("tools.web_tools")
 
@@ -61,7 +62,7 @@ def _strict_selection_error(capability: str, backend: str) -> str:
 
 
 def _result_entry(url: str, error: Optional[str]) -> Dict[str, Any]:
-    return {"url": url, "title": "", "content": "", "error": error}
+    return {"url": url, "title": "", "content": "", "error": error, "_request_url": url}
 
 
 def _extract_error_json(error: str) -> str:
@@ -73,6 +74,11 @@ def _refuse_all(error: str):
     return None, None, None, json.dumps({"success": False, "error": error})
 
 
+def _public_results(results: List[dict]) -> List[dict]:
+    """Remove private request identities from copies before serialization/truncation."""
+    return [{k: v for k, v in result.items() if k != "_request_url"} for result in results]
+
+
 def _merge_in_order(
     total: int, fixed: Dict[int, dict], fetch_positions: List[int], fetch_urls: List[str], results: List[dict]
 ) -> List[dict]:
@@ -82,7 +88,14 @@ def _merge_in_order(
     for pos, position in enumerate(fetch_positions):
         missing = _result_entry(fetch_urls[pos], _NO_RESULT_ERROR)
         merged[position] = results[pos] if pos < len(results) else missing
-    return [merged[i] for i in range(total)]
+    return _public_results([merged[i] for i in range(total)])
+
+
+def _raw_userinfo(url: str) -> str:
+    """Keep authority credentials verbatim, even without a scheme or with a malformed host."""
+    authority = re.sub(r"^[A-Za-z][A-Za-z0-9+.-]*://", "", url).removeprefix("//")
+    userinfo, separator, _ = re.split(r"[/?#]", authority, maxsplit=1)[0].rpartition("@")
+    return userinfo + separator
 
 
 def _validate_extract_urls(urls: List[Any]):
@@ -98,6 +111,7 @@ def _validate_extract_urls(urls: List[Any]):
         if _url is None:
             invalid_urls[index] = _result_entry("", _INVALID_ITEM_ERROR.format(index))
             continue
+        userinfo = _raw_userinfo(_url)
         normalized_url = normalize_url_for_request(_url)
         if any(_PREFIX_RE.search(c) for c in (_url, unquote(_url), normalized_url, unquote(normalized_url))):
             return _refuse_all(
@@ -111,6 +125,10 @@ def _validate_extract_urls(urls: List[Any]):
                 "readers; remove the sensitive query parameter or use a local "
                 "browser session when this access is explicitly required."
             )
+        # The shared IDNA normalizer can replace a hostname occurrence in the username.
+        if _raw_userinfo(normalized_url) != userinfo:
+            invalid_urls[index] = _result_entry(_url, "Invalid URL: normalization changes userinfo")
+            continue
         normalized_urls.append(normalized_url)
         normalized_indices.append(index)
     return normalized_urls, normalized_indices, invalid_urls, None
@@ -141,63 +159,104 @@ def _resolve_extract_provider(backend: str):
 
 
 def _url_key(url: Any, *, loose: bool = False) -> str:
-    """Pairing key for a requested/returned URL. Drops only what cannot change WHICH document was
-    fetched: case, userinfo, a default port, a trailing slash, the fragment. The query stays
-    (``?page=2`` is another page). ``loose`` also drops the scheme and a leading ``www.`` for
-    backends that report the post-redirect URL instead of the string they were handed."""
+    """Exact pairing preserves raw case-sensitive userinfo, non-root path slashes and
+    the query. Host/scheme case, default ports, root slash and fragment are folded.
+    ``loose`` also folds scheme, leading ``www.`` and trailing slashes for backends
+    that report a rewritten URL; the caller must establish unambiguous ownership."""
     if not isinstance(url, str) or not url.strip():
         return ""
+    raw = url.strip()
+    userinfo = _raw_userinfo(raw)
+    # Parse missing-scheme credentials as authority, not a username-shaped scheme.
+    if userinfo and "://" not in raw and not raw.startswith("//"):
+        raw = "//" + raw
     try:
-        parts = urlsplit(normalize_url_for_request(url.strip()))
+        parts = urlsplit(normalize_url_for_request(raw))
         scheme, host, port = parts.scheme.lower(), (parts.hostname or "").lower(), parts.port
     except ValueError:
-        return url.strip().lower()
+        return url.strip()
     if port == {"http": 80, "https": 443}.get(scheme):
         port = None
     if loose and host.startswith("www."):
         host = host[4:]
     prefix = "" if loose else f"{scheme}://"
     query = f"?{parts.query}" if parts.query else ""
-    return f"{prefix}{host}{f':{port}' if port else ''}{parts.path.rstrip('/')}{query}"
+    path = parts.path.rstrip("/") if loose else parts.path
+    if path == "/":
+        path = ""
+    return f"{prefix}{userinfo}{host}{f':{port}' if port else ''}{path}{query}"
 
 
 def _pair_results(urls: List[str], results: List[dict]) -> List[dict]:
-    """One entry per requested URL, in request order, paired by URL — never by list position:
-    Parallel appends failures after successes, Exa omits pages it could not fetch, the keyless ring
-    inherits both shapes, and a rescued batch comes back in ring order. Positional pairing cached one
-    page's text under another URL's key for the whole TTL (#97378).
+    """Prefer exact local request proof; untagged URL aliases are compatibility only.
 
-    Exact keys pair first, then loose ones (an exact pairing is never a loose candidate elsewhere).
-    A document beats an error stub for the same key — the keyless ring emits both when it rewrites a
-    URL. A lone leftover result goes to the lone unmatched URL (redirect to another host); any other
-    unmatched result is dropped rather than attached to some other URL. ``metadata.sourceURL`` is
-    indexed alongside ``url`` because Keenable reports the requested URL only there."""
-    entries = [r for r in results if isinstance(r, dict)]
-    by_key: Dict[tuple, List[int]] = {}
-    for index, entry in enumerate(entries):
-        meta = entry.get("metadata")
-        source = meta.get("sourceURL") if isinstance(meta, dict) else None
-        for loose in (False, True):
-            for key in {_url_key(entry.get("url"), loose=loose), _url_key(source, loose=loose)} - {""}:
-                by_key.setdefault((loose, key), []).append(index)
+    Vendor metadata (including Firecrawl's final sourceURL) is never ownership.
+    Collect competitors before selection, so ordering cannot hide an observable
+    collision. URL-only batches still cannot prove silent redirects or swaps.
+    """
+    request_keys = [_url_key(url) for url in urls]
+    raw_owners = dict(zip(urls, request_keys))
+    exact_requests = set(request_keys)
+    loose_owners: Dict[str, set[str]] = {}
+    for url, key in zip(urls, request_keys):
+        loose_owners.setdefault(_url_key(url, loose=True), set()).add(key)
 
-    paired: Dict[int, dict] = {}
-    used: set[int] = set()
-    for loose in (False, True):
-        taken = set(used)
-        for position, url in enumerate(urls):
-            candidates = [i for i in by_key.get((loose, _url_key(url, loose=loose)), ()) if i not in taken]
-            if position in paired or not candidates:
-                continue
-            paired[position] = entries[next((i for i in candidates if not entries[i].get("error")), candidates[0])]
-            used.update(candidates)
-    missing = [position for position in range(len(urls)) if position not in paired]
-    leftover = [i for i in range(len(entries)) if i not in used]
-    if len(missing) == 1 and len(leftover) == 1:
-        paired[missing[0]] = entries[leftover[0]]
-    elif leftover:
-        logger.warning("web_extract: dropping %d result(s) matching no requested URL", len(leftover))
-    return [paired.get(position) or _result_entry(url, _NO_RESULT_ERROR) for position, url in enumerate(urls)]
+    proven: Dict[str, List[dict]] = {}
+    compatible: Dict[str, List[tuple]] = {}
+    leftover: List[dict] = []
+    rejected = 0
+    for entry in results:
+        if not isinstance(entry, dict):
+            continue
+        if "_request_url" in entry:
+            marker = entry["_request_url"]
+            # No normalization/loose lookup here, even for a cosmetically valid alias.
+            if isinstance(marker, str) and marker in raw_owners:
+                proven.setdefault(raw_owners[marker], []).append(entry)
+            else:
+                rejected += 1
+            continue
+        key = _url_key(entry.get("url"))
+        exact = key in exact_requests
+        if not exact:
+            owners = loose_owners.get(_url_key(entry.get("url"), loose=True), set())
+            key = next(iter(owners)) if len(owners) == 1 else None
+        if key is None:
+            leftover.append(entry)
+        else:
+            compatible.setdefault(key, []).append((not exact, entry))
+
+    paired: Dict[str, dict] = {}
+    # Repeated exact identities represent the same request owner. A compatible
+    # singleton alias can upgrade a stub; an unknown redirect cannot do so.
+    sole_owner = len(exact_requests) == 1
+    for url, key in zip(urls, request_keys):
+        if key in paired:
+            continue
+        owned = proven.get(key, [])
+        aliases = [entry for _, entry in sorted(compatible.get(key, []), key=lambda pair: pair[0])]
+        owned_success = next((r for r in owned if not r.get("error")), None)
+        if owned_success is not None:
+            paired[key] = owned_success
+            continue
+        successes = [r for r in aliases if not r.get("error")]
+        errors = [r for r in aliases if r.get("error")]
+        if owned and not (sole_owner and successes):
+            paired[key] = owned[0]
+        elif successes and any(r != successes[0] for r in successes[1:]):
+            paired[key] = _result_entry(url, "Ambiguous extract results for this URL")
+        elif successes and (sole_owner or not errors):
+            paired[key] = successes[0]
+        elif errors:
+            paired[key] = errors[0]
+
+    # Preserve the historical sole-leftover exception only for an unmatched
+    # actual single-URL dispatch, never to overwrite a matched error/refusal.
+    if len(urls) == 1 and request_keys[0] not in paired and len(leftover) == 1 and not leftover[0].get("error"):
+        paired[request_keys[0]] = leftover.pop()
+    if leftover or rejected:
+        logger.warning("web_extract: dropping %d unowned result(s)", len(leftover) + rejected)
+    return [paired.get(key) or _result_entry(url, _NO_RESULT_ERROR) for url, key in zip(urls, request_keys)]
 
 
 async def _dispatch_extract(provider, fetch_urls: List[str], format: Optional[str]) -> List[dict]:
@@ -218,11 +277,20 @@ async def _dispatch_extract(provider, fetch_urls: List[str], format: Optional[st
         if not _rescue_eligible(provider):
             raise
         results = [_result_entry(u, str(exc)) for u in fetch_urls]
+    paired = _pair_results(fetch_urls, results)
     if results and all(r.get("error") for r in results) and _rescue_eligible(provider):
-        rescued = await asyncio.to_thread(_rescue_extract, provider.name, fetch_urls, results)
-        return _pair_results(fetch_urls, rescued)
+        # Positional rescue subsets are safe only after ownership pairing. Preserve
+        # policy slots even when the rescue returns extra or missing rows.
+        positions = [i for i, result in enumerate(paired) if not _policy_blocked_result(result)]
+        if positions:
+            rescue_urls = [fetch_urls[i] for i in positions]
+            failed = [paired[i] for i in positions]
+            rescued = await asyncio.to_thread(_rescue_extract, provider.name, rescue_urls, failed)
+            for position, result in zip(positions, _pair_results(rescue_urls, rescued)):
+                paired[position] = result
+        return paired
 
-    results = _pair_results(fetch_urls, results)
+    results = paired
     # Cache each successful fetch's full clean text under the REQUESTED url (best-effort; oversized skipped).
     for url, fetched in zip(fetch_urls, results):
         _content = fetched.get("raw_content", "") or fetched.get("content", "")
@@ -254,9 +322,9 @@ async def _extract_safe_urls(provider, safe_urls: List[str], format: Optional[st
             fetch_positions.append(position)
 
     if not fetch_urls:
-        return [cached_results[i] for i in range(len(safe_urls))]
+        return _public_results([cached_results[i] for i in range(len(safe_urls))])
     logger.info("Web extract via %s: %d URL(s)", provider.name, len(fetch_urls))
     results = await _dispatch_extract(provider, fetch_urls, format)
     if not cached_results:
-        return results
+        return _public_results(results)
     return _merge_in_order(len(safe_urls), cached_results, fetch_positions, fetch_urls, results)
