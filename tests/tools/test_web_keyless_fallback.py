@@ -552,3 +552,112 @@ class TestKeylessFailover:
         out = keyless_mcp.extract_with_failover("exa", ["https://a", "https://b"])
         assert out == partial
         assert not called
+
+
+@pytest.mark.parametrize("vendor", ["exa", "firecrawl", "keenable"])
+@pytest.mark.parametrize("fails", [False, True])
+def test_per_url_native_transports_stamp_actual_call_argument(monkeypatch, vendor, fails):
+    from unittest.mock import Mock
+    from types import SimpleNamespace
+    from plugins.web.firecrawl import provider as fc
+    urls = ["https://User:One@b.example/page", "https://b.example/page"]
+    calls = []
+
+    def fetch(u):
+        calls.append(u)
+        if fails:
+            raise keyless_mcp.KeylessMCPError("unavailable")
+        return "account body" if u == urls[0] else "anonymous body"
+
+    def post(endpoint, **kw):
+        if vendor == "exa":
+            u = kw["json"]["params"]["arguments"]["urls"][0]
+            text = json.dumps({"result": {"content": [{"type": "text", "text": fetch(u)}]}})
+            return SimpleNamespace(status_code=200, text=text)
+        u = kw["json"]["url"]
+        body = fetch(u)
+        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {
+            "data": {"markdown": body, "metadata": {"sourceURL": urls[1]}, "_request_url": urls[1]},
+        })
+
+    def get(endpoint, **kw):
+        u = kw["params"]["url"]
+        body = fetch(u)
+        return SimpleNamespace(status_code=200, json=lambda: {
+            "url": urls[1], "content": body, "_request_url": urls[1],
+        })
+
+    monkeypatch.setattr("requests.post", post)
+    monkeypatch.setattr(fc.httpx, "post", post)
+    monkeypatch.setattr("requests.get", get)
+    rows = getattr(keyless_mcp, vendor + "_extract_keyless")(urls)
+    assert [r["_request_url"] for r in rows] == urls
+    assert calls == urls
+    assert all(bool(r.get("error")) == fails for r in rows)
+    if not fails:
+        assert [r["content"] for r in rows] == ["account body", "anonymous body"]
+
+
+def test_per_url_stamps_copy_and_overrides_a_returned_marker():
+    source = {"url": "https://final.example", "content": "body", "_request_url": "vendor value"}
+    result = keyless_mcp._per_url(["https://request.example"], lambda u: source, "exa")
+    assert result[0]["_request_url"] == "https://request.example"
+    assert source["_request_url"] == "vendor value" and result[0] is not source
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_parallel_batch_stamps_only_local_missing_and_transport_failures(monkeypatch, failed):
+    from types import SimpleNamespace
+    urls = ["https://a.example", "https://b.example", "https://c.example"]
+    raw = {"results": [{"url": urls[1], "full_content": "B", "_request_url": urls[0]}],
+           "errors": [{"url": urls[2], "content": "vendor error", "_request_url": urls[0]}]}
+    def post(*a, **kw):
+        if failed:
+            raise keyless_mcp.KeylessMCPError("transport down")
+        return SimpleNamespace(status_code=200, text=json.dumps({"result": {"content": [
+            {"type": "text", "text": json.dumps(raw)},
+        ]}}))
+    with patch("requests.post", side_effect=post) as transport:
+        rows = keyless_mcp.parallel_extract_keyless(urls)
+    transport.assert_called_once()
+    if failed:
+        assert [r["_request_url"] for r in rows] == urls
+    else:
+        assert "_request_url" not in rows[0] and "_request_url" not in rows[1]
+        assert rows[2]["_request_url"] == urls[0] and rows[2].get("error")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interrupted", [False, True])
+async def test_common_guards_own_errors_without_stamping_generic_documents(monkeypatch, interrupted):
+    import logging
+    from plugins.web import _common
+    urls = ["https://a.example", "https://b.example"]
+    monkeypatch.setattr(_common, "_interrupted", lambda: interrupted)
+    def body():
+        raise ValueError("local failure")
+    async def async_body():
+        return body()
+    for rows in (
+        _common.run_extract("test", logging.getLogger(__name__), urls, body),
+        await _common.run_extract_async("test", logging.getLogger(__name__), urls, async_body),
+    ):
+        assert [r["_request_url"] for r in rows] == urls
+        assert all(r.get("error") for r in rows)
+    assert "_request_url" not in _common.document(urls[1], "", "body", source_url=urls[0])
+
+
+def test_keenable_keyed_success_and_error_both_own_local_argument(monkeypatch):
+    from types import SimpleNamespace
+    from plugins.web.keenable import provider as kn
+    urls = ["https://a.example", "https://b.example"]
+    monkeypatch.setattr(kn, "use_keyless", lambda *a: False)
+    monkeypatch.setattr(kn, "provider_env", lambda k: "synthetic")
+    with patch("requests.get", side_effect=[
+        SimpleNamespace(status_code=200, json=lambda: {"url": urls[1], "content": "A body", "_request_url": urls[1]}),
+        SimpleNamespace(status_code=500, text="B down"),
+    ]) as get:
+        rows = kn.KeenableWebSearchProvider().extract(urls)
+    assert [r["_request_url"] for r in rows] == urls
+    assert rows[0]["content"] == "A body" and rows[1].get("error")
+    assert get.call_count == 2

@@ -360,29 +360,42 @@ async def web_extract_tool(urls: List[Any], format: str = None, char_limit: Opti
 
     try:
         logger.info("Extracting content from %d URL(s)", len(normalized_urls))
-        # SSRF protection — filter private/internal URLs before any backend.
-        safe_urls, safe_indices, ssrf_blocked = [], [], {}
+        # Fixed input slots survive cache hits, reordered provider results, and dispatch failures.
+        # Policy runs before resolution, cache access, and even the SSRF check's DNS transport.
+        from tools.web_tools_extract import _policy_refusal
+        safe_urls, safe_indices, fixed = [], [], dict(invalid_urls or {})
         for index, url in zip(normalized_indices, normalized_urls):
-            if await async_is_safe_url(url):
+            try:
+                refusal = _policy_refusal(url)
+            except ValueError:
+                refusal = _result_entry(url, "Invalid URL: malformed authority")
+            if refusal is not None:
+                fixed[index] = refusal
+            elif await async_is_safe_url(url):
                 safe_urls.append(url)
                 safe_indices.append(index)
             else:
-                ssrf_blocked[index] = _result_entry(
+                fixed[index] = _result_entry(
                     url, "Blocked: URL targets a private or internal network address"
                 )
 
         results = []
         if safe_urls:
-            backend = _get_extract_backend()
-            _ensure_web_plugins_loaded()
-            provider, error_json = _resolve_extract_provider(backend)
-            if error_json is not None:
-                return error_json
-            results = await _extract_safe_urls(provider, safe_urls, format)
-        # Reconstruct input order across invalid, blocked, and provider entries (providers preserve
-        # the order of the safe URL list they receive).
-        if invalid_urls or ssrf_blocked:
-            fixed = {**ssrf_blocked, **invalid_urls}
+            try:
+                backend = _get_extract_backend()
+                _ensure_web_plugins_loaded()
+                provider, error_json = _resolve_extract_provider(backend)
+                if error_json is not None:
+                    if not fixed:
+                        return error_json
+                    results = [_result_entry(u, json.loads(error_json)["error"]) for u in safe_urls]
+                else:
+                    results = await _extract_safe_urls(provider, safe_urls, format)
+            except Exception as exc:
+                if not fixed:
+                    raise
+                results = [_result_entry(u, f"Error extracting content: {exc}") for u in safe_urls]
+        if fixed:
             results = _merge_in_order(len(urls), fixed, safe_indices, safe_urls, results)
 
         logger.info("Extracted content from %d pages", len(results))

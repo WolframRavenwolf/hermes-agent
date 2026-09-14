@@ -61,22 +61,21 @@ def _store_full_text(url: str, content: str) -> Optional[str]:
     returned). cache/web is mounted read-only into remote backends (credential_files _CACHE_DIRS) so
     read_file can page the complete text on any backend."""
     try:
-        import hashlib
+        from uuid import uuid4
         from hermes_constants import get_hermes_dir
         from tools.web_result_cache import _host_slug
         cache_dir = get_hermes_dir("cache/web", "web_cache")
         cache_dir.mkdir(parents=True, exist_ok=True)
-        path = cache_dir / f"{_host_slug(url)}-{hashlib.sha256(url.encode('utf-8')).hexdigest()[:10]}.md"
+        path = cache_dir / f"{_host_slug(url)}-{uuid4().hex}.md"
         if len(content) > MAX_STORED_TEXT_CHARS:
             content = content[:MAX_STORED_TEXT_CHARS] + (
                 f"\n\n[... stored copy truncated at {MAX_STORED_TEXT_CHARS:,} chars "
                 f"of {len(content):,}; re-extract a more specific URL for the rest ...]"
             )
         from tools.spill_safety import write_text_exclusive
-        # Deterministic name in a well-known dir: refuse symlinks (lstat-unlink + exclusive create);
-        # same-URL re-extraction legitimately overwrites. Not private: cache/web is bind-mounted
-        # into remote backends' container UID.
-        write_text_exclusive(path, content, private=False, overwrite=True)
+        # Result-local name: refuse any existing path so earlier paging links keep their content.
+        # Not private: cache/web is bind-mounted into remote backends' container UID.
+        write_text_exclusive(path, content, private=False, overwrite=False)
         return str(path)
     except Exception as exc:  # noqa: BLE001
         logger.debug("Failed to store full web_extract text for %s: %s", url, exc)
@@ -86,7 +85,7 @@ def _store_full_text(url: str, content: str) -> Optional[str]:
 def _truncate_with_footer(content: str, url: str, char_limit: int) -> tuple[str, bool]:
     """Return (model_text, was_truncated). Pages over ``char_limit`` become a ~75% head / ~25% tail window cut
     on line boundaries, plus a footer saying how much is shown, where the full text is stored, and the
-    read_file call that pages the omitted middle. Deterministic."""
+    read_file call that pages the omitted middle."""
     if len(content) <= char_limit:
         return content, False
     head_budget = int(char_limit * 0.75)
