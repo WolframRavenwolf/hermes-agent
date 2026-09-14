@@ -415,6 +415,17 @@ class MattermostAdapter(BasePlatformAdapter):
         data = await self._api_get(f"posts/{post_id}")
         return data["root_id"] if data and data.get("root_id") else post_id
 
+    async def _get_verified_chat_type(self, chat_id: str) -> Optional[str]:
+        """Continuation requires a matching channel identity and a known native type."""
+        try:
+            channel = await self._api_get(f"channels/{chat_id}")
+            if isinstance(channel, dict) and channel.get("id") == chat_id:
+                kind = channel.get("type")
+                return _CHANNEL_TYPE_MAP.get(kind) if isinstance(kind, str) else None
+        except Exception:
+            logger.debug("Mattermost: channel metadata unavailable")
+        return None
+
     async def create_handoff_thread(self, parent_chat_id: str, name: str) -> Optional[str]:
         """Open a placeholder for callers that need a thread ID before content.
 
@@ -423,7 +434,7 @@ class MattermostAdapter(BasePlatformAdapter):
         """
         if not self._session:
             return None
-        seed_text = f":thread: {(name or 'Hermes session').strip()[:80]}"
+        seed_text = ":thread: Hermes session"
         payload = _with_mentions_disabled({"channel_id": parent_chat_id, "message": seed_text})
         try:
             data = await self._api_post("posts", payload)
@@ -463,14 +474,23 @@ class MattermostAdapter(BasePlatformAdapter):
         """Send a message (or multiple chunks) to a channel; reply_to / metadata["thread_id"] is the root post."""
         if not content:
             return SendResult(success=True)
+        cron_attach = (metadata or {}).get("cron_attach") is True
         candidate = (metadata or {}).get("thread_id") or (metadata or {}).get("root_id")
         if self._reply_mode == "thread":
             candidate = reply_to or candidate
-        if candidate and str(candidate) in self._empty_handoff_seeds:
+        if not cron_attach and candidate and str(candidate) in self._empty_handoff_seeds:
             self._empty_handoff_seeds.pop(str(candidate))
             return await self.edit_message(
                 chat_id, str(candidate), content,
                 metadata={**(metadata or {}), "mattermost_explicit_thread": True})
+        cron_root_id = cron_chat_type = cron_metadata_error = None
+        if cron_attach:
+            metadata = dict(metadata or {})
+            # A missing/unknown channel is not evidence for the permissive
+            # get_chat_info fallback. Delivery may proceed, but must not seed.
+            cron_chat_type = await self._get_verified_chat_type(chat_id)
+            if not cron_chat_type:
+                cron_metadata_error = "Mattermost cron channel identity/type not verified"
         ids = []
         data: Dict[str, Any] = {}
         confirmed = attempted = 0
@@ -480,7 +500,7 @@ class MattermostAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 raise
             except Exception:
-                if not ids:
+                if not ids and not cron_attach:
                     raise
                 data = {"_delivery_uncertain": True, "content_attempted": True, "content_uncertain": True}
             ids.extend(data.get("message_ids") or ([str(data["id"])] if data.get("id") else []))
@@ -491,6 +511,25 @@ class MattermostAdapter(BasePlatformAdapter):
                 break
             confirmed += len(chunk)
             attempted = confirmed
+            if cron_attach:
+                # Only the accepted CONTENT post supplies its root. message_ids
+                # may start with a separate broken-thread warning.
+                post_id, root_id = data.get("id"), data.get("root_id")
+                verified = (data.get("channel_id") == chat_id
+                            and isinstance(post_id, str) and bool(post_id.strip())
+                            and isinstance(root_id, str) and (not root_id or bool(root_id.strip())))
+                accepted_root = (root_id or post_id) if verified else None
+                if not accepted_root or (cron_root_id and accepted_root != cron_root_id):
+                    cron_metadata_error = "Mattermost cron content root not verified"
+                    if confirmed < len(content):
+                        data = {k: v for k, v in data.items() if k != "id"}
+                    break
+                cron_root_id = accepted_root
+                metadata.update(thread_id=cron_root_id, mattermost_explicit_thread=True)
+                reply_to = None
+        if cron_attach:
+            data = {**data, "cron_root_id": cron_root_id, "cron_chat_type": cron_chat_type,
+                    "cron_metadata_error": cron_metadata_error}
         return self._source_result(data, ids, content, confirmed, attempted,
                                    _POST_DELIVERY_PARTIAL if ids else "Failed to create post")
 

@@ -1458,6 +1458,11 @@ class GatewayStartupMixin:
                 f"no home channel configured for {platform_name}; run /sethome on the desired chat first"
             )
         home_chat_id = str(home.chat_id)
+        native_mattermost = platform == Platform.MATTERMOST and not transport.is_relay
+        if native_mattermost:
+            chat_type = await transport.adapter._get_verified_chat_type(home_chat_id)
+            if chat_type is None:
+                raise RuntimeError("Mattermost handoff channel identity/type not verified")
         # Fresh thread for the handoff's own scrollback; None when unsupported or creation failed.
         cli_title = row.get("title") or cli_session_id[:8]
         try:
@@ -1475,16 +1480,23 @@ class GatewayStartupMixin:
         )
         is_thread = bool(new_thread_id) and not is_telegram_private_chat
         # Discord builds in-thread messages with ``chat_id == thread id``: key on the thread's OWN id.
-        dest_source = SessionSource(
-            platform=platform,
-            chat_id=str(effective_thread_id) if (
-                is_thread and platform == Platform.DISCORD and effective_thread_id
-            ) else home_chat_id,
-            chat_name=home.name,
-            chat_type="thread" if is_thread else "dm",
-            user_id=home_chat_id if is_telegram_private_chat else "system:handoff",
-            user_name="Handoff", thread_id=effective_thread_id, profile=profile_name,
-        )
+        if native_mattermost:
+            dest_source = transport.adapter.build_source(
+                chat_id=home_chat_id, chat_name=home.name, chat_type=chat_type,
+                user_id=home.user_id, scope_id=home.scope_id,
+                user_name="Handoff", thread_id=effective_thread_id,
+            )
+        else:
+            dest_source = SessionSource(
+                platform=platform,
+                chat_id=str(effective_thread_id) if (
+                    is_thread and platform == Platform.DISCORD and effective_thread_id
+                ) else home_chat_id,
+                chat_name=home.name,
+                chat_type="thread" if is_thread else "dm",
+                user_id=home_chat_id if is_telegram_private_chat else "system:handoff",
+                user_name="Handoff", thread_id=effective_thread_id, profile=profile_name,
+            )
         return self._HandoffDestination(
             platform=platform, platform_name=platform_name, transport=transport, home=home,
             home_chat_id=home_chat_id, effective_thread_id=effective_thread_id, source=dest_source,
@@ -1497,6 +1509,33 @@ class GatewayStartupMixin:
         ``agent:main:...`` while the profile's adapter routes on ``agent:<profile>:...``); the store
         resolver is only the root fallback. The isinstance check is load-bearing: a Mock store returns
         a truthy MagicMock."""
+        if dest.platform == Platform.MATTERMOST and not dest.transport.is_relay:
+            from hermes_cli.profiles import get_active_profile_name
+            try:
+                owner = get_active_profile_name()
+            except Exception as exc:
+                raise RuntimeError("Mattermost handoff profile ownership unavailable") from exc
+            source = dest.source
+            if (not isinstance(owner, str) or not owner.strip()
+                    or (profile_name is not None and profile_name != owner)
+                    or getattr(source, "profile_route_rejected", False) is True
+                    or (source.profile or owner) != owner):
+                raise RuntimeError("Mattermost handoff destination does not belong to the CLI profile")
+            # AsyncSessionStore wraps every callable; key generation here must stay synchronous.
+            store = getattr(self.async_session_store, "_store", self.async_session_store)
+            config = store.config
+            needs_user = (source.chat_type != "dm" and config.group_sessions_per_user
+                          and (not source.thread_id or config.thread_sessions_per_user))
+            if needs_user and (not source.user_id or source.user_id.startswith("system:")):
+                raise RuntimeError("Mattermost handoff requires the home channel participant")
+            session_key = store._generate_session_key(source)
+            expected_key = build_session_key(
+                source, group_sessions_per_user=config.group_sessions_per_user,
+                thread_sessions_per_user=config.thread_sessions_per_user,
+                profile=owner if config.multiplex_profiles else None)
+            if session_key != expected_key:
+                raise RuntimeError("Mattermost handoff session key does not match the CLI profile")
+            return session_key
         platform_cfg = dest.handoff_config.platforms.get(dest.platform)
         extra = platform_cfg.extra if platform_cfg else {}
         handoff_profile = profile_name if (profile_name and profile_name != "default") else None
@@ -1558,6 +1597,8 @@ class GatewayStartupMixin:
         # Reply into the new thread (else the home channel) via the resolved transport, so a relay-fronted
         # logical platform is stamped on the outbound frame.
         send_metadata = {"thread_id": dest.effective_thread_id} if dest.effective_thread_id else None
+        if send_metadata and dest.platform == Platform.MATTERMOST and not dest.transport.is_relay:
+            send_metadata["mattermost_explicit_thread"] = True
         try:
             result = await dest.transport.send(
                 dest.platform, str(dest.home.chat_id), response_text, send_metadata,

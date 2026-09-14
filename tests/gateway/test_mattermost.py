@@ -1739,7 +1739,7 @@ class TestMattermostHandoffThread:
         assert "/api/v4/posts" in call_args[0][0]
         payload = call_args[1]["json"]
         assert payload["channel_id"] == "channel_1"
-        assert "Inbox Triage" in payload["message"]
+        assert payload["message"] == ":thread: Hermes session"
         assert "root_id" not in payload
 
     @pytest.mark.asyncio
@@ -1798,3 +1798,97 @@ class TestMattermostSeedReplacement:
         result = await self.adapter.send("channel_1", "Hi", metadata={"thread_id": "seed_post", "mattermost_explicit_thread": True})
         assert result.message_id == "reply_post"
         assert not self.adapter._session.put.called
+
+
+class TestMattermostCronContentReceipt:
+    @staticmethod
+    def wire(adapter, *, channel=None, outcome="ok"):
+        """Fake only HTTP; exercise formatting, post routing and receipt owners."""
+        posts = []
+        gets = []
+        channel = {"id": "channel", "type": "O"} if channel is None else channel
+
+        def response(body, status=201):
+            resp = AsyncMock()
+            resp.__aenter__.return_value = resp
+            resp.status = status
+            resp.json.return_value = body
+            resp.text.return_value = "invalid root_id" if status == 404 else "rejected"
+            return resp
+
+        def get(url, **kwargs):
+            gets.append(url)
+            return response(channel if "/channels/" in url else {"id": "old", "root_id": ""})
+
+        def post(url, **kwargs):
+            payload = kwargs["json"]
+            posts.append(payload)
+            n = len(posts)
+            if outcome.startswith("warning") and n == 1:
+                return response({}, 404)
+            if outcome == "warning_only" and n == 3:
+                return response({}, 400)
+            if outcome == "partial" and n == 2:
+                return response({}, 400)
+            if outcome == "uncertain":
+                resp = response({})
+                resp.json.side_effect = TimeoutError()
+                return resp
+            return response({"id": f"p{n}", "channel_id": "channel", "root_id": payload.get("root_id", "")})
+
+        adapter._session = MagicMock()
+        adapter._session.get.side_effect = get
+        adapter._session.post.side_effect = post
+        return posts, gets
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind,expected", [("D", "dm"), ("G", "group"), ("P", "group"), ("O", "channel")])
+    async def test_first_content_is_root_and_following_chunks_are_replies(self, kind, expected):
+        adapter = _make_adapter()
+        adapter.MAX_MESSAGE_LENGTH = 500
+        posts, gets = self.wire(adapter, channel={"id": "channel", "type": kind})
+        metadata = {"cron_attach": True}
+        source = "a" * 500 + "b" * 500 + "tail"
+        result = await adapter.send("channel", source, metadata=metadata)
+        assert result.success
+        assert [p.get("root_id") for p in posts] == [None, "p1", "p1"]
+        assert result.raw_response["cron_root_id"] == "p1"
+        assert result.raw_response["cron_chat_type"] == expected
+        assert result.raw_response["source_confirmed_prefix"] == source
+        assert result.message_id == "p3"
+        assert metadata == {"cron_attach": True}
+        assert sum("/channels/channel" in url for url in gets) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("outcome", ["warning_ok", "warning_only", "partial", "uncertain"])
+    async def test_receipt_never_promotes_warning_to_content_root(self, outcome):
+        adapter = _make_adapter()
+        adapter.MAX_MESSAGE_LENGTH = 500
+        posts, _ = self.wire(adapter, outcome=outcome)
+        metadata = {"cron_attach": True, "notify": True}
+        if outcome.startswith("warning"):
+            metadata.update(thread_id="old", mattermost_explicit_thread=True)
+        result = await adapter.send("channel", "x" * 500 + "tail", metadata=metadata)
+        raw = result.raw_response
+        assert raw.get("cron_root_id") == {"warning_ok": "p3", "partial": "p1"}.get(outcome)
+        assert result.success is (outcome == "warning_ok")
+        if outcome == "warning_ok":
+            assert posts[-1]["root_id"] == "p3"
+        if outcome == "warning_only":
+            assert result.message_id == "p2"
+            assert raw["source_confirmed_prefix"] == ""
+        if outcome == "partial":
+            assert raw["source_confirmed_prefix"] == "x" * 500
+        if outcome == "uncertain":
+            assert len(posts) == 1 and raw["content_uncertain"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("channel", [{}, {"id": "other", "type": "D"}, {"id": "channel", "type": "X"}])
+    async def test_channel_identity_and_type_are_required_for_seed_receipt(self, channel):
+        adapter = _make_adapter()
+        self.wire(adapter, channel=channel)
+        result = await adapter.send("channel", "report", metadata={"cron_attach": True})
+        assert result.success
+        assert not result.raw_response.get("cron_chat_type")
+        assert result.raw_response.get("cron_metadata_error")
+

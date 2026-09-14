@@ -404,3 +404,284 @@ class TestUnverifiedDeliveryIsRecordedOnTheJob:
 def test_scheduler_module_exposes_the_confirmation_helper():
     """Guard the import surface the delivery block depends on."""
     assert callable(sched_delivery._confirm_adapter_delivery)
+
+
+@pytest.fixture
+def mattermost_cron(tmp_path, monkeypatch):
+    """Native scheduler/router/adapter/store; fake the gateway loop and HTTP only."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from gateway.config import GatewayConfig, HomeChannel
+    from gateway.session import SessionStore
+    from plugins.platforms.mattermost.adapter import MattermostAdapter
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    # The global test fixture pins one DB; these cases exercise native profile scopes.
+    import hermes_state
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", hermes_state._IMPORT_DEFAULT_DB_PATH)
+    pc = PlatformConfig(enabled=True, extra={"max_post_length": 500, "reply_mode": "off", "require_mention": False})
+    pc.home_channel = HomeChannel(platform=Platform.MATTERMOST, chat_id="room", name="Reports")
+    config = GatewayConfig(platforms={Platform.MATTERMOST: pc})
+    store = SessionStore(home / "sessions", config)
+    adapter = MattermostAdapter(pc)
+    adapter._session_store = store
+    adapter._bot_user_id = "bot"
+    adapter._bot_username = "hermes"
+    state = SimpleNamespace(adapter=adapter, store=store, config=config, posts=[], standalone=[],
+                            channel_type="O", outcome="ok", fail_at=2, channel_id="room", metadata_calls=[])
+
+    def response(body, status=201):
+        resp = AsyncMock()
+        resp.__aenter__.return_value = resp
+        resp.status = status
+        resp.json.return_value = body
+        resp.text.return_value = "invalid root_id" if status == 404 else "rejected"
+        return resp
+
+    def get(url, **kwargs):
+        if "/channels/" in url:
+            if state.outcome == "metadata_exception":
+                raise ValueError("metadata unavailable")
+            return response({"id": state.channel_id, "type": state.channel_type})
+        return response({"id": "explicit-root", "root_id": ""})
+
+    def post(url, **kwargs):
+        payload = kwargs["json"]
+        state.posts.append(payload)
+        n = len(state.posts)
+        if state.outcome == "warning_only" and n in (1, 3):
+            return response({}, 404 if n == 1 else 400)
+        if state.outcome == "rejected" and n == state.fail_at:
+            return response({}, 400)
+        if state.outcome == "uncertain" and n == state.fail_at:
+            resp = response({})
+            resp.json.side_effect = TimeoutError()
+            return resp
+        if state.outcome == "exception" and n == state.fail_at:
+            raise ValueError("transport failed")
+        return response({"id": f"post-{n}", "channel_id": "other" if state.outcome == "wrong_post" else "room",
+                         "root_id": payload.get("root_id", "")})
+
+    adapter._session = MagicMock()
+    adapter._session.get.side_effect = get
+    adapter._session.post.side_effect = post
+    adapter._upload_file = AsyncMock(return_value="file-id")
+    native_send = adapter.send
+
+    async def send(chat_id, content, reply_to=None, metadata=None):
+        state.metadata_calls.append(dict(metadata or {}))
+        if state.outcome == "filtered":
+            return {"success": True, "filtered": "silence_narration", "delivered": False}
+        return await native_send(chat_id, content, reply_to, metadata)
+
+    adapter.send = send
+    loop = MagicMock()
+    loop.is_running.return_value = True
+
+    def run_coro(coro, _loop):
+        future = Future()
+        try:
+            future.set_result(asyncio.run(coro))
+        except BaseException as exc:
+            future.set_exception(exc)
+        return future
+
+    async def standalone(*args, **kwargs):
+        state.standalone.append((args, kwargs))
+        return {"success": True, "message_id": "standalone"}
+
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
+    monkeypatch.setattr(sched, "load_config", lambda: {"cron": {"wrap_response": False, "mirror_delivery": True}})
+    monkeypatch.setattr(sched_delivery, "_record_delivery_verification", lambda *args: None)
+    monkeypatch.setattr("asyncio.run_coroutine_threadsafe", run_coro)
+    monkeypatch.setattr("tools.send_message_tool._send_to_platform", standalone)
+    state.job = {"id": "abc123", "name": "Brief", "deliver": "origin", "attach_to_session": True,
+                 "origin": {"platform": "mattermost", "chat_id": "room", "user_id": "member", "chat_type": "dm"}}
+    state.adapters = {Platform.MATTERMOST: adapter}
+    state.run = lambda text: _deliver_result(state.job, text, adapters=state.adapters, loop=loop)
+    return state
+
+
+@pytest.mark.parametrize("kind", ["D", "G", "P", "O"])
+@pytest.mark.parametrize("per_user", [False, True])
+def test_mattermost_first_report_resumes_exact_native_reply_session(mattermost_cron, tmp_path, kind, per_user):
+    import json
+    from unittest.mock import AsyncMock
+    from gateway.session import build_session_key
+    s = mattermost_cron
+    s.channel_type = kind
+    s.config.thread_sessions_per_user = per_user
+    report = "a" * 500 + "b" * 500 + "tail"
+    media = tmp_path / "report.txt"
+    media.write_text("attachment")
+    error = s.run(report + f"\nMEDIA:{media}")
+    assert error is None
+    assert s.metadata_calls[0]["cron_attach"] is True
+    assert [p.get("root_id") for p in s.posts] == [None, "post-1", "post-1", "post-1"]
+    assert s.posts[0]["message"] == report[:500]
+    assert s.posts[-1]["file_ids"] == ["file-id"]
+    assert len(s.store._entries) == 1
+    seeded = next(iter(s.store._entries.values()))
+    s.adapter.handle_message = AsyncMock()
+    asyncio.run(s.adapter._handle_ws_event({"event": "posted", "data": {
+        "channel_type": kind, "sender_name": "member", "post": json.dumps({
+            "id": "reply", "user_id": "member", "channel_id": "room", "message": "Continue",
+            "root_id": "post-1"})}}))
+    source = s.adapter.handle_message.call_args.args[0].source
+    assert seeded.session_key == build_session_key(source, thread_sessions_per_user=per_user)
+    resumed = s.store.get_or_create_session(source)
+    assert resumed.session_id == seeded.session_id
+    assert [(m["role"], m["content"]) for m in s.store.load_transcript(resumed.session_id)] == [
+        ("user", "[Cron delivery: Brief]\n" + report)]
+    assert s.standalone == []
+
+
+@pytest.mark.parametrize("outcome,fail_at,replay", [
+    ("rejected", 1, True), ("rejected", 2, False), ("uncertain", 1, False),
+    ("uncertain", 2, False), ("exception", 1, False), ("exception", 2, False),
+    ("warning_only", 3, False), ("filtered", 1, False), ("wrong_post", 1, False),
+])
+def test_mattermost_unconfirmed_report_never_seeds_or_replays_accepted_content(
+        mattermost_cron, tmp_path, outcome, fail_at, replay):
+    s = mattermost_cron
+    s.outcome, s.fail_at = outcome, fail_at
+    if outcome == "warning_only":
+        s.job["origin"]["thread_id"] = "explicit-root"
+    media = tmp_path / "report.txt"
+    media.write_text("attachment")
+    error = s.run("x" * 500 + "tail" + f"\nMEDIA:{media}")
+    assert bool(s.standalone) is replay
+    assert not s.store._entries
+    assert not s.adapter._upload_file.called
+    if not replay:
+        assert error
+    if outcome in {"rejected", "uncertain", "exception"}:
+        assert len(s.posts) == fail_at
+
+
+@pytest.mark.parametrize("kind,channel_id,outcome", [
+    ("X", "room", "ok"), ("D", "other", "ok"), ("O", "room", "metadata_exception")])
+def test_mattermost_failed_metadata_never_seeds_or_replays(mattermost_cron, kind, channel_id, outcome):
+    s = mattermost_cron
+    s.channel_type, s.channel_id, s.outcome = kind, channel_id, outcome
+    assert s.run("Report")
+    assert len(s.posts) == 1
+    assert not s.store._entries and not s.standalone
+
+
+@pytest.mark.parametrize("boundary", ["opt_out", "broadcast", "explicit_without_opt_in"])
+def test_mattermost_attach_boundaries_keep_flat_delivery(mattermost_cron, boundary):
+    s = mattermost_cron
+    if boundary == "opt_out":
+        s.job["attach_to_session"] = False
+    else:
+        s.job.pop("origin")
+        s.job["deliver"] = "all" if boundary == "broadcast" else "mattermost:room"
+        if boundary == "explicit_without_opt_in":
+            s.job.pop("attach_to_session")
+    assert s.run("Report") is None
+    assert len(s.posts) == 1 and "root_id" not in s.posts[0]
+    assert not s.metadata_calls[0].get("cron_attach")
+    assert not s.store._entries
+
+
+@pytest.mark.parametrize("route", ["explicit", "home", "origin_fallback", "explicit_root"])
+def test_mattermost_opted_in_targets_seed_verified_root(mattermost_cron, route):
+    s = mattermost_cron
+    s.channel_type = "D"
+    if route == "explicit_root":
+        s.job["origin"]["thread_id"] = "explicit-root"
+    else:
+        s.job.pop("origin")
+        s.job["deliver"] = {"explicit": "mattermost:room", "home": "mattermost", "origin_fallback": "origin"}[route]
+    assert s.run("Report") is None
+    assert len(s.posts) == 1 and len(s.store._entries) == 1
+    entry = next(iter(s.store._entries.values()))
+    expected_root = "explicit-root" if route == "explicit_root" else "post-1"
+    assert entry.session_key == f"agent:main:mattermost:dm:room:{expected_root}"
+    assert s.posts[0].get("root_id") == (expected_root if route == "explicit_root" else None)
+
+
+@pytest.mark.parametrize("kind,group_per_user,should_seed", [("O", True, False), ("D", True, True), ("G", False, True)])
+def test_mattermost_missing_required_participant_has_no_orphan_seed(mattermost_cron, kind, group_per_user, should_seed):
+    s = mattermost_cron
+    s.channel_type = kind
+    s.config.thread_sessions_per_user = True
+    s.config.group_sessions_per_user = group_per_user
+    s.job["origin"].pop("user_id")
+    assert s.run("Report") is None
+    assert bool(s.store._entries) is should_seed
+
+
+def test_mattermost_empty_report_has_no_placeholder_or_seed(mattermost_cron):
+    s = mattermost_cron
+    assert s.run("   ")
+    assert not s.posts and not s.store._entries and not s.standalone
+
+
+@pytest.mark.parametrize("owner,target,route,shared,dedicated", [
+    ("default", "reviews", "explicit", False, False),
+    ("reviews", "reviews", "origin", True, False),
+    ("reviews", "reviews", "home", True, False),
+    ("reviews", "reviews", "explicit", False, True),
+    ("default", "unserved", "origin", False, False),
+])
+def test_mattermost_cron_respects_native_profile_owner(
+        mattermost_cron, monkeypatch, tmp_path, caplog, owner, target, route, shared, dedicated):
+    import json
+    from pathlib import Path
+    from unittest.mock import AsyncMock
+    from cron.scheduler_preflight import SharedRouteAdapters
+    from gateway.profile_routing import parse_profile_routes
+    from gateway.run import GatewayRunner, _profile_runtime_scope
+    from hermes_cli.profiles import get_active_profile_name
+
+    s = mattermost_cron
+    home = s.store.sessions_dir.parent
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    reviews = home / "profiles" / "reviews"
+    reviews.mkdir(parents=True)
+    (reviews / "config.yaml").write_text("{}\n")
+    s.config.multiplex_profiles = True
+    s.config.profile_routes = parse_profile_routes([
+        {"name": "reports", "platform": "mattermost", "chat_id": "room", "profile": target}])
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = s.config
+    runner.adapters = {} if dedicated else {Platform.MATTERMOST: s.adapter}
+    runner._profile_adapters = {"reviews": {Platform.MATTERMOST: s.adapter}} if dedicated else {}
+    s.adapter.gateway_runner = runner
+    if dedicated:
+        s.adapter.set_owner_profile("reviews")
+    if shared:
+        s.adapters = SharedRouteAdapters(s.adapters, s.config.profile_routes)
+    s.channel_type = "D"
+    if route != "origin":
+        s.job.pop("origin")
+        s.job["deliver"] = "origin" if route == "home" else "mattermost:room"
+    owner_home = home if owner == "default" else reviews
+    with _profile_runtime_scope(owner_home, prepared_secret_scope={}):
+        assert get_active_profile_name() == owner
+        assert s.run("Profile report") is None
+        assert len(s.posts) == 1 and not s.standalone
+        s.adapter.handle_message = AsyncMock()
+        asyncio.run(s.adapter._handle_ws_event({"event": "posted", "data": {
+            "channel_type": "D", "post": json.dumps({"id": "reply", "user_id": "member",
+                "channel_id": "room", "message": "Continue", "root_id": "post-1"})}}))
+        source = s.adapter.handle_message.call_args.args[0].source
+        assert runner._transport_owner(source) == (s.adapter, "reviews" if dedicated else None)
+        if owner != target:
+            assert not s.store._entries
+            assert "thread seed did NOT land" in caplog.text
+            for profile_home in (home, reviews):
+                with _profile_runtime_scope(profile_home, prepared_secret_scope={}):
+                    assert s.store._db.list_sessions_rich() == []
+        else:
+            assert source.profile == owner
+            seeded = next(iter(s.store._entries.values()))
+            assert seeded.session_key == s.store._generate_session_key(source)
+            resumed = s.store.get_or_create_session(source)
+            assert resumed.session_id == seeded.session_id
+            assert [(m["role"], m["content"]) for m in s.store.load_transcript(resumed.session_id)] == [
+                ("user", "[Cron delivery: Brief]\nProfile report")]

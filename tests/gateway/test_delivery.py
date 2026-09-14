@@ -402,3 +402,26 @@ def test_local_delivery_writes_non_ascii_on_windows_codepage(tmp_path, monkeypat
     written = Path(result["path"]).read_text(encoding="utf-8")
     assert "完了 ✅ café" in written
     assert "日次レポート" in written
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw", [
+    {"source_confirmed_prefix": "prefix", "message_ids": ["accepted"]},
+    {"content_uncertain": True, "_delivery_uncertain": True},
+    {"source_confirmed_prefix": "", "source_attempted_prefix": ""},
+])
+async def test_mattermost_cron_retains_failed_send_result_at_router_boundary(raw):
+    from unittest.mock import AsyncMock
+    failed = SendResult(success=False, error="delivery failed", raw_response=raw)
+    adapter = RecordingAdapter()
+    adapter.send = AsyncMock(return_value=failed)
+    router = DeliveryRouter(GatewayConfig(platforms={Platform.MATTERMOST: PlatformConfig(enabled=True)}),
+                            {Platform.MATTERMOST: adapter})
+    target = DeliveryTarget.parse("mattermost:room")
+    result = await router._deliver_to_platform(target, "report", {"job_id": "abc", "cron_attach": True})
+    assert result is failed
+    public = (await router.deliver("report", [target], metadata={"job_id": "abc"}))[target.to_string()]
+    assert public["success"] is False
+    assert public["result"] is failed and public["error"] == "delivery failed"
+    with pytest.raises(RuntimeError, match="delivery failed"):
+        await router._deliver_to_platform(target, "report", None)
