@@ -56,6 +56,28 @@ class TestJobContextFromField:
 class TestBuildJobPromptContextFrom:
     """Test that _build_job_prompt() injects context from referenced jobs."""
 
+    @pytest.mark.parametrize("failure", ["invalid_utf8", "oversized"])
+    def test_invalid_or_oversized_sidecar_skips_to_older_run(self, cron_env, failure):
+        from cron import jobs
+        from cron.scheduler_prompt import _inject_context_from
+
+        job = jobs.create_job(prompt="Read context", schedule="every 1h")
+        older = jobs.save_job_output(job["id"], "log", "Useful earlier response")
+        os.utime(older, (1, 1))
+        newer = jobs.save_job_output(job["id"], "log", "New response")
+        sidecar = jobs._response_sidecar_path(newer)
+        malformed = b"\xff"
+        if failure == "oversized":
+            import json
+            payload = json.loads(sidecar.read_text())
+            payload["response"] = "x" * (1024 * 1024)
+            malformed = json.dumps(payload).encode()
+        sidecar.write_bytes(malformed)
+        os.utime(newer, (2, 2))
+        assert jobs.read_job_output_response(newer) == (False, None)
+        prompt, injected = _inject_context_from({**job, "context_from": ["self"]}, "next")
+        assert injected and "Useful earlier response" in prompt
+
     def test_injects_latest_output(self, cron_env):
         from cron.jobs import create_job, OUTPUT_DIR
         from cron.scheduler import _build_job_prompt

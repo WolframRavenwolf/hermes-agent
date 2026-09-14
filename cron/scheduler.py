@@ -2624,6 +2624,15 @@ def _save_compose_deliver(
     with fence.side_effect_fence() as owns_output:
         if not owns_output:
             raise _FireClaimLostDuringSideEffect
+        # A shutdown-killed tool subprocess can leave a plausible final_response from truncated
+        # output; force the honest "interrupted" failure path. Peek-only (consumed later).
+        if d.success and _is_interrupted(job["id"], execution_token):
+            d.success = False
+            d.error = (
+                "Interrupted by gateway shutdown before the run finished "
+                "(tool subprocess was killed mid-flight)."
+            )
+
         # Publish the exact response (or the useful failure payload) and
         # human-readable Markdown as one collision-resistant committed
         # run. The sidecar is prepared first; the Markdown filename is
@@ -2633,15 +2642,6 @@ def _save_compose_deliver(
         output_file = save_job_output(job["id"], output, context_payload)
     if verbose:
         logger.info("Output saved to: %s", output_file)
-
-    # A shutdown-killed tool subprocess can leave a plausible final_response from truncated
-    # output; force the honest "interrupted" failure path. Peek-only (consumed later).
-    if d.success and _is_interrupted(job["id"], execution_token):
-        d.success = False
-        d.error = (
-            "Interrupted by gateway shutdown before the run finished "
-            "(tool subprocess was killed mid-flight)."
-        )
 
     (
         deliver_content, d.blocked_config, _silent_alert, d.incident_acked, d.failure_incident_id,

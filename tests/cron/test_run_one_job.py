@@ -397,6 +397,23 @@ def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path
     assert ss.current_secret_scope() is None
 
 
+def test_known_interruption_persists_failure_before_publication(tmp_path, monkeypatch):
+    from cron import jobs
+
+    with jobs.use_cron_store(tmp_path):
+        calls = _patch_pipeline(monkeypatch, final="Plausible truncated answer")
+        monkeypatch.setattr(s, "save_job_output", jobs.save_job_output)
+        monkeypatch.setattr(s, "_interrupted_job_ids", {"abcdef"})
+        s.run_one_job({"id": "abcdef", "name": "interrupted"})
+        outputs = list((jobs.get_cron_output_dir() / "abcdef").glob("*.md"))
+        assert len(outputs) == 1
+        valid, response = jobs.read_job_output_response(outputs[0])
+        assert valid and response is not None
+        assert "Interrupted by gateway shutdown" in response
+        assert "Plausible truncated answer" not in response
+        assert not any(call == ("mark", "abcdef", True) for call in calls)
+
+
 def test_run_one_job_persists_exact_response_frame(monkeypatch):
     saves = []
     monkeypatch.setattr(

@@ -63,6 +63,7 @@ def _job_skill_names(job: dict) -> list[str]:
 
 
 _MAX_CONTEXT_CHARS = 8000
+_MAX_AUDIT_BYTES = 64 * 1024
 
 _SELF_CONTEXT_INTRO = (
     "The following is this job's most recent output from its previous run. Treat it as "
@@ -84,6 +85,24 @@ def _truncate_context(text: str) -> str:
     return text
 
 
+def _is_header_only_silent_audit(saved_output: str) -> bool:
+    """Recognize generated audit metadata, never declarations inside the job name."""
+    title, separator, metadata = saved_output.partition("\n\n**Job ID:** ")
+    if not separator or not title.startswith("# Cron Job: "):
+        return False
+    # Stop at the first metadata boundary: a later lookalike inside a prompt,
+    # report or error must not turn the preceding body into part of the title.
+    return re.fullmatch(
+        r"[^\n]+\n\*\*Run Time:\*\* [^\n]+\n(?:"
+        r"\*\*Mode:\*\* monitor\n\*\*Status:\*\* no_change \(agent run suppressed\)"
+        r"|\*\*Mode:\*\* no_agent \(script\)\n"
+        r"\*\*Status:\*\* silent \((?:empty output|wakeAgent=false)\)"
+        r"|\nScript gate returned `wakeAgent=false` — agent skipped\."
+        r")\n\s*",
+        metadata,
+    ) is not None
+
+
 def _latest_context_output(output_files, source_job_id: str) -> str:
     """Pick the newest usable chained-job payload from saved run files."""
     from cron.jobs import is_structured_job_output, read_job_output_response
@@ -91,6 +110,22 @@ def _latest_context_output(output_files, source_job_id: str) -> str:
     for output_file in output_files:
         has_structured_response, structured_response = read_job_output_response(output_file)
         if has_structured_response:
+            if _sched._is_cron_silence_response(structured_response or ""):
+                continue
+            # Only a complete, bounded header-only audit may override a sidecar.
+            # Large Markdown wrappers remain unread beyond this probe; a prefix
+            # cannot establish the absence of a prompt/report/error body.
+            try:
+                with output_file.open("rb") as handle:
+                    audit = handle.read(_MAX_AUDIT_BYTES + 1)
+            except OSError:
+                # The optional wrapper may disappear during pruning. Keep the
+                # already-validated response when silence cannot be established.
+                audit = b""
+            if len(audit) <= _MAX_AUDIT_BYTES and _is_header_only_silent_audit(
+                audit.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+            ):
+                continue
             # New runs use an out-of-band JSON frame, so response-like headings
             # inside the response cannot alter its boundary. Preserve a committed
             # empty or whitespace-only response as explicit context instead of
@@ -112,17 +147,8 @@ def _latest_context_output(output_files, source_job_id: str) -> str:
             )
             continue
 
-        saved_output = output_file.read_text(encoding="utf-8")
-        if not saved_output.strip():
-            continue
-        # Main's silent/no_change audit docs are not chaining payloads; skip them
-        # without falling back to the ambiguous legacy heading parser.
-        header = saved_output.strip().split("\n---\n", 1)[0].split("\n## Prompt", 1)[0]
-        if saved_output.strip().startswith("# Cron Job:") and any(
-            line.startswith(("**Status:** no_change", "**Status:** silent",
-                             "Script gate returned `wakeAgent=false`"))
-            for line in header.splitlines()
-        ):
+        saved_output = output_file.read_text(encoding="utf-8", errors="replace")
+        if not saved_output.strip() or _is_header_only_silent_audit(saved_output):
             continue
         response_markers = list(re.finditer(r"(?m)^## Response[ \t]*\r?$", saved_output))
         if len(response_markers) == 1:
