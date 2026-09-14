@@ -887,9 +887,14 @@ def _resolve_explicit_runtime(
         # trailing /v1 so the SDK constructs the correct path (e.g.
         # https://opencode.ai/zen/v1/messages instead of .../v1/v1/messages).
         # Mirrors the same step in _resolve_runtime_from_pool_entry.
+        # Restore /v1 only for known OpenCode roots; custom proxy roots stay exact.
         if api_mode == "anthropic_messages" and provider in ("opencode-zen", "opencode-go"):
             import re as _re
             base_url = _re.sub(r"/v1/?$", "", base_url)
+        elif provider in ("opencode-zen", "opencode-go") and base_url.rstrip("/") in (
+            "https://opencode.ai/zen", "https://opencode.ai/zen/go",
+        ):
+            base_url = base_url.rstrip("/") + "/v1"
 
         return {
             "provider": provider,
