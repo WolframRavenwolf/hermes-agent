@@ -113,7 +113,7 @@ class TavilyWebSearchProvider(BaseWebSearchProvider):
                 return extract_fail(urls, missing)
             logger.info("Tavily %sextract: %d URL(s)", prefix, len(urls))
             raw = _tavily_request("extract", {"urls": urls, "include_images": False}, api_key=key)
-            return _normalize_tavily_documents(raw, fallback_url=urls[0] if urls else "")
+            return _normalize_tavily_documents(raw, fallback_url=urls[0] if len(urls) == 1 else "")
 
         return run_extract("Tavily", logger, urls, _body)
 

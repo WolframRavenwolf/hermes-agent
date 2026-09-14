@@ -142,11 +142,18 @@ class TestNormalizeTavilyDocuments:
         assert docs[0]["metadata"]["sourceURL"] == "https://example.com"
 
 
-    def test_fallback_url(self):
-        from plugins.web.tavily.provider import _normalize_tavily_documents
+    @pytest.mark.parametrize("urls, expected_url", [
+        (["https://fallback.com"], "https://fallback.com"),
+        (["https://fallback.com", "https://other.example"], ""),
+    ], ids=["single-request", "multi-request"])
+    def test_fallback_url(self, urls, expected_url):
+        from plugins.web.tavily.provider import TavilyWebSearchProvider
         raw = {"results": [{"content": "data"}]}
-        docs = _normalize_tavily_documents(raw, fallback_url="https://fallback.com")
-        assert docs[0]["url"] == "https://fallback.com"
+        with patch.dict(os.environ, {"TAVILY_API_KEY": "tvly-test"}), \
+             patch("plugins.web.tavily.provider.httpx.post", return_value=_ok_response(raw)):
+            docs = TavilyWebSearchProvider().extract(urls)
+        assert docs[0]["url"] == expected_url
+        assert docs[0]["metadata"]["sourceURL"] == expected_url
 
 
 # ─── availability / auto-detect ───────────────────────────────────────────────
@@ -315,3 +322,123 @@ class TestWebExtractTavily:
             assert len(result["results"]) == 1
             assert result["results"][0]["url"] == "https://example.com"
             assert "Extracted content" in result["results"][0]["content"]
+
+
+class TestTavilyExtractContracts:
+    """Exercise Tavily response provenance through the real dispatcher and disk cache."""
+
+    @pytest.fixture(autouse=True)
+    def _isolated_tavily(self, monkeypatch):
+        from hermes_constants import get_hermes_home
+        from tools import website_policy
+
+        register_all_web_providers()
+        config = {"web": {
+            "backend": "tavily", "cache_enabled": True,
+            "keyless_fallback": True, "keyless_rescue": False,
+        }}
+        (get_hermes_home() / "config.yaml").write_text(json.dumps(config))
+        monkeypatch.setenv("TAVILY_API_KEY", "synthetic-test")
+        monkeypatch.setattr("tools.web_tools._load_web_config", lambda: config["web"])
+        monkeypatch.setattr("tools.url_safety.socket.getaddrinfo",
+                            lambda *args, **kwargs: [(2, 1, 6, "", ("93.184.216.34", 443))])
+        with website_policy._cache_lock:
+            website_policy._cached_policy = None
+        yield
+        with website_policy._cache_lock:
+            website_policy._cached_policy = None
+        from agent.web_search_registry import _reset_for_tests
+        _reset_for_tests()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure_field", ["failed_results", "failed_urls"])
+    @pytest.mark.parametrize("unlabeled", [False, True], ids=["labeled-only", "unlabeled-success"])
+    async def test_mixed_batch_does_not_cache_success_under_failed_url(self, failure_field, unlabeled):
+        from tools.web_tools import web_extract_tool
+        from tools.web_result_cache import extract_cache_get
+
+        a, b = "https://example.com/failed", "https://example.com/success"
+        failures = [{"url": a, "error": "unavailable"}] if failure_field == "failed_results" else [a]
+        raw = {"results": [{"url": b, "raw_content": "ONLY_PAGE_B"}], failure_field: failures}
+        if unlabeled:
+            raw["results"].insert(0, {"raw_content": "UNATTRIBUTED"})
+        with patch("plugins.web.tavily.provider.httpx.post", side_effect=[
+            _ok_response(raw), _ok_response({failure_field: failures}),
+        ]) as post:
+            first = json.loads(await web_extract_tool([a, b]))["results"]
+            later_a = json.loads(await web_extract_tool([a]))["results"][0]
+            later_b = json.loads(await web_extract_tool([b]))["results"][0]
+        assert [row["url"] for row in first] == [a, b]
+        assert first[0].get("error") and not first[0]["content"]
+        assert first[1]["content"] == "ONLY_PAGE_B"
+        assert later_a.get("error") and not later_a["content"]
+        assert extract_cache_get(a, provider="tavily") is None
+        cached_b = extract_cache_get(b, provider="tavily")
+        assert cached_b is not None and cached_b["content"] == "ONLY_PAGE_B"
+        assert later_b["content"] == "ONLY_PAGE_B"
+        assert [call.kwargs["json"]["urls"] for call in post.call_args_list] == [[a, b], [a]]
+
+    @pytest.mark.asyncio
+    async def test_sparse_shuffled_response_preserves_requested_slots(self):
+        from tools.web_tools import web_extract_tool
+        from tools.web_result_cache import extract_cache_get
+
+        a, b, c = [f"https://example.com/{name}" for name in "abc"]
+        raw = {"results": [
+            {"url": b, "raw_content": "B"},
+            {"url": "https://example.com/unrequested", "raw_content": "EXTRA"},
+            {"url": a, "raw_content": "A"},
+            {"raw_content": "UNATTRIBUTED"},
+        ]}
+        with patch("plugins.web.tavily.provider.httpx.post", side_effect=[
+            _ok_response(raw), _ok_response({"failed_urls": [c]}),
+        ]) as post:
+            rows = json.loads(await web_extract_tool([a, c, b, a]))["results"]
+            again = json.loads(await web_extract_tool([a, c, b, a]))["results"]
+        for batch in (rows, again):
+            assert [row["url"] for row in batch] == [a, c, b, a]
+            assert batch[1].get("error") and not batch[1]["content"]
+            assert [batch[i]["content"] for i in (0, 2, 3)] == ["A", "B", "A"]
+        assert extract_cache_get(c, provider="tavily") is None
+        assert [call.kwargs["json"]["urls"] for call in post.call_args_list] == [[a, c, b, a], [c]]
+
+    @pytest.mark.asyncio
+    async def test_unlabeled_result_cannot_fill_or_cache_missing_first_request(self):
+        from tools.web_tools import web_extract_tool
+        from tools.web_result_cache import extract_cache_get
+
+        a, b = "https://example.com/a", "https://example.com/b"
+        raw = {"results": [{"raw_content": "UNATTRIBUTED"}, {"url": b, "raw_content": "B"}]}
+        with patch("plugins.web.tavily.provider.httpx.post", side_effect=[
+            _ok_response(raw), _ok_response({"results": [{"raw_content": "A"}]}),
+        ]) as post:
+            rows = json.loads(await web_extract_tool([a, b]))["results"]
+            assert [row["url"] for row in rows] == [a, b]
+            assert rows[0].get("error") and not rows[0]["content"]
+            assert rows[1]["content"] == "B"
+            assert extract_cache_get(a, provider="tavily") is None
+            cached_b = extract_cache_get(b, provider="tavily")
+            assert cached_b is not None and cached_b["content"] == "B"
+            later_a = json.loads(await web_extract_tool([a]))["results"][0]
+        assert later_a["content"] == "A" and not later_a.get("error")
+        assert [call.kwargs["json"]["urls"] for call in post.call_args_list] == [[a, b], [a]]
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_native_tavily_observable_collision_is_ambiguous_without_stamping_vendor_marker(monkeypatch, reverse):
+    from plugins.web.tavily.provider import TavilyWebSearchProvider
+    from tools.web_tools_extract import _pair_results
+    urls = ["https://a.example", "https://b.example"]
+    raw = {"results": [
+        {"url": urls[1], "raw_content": "A redirected body", "_request_url": urls[0]},
+        {"url": urls[1], "raw_content": "B body"},
+    ]}
+    if reverse:
+        raw["results"].reverse()
+    with patch("plugins.web.tavily.provider.httpx.post", return_value=_ok_response(raw)) as post:
+        rows = TavilyWebSearchProvider().extract(urls)
+    assert all("_request_url" not in r for r in rows)
+    paired = _pair_results(urls, rows)
+    assert paired[0].get("error") and "ambiguous" in paired[1]["error"].lower()
+    assert all(not r["content"] for r in paired)
+    post.assert_called_once()

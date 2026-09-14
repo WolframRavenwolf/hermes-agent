@@ -71,9 +71,9 @@ class KeenableWebSearchProvider(BaseWebSearchProvider):
                     if response.status_code >= 400:
                         raise ValueError(http_status_detail(response))
                     data = response.json()
-                    results.append(document(data.get("url") or url, data.get("title") or "", data.get("content") or "", source_url=url))
+                    results.append({**document(data.get("url") or url, data.get("title") or "", data.get("content") or "", source_url=url), "_request_url": url})
                 except Exception as exc:  # noqa: BLE001 — per-URL error entry
-                    results.append(page_error(url, f"Keenable extract failed: {exc}"))
+                    results.append({**page_error(url, f"Keenable extract failed: {exc}"), "_request_url": url})
             return results
 
         return run_extract("Keenable", logger, urls, _body, verbatim_value_error=False)
