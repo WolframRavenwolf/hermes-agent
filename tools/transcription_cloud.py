@@ -104,12 +104,15 @@ def _transcribe_groq(
     return _with_openai_client(api_key, GROQ_BASE_URL, file_path, "Groq", _run)
 
 
-def _gpt_transcribe_languages(provider_label: str, language: Optional[str]) -> list[str]:
+def _gpt_transcribe_languages(
+    provider_label: str, language: Optional[str], *, config: Optional[Dict[str, Any]] = None
+) -> list[str]:
     """Explicit override > native array > legacy string resolution."""
     from tools.transcription_tools import _load_stt_config, _resolve_stt_language
 
     if not language:
-        config = _load_stt_config()
+        if config is None:
+            config = _load_stt_config()
         languages = _get_stt_section(config, provider_label).get("languages")
         if languages is not None:
             if not isinstance(languages, list) or any(
@@ -132,7 +135,7 @@ def _transcribe_openai(
     """Transcribe via the OpenAI ``audio.transcriptions.create`` SDK shape, shared by every
     OpenAI-compatible endpoint (DeepInfra etc.): explicit ``api_key``/``base_url`` skip the
     OpenAI-only auth chain; ``provider_label`` names the response's provider."""
-    from tools.transcription_tools import _HAS_OPENAI, _resolve_stt_language
+    from tools.transcription_tools import _HAS_OPENAI, _load_stt_config, _resolve_stt_language
     if api_key is None:
         try:
             api_key, fallback_base = _resolve_openai_audio_client_config()
@@ -145,6 +148,10 @@ def _transcribe_openai(
     if provider_label == "openai" and model_name in GROQ_MODELS:
         logger.info("Model %s not available on OpenAI, using %s", model_name, DEFAULT_STT_MODEL)
         model_name = DEFAULT_STT_MODEL
+    # Keep native language config stable through client construction and container retry.
+    language_config = (
+        _load_stt_config() if model_name == "gpt-transcribe" and not language else None
+    )
     # Resolve gpt-transcribe separately so the native array precedes legacy config hints.
     if model_name != "gpt-transcribe":
         language = language or _resolve_stt_language(provider_label)
@@ -158,7 +165,7 @@ def _transcribe_openai(
             }
             # gpt-transcribe takes a ``languages`` list and rejects the legacy field.
             if model_name == "gpt-transcribe":
-                languages = _gpt_transcribe_languages(provider_label, language)
+                languages = _gpt_transcribe_languages(provider_label, language, config=language_config)
                 if languages:
                     create_kwargs["extra_body"] = {"languages": languages}
             elif language:
