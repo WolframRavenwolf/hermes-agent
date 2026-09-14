@@ -168,6 +168,74 @@ def _cron_mirror_message(job: dict, text: str) -> str:
     return f"[Cron delivery: {job.get('name') or job.get('id', 'cron')}]\n{text}"
 
 
+def _record_cron_conversation(job: dict, session_id: str, mirror_text: str) -> None:
+    """Metadata is best-effort and only follows successful mirror persistence."""
+    output_file = job.get("_context_output_file")
+    if not output_file:
+        return
+    try:
+        from cron.context import record_conversation
+        record_conversation(output_file, session_id, mirror_text)
+    except Exception:
+        logger.debug("Cron context: recording delivery anchor failed", exc_info=True)
+
+
+def _record_cron_mirror_conversation(
+    job: dict, session_id: str, mirror_text: str, platform_name: str, chat_id: str,
+    thread_id: Optional[str], user_id: Optional[str],
+) -> None:
+    """Export discussion only from the native key for this delivery's identity.
+
+    The mirror finder can return a sole different participant. That inherited
+    mirror policy is not permission to read their conversation back into cron.
+    Shared keys (including DMs) intentionally need not match the row's creator.
+    """
+    if not job.get("_context_output_file"):
+        return
+    from gateway.config import Platform, load_gateway_config
+    from gateway.session import SessionSource, build_session_key
+    from hermes_state import SessionDB
+
+    db = SessionDB(read_only=True)
+    try:
+        row = db.get_session(session_id)
+    finally:
+        db.close()
+    if (not row or row.get("ended_at") is not None
+            or str(row.get("source", "")).lower() != platform_name.lower()
+            or str(row.get("chat_id") or "") != str(chat_id)
+            or str(row.get("thread_id") or "") != str(thread_id or "")):
+        return
+    origin = _resolve_origin(job) or {}
+    if (not _target_matches_origin(origin, platform_name, chat_id, thread_id)
+            or str(origin.get("thread_id") or "") != str(thread_id or "")):
+        origin = {}
+    chat_type = origin.get("chat_type") or row.get("chat_type")
+    if chat_type not in {"dm", "group", "channel", "thread"}:
+        return
+    source = SessionSource(
+        platform=Platform(platform_name.lower()), chat_id=str(chat_id), chat_type=chat_type,
+        thread_id=str(thread_id) if thread_id else None,
+        user_id=str(user_id) if user_id else None,
+        user_id_alt=origin.get("user_id_alt") if origin.get("user_id") == user_id else None,
+        scope_id=origin.get("scope_id", origin.get("guild_id")), profile=origin.get("profile"))
+    config = load_gateway_config()
+    group_per_user = config.group_sessions_per_user
+    thread_per_user = config.thread_sessions_per_user
+    if (chat_type != "dm" and group_per_user and not (thread_id and not thread_per_user)
+            and not (source.user_id_alt or source.user_id)):
+        return
+    profile = None
+    if config.multiplex_profiles:
+        from hermes_cli.profiles import get_active_profile_name
+        profile = source.profile or get_active_profile_name() or "default"
+    expected_key = build_session_key(
+        source, group_sessions_per_user=group_per_user,
+        thread_sessions_per_user=thread_per_user, profile=profile)
+    if row.get("session_key") == expected_key:
+        _record_cron_conversation(job, session_id, mirror_text)
+
+
 def _maybe_mirror_cron_delivery(
     job: dict, platform_name: str, chat_id: str, mirror_text: str, thread_id: Optional[str] = None,
     user_id: Optional[str] = None, *, enabled: bool = False,
@@ -183,7 +251,15 @@ def _maybe_mirror_cron_delivery(
     if not text:
         return
     try:
-        from gateway.mirror import mirror_to_session
+        from gateway.mirror import _find_session_id, mirror_to_session
+        # Pin the exact target before writing. None is a wildcard in the native
+        # finder, whereas an empty thread explicitly means the flat conversation.
+        session_id = _find_session_id(
+            platform_name, str(chat_id), thread_id=thread_id if thread_id is not None else "",
+            user_id=user_id)
+        if not session_id:
+            return
+        labelled_text = _cron_mirror_message(job, text)
         # USER role + labelled prefix, NOT assistant: an assistant-role mirror lands
         # assistant→assistant and breaks strict alternation; consecutive user turns merge safely.
         # The brief is not the agent speaking; an assistant-role mirror lands as assistant→assistant after
@@ -192,9 +268,12 @@ def _maybe_mirror_cron_delivery(
         # on every provider, and the prefix preserves the "this came from cron" context that the dropped
         # SQLite mirror metadata would otherwise lose on replay.
         ok = mirror_to_session(
-            platform_name, str(chat_id), _cron_mirror_message(job, text),
-            source_label="cron", thread_id=thread_id, user_id=user_id, role="user")
+            platform_name, str(chat_id), labelled_text,
+            source_label="cron", thread_id=thread_id, user_id=user_id, role="user",
+            session_id=session_id)
         if ok:
+            _record_cron_mirror_conversation(
+                job, session_id, labelled_text, platform_name, chat_id, thread_id, user_id)
             logger.info(
                 "Job '%s': mirrored delivery into %s:%s session transcript",
                 job.get("id", "?"), platform_name, chat_id)
@@ -268,11 +347,17 @@ def _seed_cron_session(
             # bails on populated chats.
             _entry = session_store.get_or_create_session(dest_source)
             seeded_session_id = getattr(_entry, "session_id", None)
-    return mirror_to_session(
-        platform_name, str(chat_id), _cron_mirror_message(job, text),
+    if not seeded_session_id:
+        return False  # Never infer a different conversation when seeding failed.
+    labelled_text = _cron_mirror_message(job, text)
+    ok = mirror_to_session(
+        platform_name, str(chat_id), labelled_text,
         source_label="cron", thread_id=thread_id, user_id=user_id, role="user",
         session_id=seeded_session_id,
     )
+    if ok:
+        _record_cron_conversation(job, seeded_session_id, labelled_text)
+    return ok
 
 
 def _seed_cron_thread_session(

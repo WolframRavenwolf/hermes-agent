@@ -404,3 +404,205 @@ class TestUnverifiedDeliveryIsRecordedOnTheJob:
 def test_scheduler_module_exposes_the_confirmation_helper():
     """Guard the import surface the delivery block depends on."""
     assert callable(sched_delivery._confirm_adapter_delivery)
+
+
+
+@pytest.fixture
+def discussion_delivery(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from cron import jobs
+    from gateway.config import GatewayConfig
+    from gateway.session import SessionSource, SessionStore
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True)})
+    store = SessionStore(tmp_path / "sessions", config)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id=CHAT_ID, chat_type="dm", user_id="owner")
+    flat = store.get_or_create_session(source)
+    topic = store.get_or_create_session(SessionSource(
+        platform=Platform.TELEGRAM, chat_id=CHAT_ID, chat_type="dm", user_id="owner", thread_id="99"))
+    with jobs.use_cron_store(tmp_path):
+        path = jobs.save_job_output("abcdef", "Native output document")
+        job = {"id": "abcdef", "name": "Brief", "deliver": "origin", "attach_to_session": True,
+               "origin": {"platform": "telegram", "chat_id": CHAT_ID, "chat_type": "dm", "user_id": "owner"},
+               "_context_output_file": str(path)}
+        try:
+            yield job, path, store, SimpleNamespace(_session_store=store), flat, topic, config
+        finally:
+            store.close_all_db_handles()
+
+
+@pytest.mark.parametrize("route", ["mirror", "thread", "channel"])
+def test_native_mirror_and_seed_owners_bind_exact_persisted_user_turn(discussion_delivery, route):
+    import json
+    from cron.context import load_context
+    job, path, store, adapter, flat, topic, _ = discussion_delivery
+    if route == "mirror":
+        sched_delivery._maybe_mirror_cron_delivery(job, "telegram", CHAT_ID, "Delivered report", user_id="owner", enabled=True)
+    elif route == "thread":
+        sched_delivery._seed_cron_thread_session(job, adapter, "telegram", CHAT_ID, "99", "Delivered report", is_dm=True)
+    else:
+        assert sched_delivery._seed_cron_channel_session(
+            job, adapter, "telegram", CHAT_ID, "Delivered report", is_dm=True, user_id="owner")
+    record = json.loads(path.with_suffix(".context.json").read_text())
+    sid = topic.session_id if route == "thread" else flat.session_id
+    assert len(record["conversations"]) == 1
+    ref = record["conversations"][0]
+    assert ref["session_id"] == sid
+    rows = store._db.get_context_messages(sid, matching_content="[Cron delivery: Brief]\nDelivered report")
+    assert ref == {"session_id": sid, "after_id": rows[0]["id"], "after_timestamp": rows[0]["timestamp"]}
+    other = flat.session_id if route == "thread" else topic.session_id
+    store._db.append_message(sid, "user", "Next briefing correction")
+    store._db.append_message(other, "user", "OTHER CONVERSATION")
+    result = load_context("abcdef")
+    assert "Next briefing correction" in result and "OTHER CONVERSATION" not in result
+
+
+@pytest.mark.parametrize("route", ["mirror", "seed"])
+@pytest.mark.parametrize("failure", ["write", "missing_anchor"])
+def test_failed_mirror_or_missing_anchor_never_records_reference(discussion_delivery, monkeypatch, route, failure):
+    import gateway.mirror as mirror
+    job, path, store, adapter, _, _, _ = discussion_delivery
+    if failure == "write":
+        def fail_write(*args, **kwargs):
+            raise OSError("SQLite unavailable")
+        monkeypatch.setattr(mirror, "_append_to_sqlite", fail_write)
+    else:
+        monkeypatch.setattr(mirror, "mirror_to_session", lambda *args, **kwargs: True)
+    if route == "mirror":
+        sched_delivery._maybe_mirror_cron_delivery(job, "telegram", CHAT_ID, "Undurable report", user_id="owner", enabled=True)
+    else:
+        sched_delivery._seed_cron_channel_session(job, adapter, "telegram", CHAT_ID, "Undurable report", is_dm=True, user_id="owner")
+    assert not path.with_suffix(".context.json").exists()
+
+
+def test_seed_without_exact_session_does_not_fall_back_to_existing_chat(discussion_delivery):
+    from types import SimpleNamespace
+    job, path, store, _, flat, _, _ = discussion_delivery
+    assert not sched_delivery._seed_cron_session(
+        job, SimpleNamespace(), "telegram", CHAT_ID, "Do not infer", thread_id=None,
+        chat_type="dm", user_id="owner", chat_name=None, scope_id=None)
+    assert store._db.get_context_messages(flat.session_id) == []
+    assert not path.with_suffix(".context.json").exists()
+
+
+def test_flat_mirror_does_not_select_only_available_topic(discussion_delivery):
+    job, path, store, _, flat, topic, _ = discussion_delivery
+    # Different chat has a topic but no flat conversation.
+    from gateway.session import SessionSource
+    entry = store.get_or_create_session(SessionSource(
+        platform=Platform.TELEGRAM, chat_id="topic-only", chat_type="dm", user_id="owner", thread_id="99"))
+    sched_delivery._maybe_mirror_cron_delivery(job, "telegram", "topic-only", "Do not infer", user_id="owner", enabled=True)
+    assert store._db.get_context_messages(entry.session_id) == []
+    assert not path.with_suffix(".context.json").exists()
+
+
+@pytest.mark.parametrize("chat_type,thread_id,group_per_user,thread_per_user,participant,ended,allowed", [
+    ("group", None, True, False, "B", False, False),
+    ("group", None, True, False, "B", True, False),
+    ("group", "99", True, True, "B", False, False),
+    ("group", "99", True, True, "B", True, False),
+    ("group", None, True, False, "A", False, True),
+    ("group", None, False, False, "B", False, True),
+    ("group", "99", True, False, "B", False, True),
+    ("group", "99", False, True, "B", False, True),
+    ("dm", None, True, False, "B", False, True),
+    ("dm", "99", True, True, "B", False, True),
+])
+def test_standalone_discussion_uses_native_participant_route(
+    discussion_delivery, monkeypatch, chat_type, thread_id, group_per_user,
+    thread_per_user, participant, ended, allowed,
+):
+    import json
+    from dataclasses import replace
+    from cron.context import load_context
+    from gateway.session import SessionSource
+    job, path, store, _, _, _, config = discussion_delivery
+    config.group_sessions_per_user = group_per_user
+    config.thread_sessions_per_user = thread_per_user
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="participant-route",
+                           chat_type=chat_type, thread_id=thread_id, user_id="A")
+    if ended:
+        previous = store.get_or_create_session(source)
+        store._db.end_session(previous.session_id, "session_reset")
+    target = store.get_or_create_session(replace(source, user_id=participant))
+    assert (target.session_key == store._generate_session_key(source)) is allowed
+    job["origin"] = source.to_dict()
+    sent = []
+    async def send(*args, **kwargs):
+        sent.append((args, kwargs))
+        return {"success": True, "message_id": "confirmed"}
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
+    monkeypatch.setattr("tools.send_message_tool._send_to_platform", send)
+    monkeypatch.setattr(sched, "load_config", lambda: {"cron": {"wrap_response": False}})
+    assert sched._deliver_result(job, "Delivered report") is None
+    assert sent
+    store._db.append_message(target.session_id, "user", "Participant route correction")
+    result = load_context("abcdef")
+    companion = path.with_suffix(".context.json")
+    if allowed:
+        record = json.loads(companion.read_text())
+        assert record["conversations"][0]["session_id"] == target.session_id
+        assert "Participant route correction" in result
+    else:
+        assert not companion.exists()
+        assert result == ""
+
+
+def test_discussion_rejects_same_user_in_another_slack_scope(discussion_delivery, monkeypatch):
+    from gateway.session import SessionSource
+    from cron.context import load_context
+    job, path, store, _, _, _, config = discussion_delivery
+    target = store.get_or_create_session(SessionSource(
+        platform=Platform.SLACK, chat_id="scope-chat", chat_type="group", user_id="A", scope_id="B"))
+    job["origin"] = {"platform": "slack", "chat_id": "scope-chat", "chat_type": "group",
+                     "user_id": "A", "scope_id": "A"}
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
+    sched_delivery._maybe_mirror_cron_delivery(
+        job, "slack", "scope-chat", "Delivered report", user_id="A", enabled=True)
+    store._db.append_message(target.session_id, "user", "Other workspace correction")
+    assert not path.with_suffix(".context.json").exists()
+    assert load_context("abcdef") == ""
+
+
+@pytest.mark.parametrize("delivered", [True, False])
+def test_save_compose_deliver_reaches_real_sqlite_and_next_prompt(discussion_delivery, monkeypatch, delivered):
+    from cron import jobs
+    from cron.scheduler_prompt import _inject_context_from
+    job, old_path, store, adapter, flat, _, config = discussion_delivery
+    job.pop("_context_output_file")
+    jobs.save_jobs([job])
+    sent = []
+    async def send(target, text, metadata):
+        sent.append(text)
+        return {"success": delivered, "delivered": delivered, "message_id": "123" if delivered else None}
+    async def fail_standalone(*args, **kwargs):
+        return {"error": "Transport unavailable"}
+    router = MagicMock()
+    router._deliver_to_platform = send
+    loop = MagicMock()
+    loop.is_running.return_value = True
+    def run_coro(coro, _loop):
+        future = Future()
+        try:
+            future.set_result(asyncio.run(coro))
+        except BaseException as exc:
+            future.set_exception(exc)
+        return future
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
+    monkeypatch.setattr(sched, "load_config", lambda: {"cron": {"wrap_response": False}})
+    monkeypatch.setattr("gateway.delivery.DeliveryRouter", lambda *args, **kwargs: router)
+    monkeypatch.setattr("tools.send_message_tool._send_to_platform", fail_standalone)
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", run_coro)
+    outcome = sched._RunDelivery(job, success=True, error=None)
+    sched._save_compose_deliver(outcome, sched._FireOwnership(job, None), "Delivered report", "Original native log",
+                               adapters={Platform.TELEGRAM: adapter}, loop=loop, verbose=False, execution_token=None)
+    assert sent and outcome.delivery_attempted
+    assert "_context_output_file" not in job and "_context_output_file" not in jobs.get_job(job["id"])
+    companions = list(old_path.parent.glob("*.context.json"))
+    if delivered:
+        assert outcome.delivery_error is None and len(companions) == 1
+        store._db.append_message(flat.session_id, "user", "Correction through the native pipeline")
+        prompt, injected = _inject_context_from({"id": "abcdef", "context_from": ["self"]}, "Next task")
+        assert injected and "Original native log" in prompt and "Correction through the native pipeline" in prompt
+    else:
+        assert outcome.delivery_error and companions == []

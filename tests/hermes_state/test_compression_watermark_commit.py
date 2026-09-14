@@ -338,3 +338,54 @@ class TestRotationPathWatermark:
         assert [m["content"] for m in child] == [
             SUMMARY[0]["content"], SUMMARY[1]["content"],
         ]
+
+
+@pytest.mark.parametrize("mode", ["in_place", "rotation"])
+def test_provenance_publication_stamps_copies_and_preserves_payload(db, mode):
+    original = db.append_message("sess1", "user", "persisted", display_metadata={"label": "kept"})
+    watermark = db.get_active_message_watermark("sess1")
+    concurrent = db.append_message("sess1", "user", "concurrent", api_content="exact sidecar")
+    messages = [{"role": "user", "content": "persisted", "_row_id": original,
+                 "display_metadata": {"label": "kept"}},
+                {"role": "user", "content": "unknown", "display_metadata": {
+                    "_compression_origin": {"version": 1, "session_id": "sess1", "row_id": original}}}]
+    if mode == "in_place":
+        db.archive_and_compact("sess1", messages, watermark=watermark)
+        target = "sess1"
+    else:
+        db.publish_compression_child(parent_session_id="sess1", child_session_id="child",
+            source="test", require_compression_lease=False, messages=messages,
+            watermark=watermark, model_config={"keep": "config"})
+        target = "child"
+    rows = db.get_messages(target)
+    assert rows[0]["display_metadata"]["label"] == "kept"
+    for row, expected in zip(rows, [original, None, concurrent]):
+        assert row["display_metadata"]["_compression_origin"] == {
+            "version": 1, "session_id": "sess1" if expected else None, "row_id": expected}
+    assert rows[-1]["api_content"] == "exact sidecar"
+    if mode == "rotation":
+        config = db.get_session(target)["model_config"]
+        config = json.loads(config) if isinstance(config, str) else config
+        assert config == {"keep": "config", "_compression_seed": {
+            "version": 1, "parent_session_id": "sess1", "last_row_id": rows[-1]["id"]}}
+
+
+def test_provenance_child_failure_rolls_back_seed_and_parent(db):
+    db.append_message("sess1", "user", "original")
+    db._execute_write(lambda conn: conn.execute("""CREATE TRIGGER reject_parent_close
+        BEFORE UPDATE OF ended_at ON sessions WHEN NEW.id = 'sess1'
+        BEGIN SELECT RAISE(ABORT, 'publication failed'); END"""))
+    with pytest.raises(sqlite3.IntegrityError, match="publication failed"):
+        db.publish_compression_child(parent_session_id="sess1", child_session_id="child",
+            source="test", require_compression_lease=False,
+            messages=[{"role": "user", "content": "unresolved"}])
+    assert db.get_session("child") is None
+    assert db.get_session("sess1")["ended_at"] is None
+    assert [r["content"] for r in db.get_messages("sess1")] == ["original"]
+
+
+def test_provenance_out_of_range_native_id_is_unresolved(db):
+    messages = [{"role": "user", "content": "unproved", "_row_id": 2**80}]
+    db.archive_and_compact("sess1", messages)
+    assert db.get_messages("sess1")[0]["display_metadata"]["_compression_origin"] == {
+        "version": 1, "session_id": None, "row_id": None}

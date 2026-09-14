@@ -1971,3 +1971,19 @@ class TestEnsureCronDirWidened:
         with pytest.raises(FileNotFoundError):
             jobs._ensure_cron_dir(scripts_dir)
         assert not deleted_home.exists()
+
+
+
+def test_output_pruning_removes_only_paired_context_companions(tmp_path):
+    from cron.jobs import _prune_job_output
+    for name in ["01", "02", "03"]:
+        (tmp_path / f"{name}.md").write_text("native log")
+        (tmp_path / f"{name}.context.json").write_text("metadata")
+    unrelated = tmp_path / "other.json"
+    unrelated.write_text("keep")
+    assert _prune_job_output(tmp_path, 0) == 0
+    assert _prune_job_output(tmp_path, 2) == 1
+    assert not (tmp_path / "01.md").exists()
+    assert not (tmp_path / "01.context.json").exists()
+    assert (tmp_path / "02.context.json").read_text() == "metadata"
+    assert (tmp_path / "03.context.json").exists() and unrelated.exists()
