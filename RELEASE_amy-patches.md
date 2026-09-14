@@ -1,5 +1,21 @@
 # Amy's Patches — Stable 0.21 Ledger
 
+## Search pagination keeps valid JSON - checkpoint 2026-09-14
+
+- Problem: appending a human pagination hint after the JSON payload broke strict
+  consumers, including the Python tool RPC path (upstream issue #90322).
+- Solution: retain the existing September 9 repair, putting the same pagination
+  guidance in the `_hint` field before serialization. Credential-result filtering
+  and the remaining response fields are unchanged.
+- Files: `tools/file_tools.py`, `tests/tools/test_file_tools.py`,
+  `tests/agent/test_file_safety_credentials.py`, this ledger.
+- Validation: two pagination tests and nine credential-file tests passed in
+  isolated homes; scoped Ruff passed. A live Python tool RPC returned a truncated
+  search with `_hint` and subsequently read source text without a JSON parse error.
+- Provenance: https://github.com/NousResearch/hermes-agent/issues/90322;
+  repair and live acceptance on 2026-09-09.
+  This checkpoint changes neither the upstream base nor the running service.
+
 ## Owner-maintained restart helper - checkpoint 2026-09-14
 
 - Problem: the fixed helper digest compiled into the restart corridor rejected
