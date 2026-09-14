@@ -1,5 +1,26 @@
 # Amy's Patches — Stable 0.21 Ledger
 
+## Named skill batch notifications - 2026-09-14
+
+- Problem: successful background skill batches were silent in `on` mode and
+  rendered `Skill ?` in `verbose` mode.
+- Solution: backport upstream PR #104896, commit
+  `ab98a92a45f2b5de1034b18b769e2ef6f70bafc3`, into the existing summary loop.
+  Name each successful applied result and its action; suppress staged and
+  rolled-back outcomes. Preserve legacy delete/support-file notices.
+- Port differences: use loop `continue`/`actions.append` in place of the newer
+  `_action_lines` helper's returns; normalize an absent action to an empty key.
+  The upstream refactor and later feature changes are not included.
+- Files: `agent/background_review.py`,
+  `tests/run_agent/test_skill_applied_notifications.py`,
+  `website/docs/user-guide/features/memory.md`, this ledger.
+- Validation: all four new regressions failed on the original code; 28 focused
+  tests passed after the port, including real cross-skill writes in an isolated
+  test home. Scoped Ruff passed. Runtime activation awaits a gateway restart.
+- Upstream status: merged 2026-09-07 and included in v2026.9.11; drop this
+  downstream patch when adopting an upstream base that contains the fix.
+- Implementation reference: named skill notification backport, 2026-09-14.
+
 ## Cron final-output and conversation continuity - 2026-09-13
 
 - Problem: chained runs read the beginning of nested log artifacts instead of

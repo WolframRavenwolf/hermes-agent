@@ -831,7 +831,7 @@ def summarize_background_review_actions(
         # Defensively normalize everything through a dict-typed alias so
         # the rest of the function can stay terse without per-call
         # ``isinstance`` guards (#59437).
-        if not isinstance(data, dict) or not data.get("success"):
+        if not isinstance(data, dict) or not data.get("success") or data.get("staged"):
             continue
         message = data.get("message", "")
         detail = call_details.get(tcid) or {}
@@ -839,6 +839,24 @@ def summarize_background_review_actions(
             detail = {}
         target = data.get("target", "") or detail.get("target", "")
         is_skill = detail.get("tool") == "skill_manage"
+        if is_skill and "results" in data:
+            # The requested operations are not evidence of applied writes (approval
+            # and atomic rollback can leave all of them unapplied).
+            verbs = {
+                "create": "created", "patch": "patched", "edit": "rewritten",
+                "write_file": "written", "remove_file": "removed", "delete": "deleted",
+            }
+            results = data.get("results")
+            if not data.get("operations_applied") or not isinstance(results, list):
+                continue
+            for result in results:
+                if not isinstance(result, dict) or result.get("success") is not True:
+                    continue
+                verb = verbs.get(result.get("action") or "")
+                if verb and result.get("name"):
+                    path = f" ({result['file_path']})" if result.get("file_path") else ""
+                    actions.append(f"Skill '{result['name']}' {verb}{path}")
+            continue
 
         message_lower = message.lower()
         if not verbose:
@@ -848,7 +866,7 @@ def summarize_background_review_actions(
             if "updated" in message_lower:
                 actions.append(message)
                 continue
-            if is_skill and "patched" in message_lower:
+            if is_skill and any(word in message_lower for word in ("patched", "deleted", "written")):
                 actions.append(message)
                 continue
 
