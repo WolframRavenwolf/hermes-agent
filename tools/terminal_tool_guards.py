@@ -211,7 +211,9 @@ def gateway_lifecycle_block(
     # Keep the specific launchctl diagnostic when this optional pre-scan fits the
     # budget. The full fail-closed guard below still runs when it does not, so
     # oversized roots never reach shlex here.
-    if lifecycle_scan_root_within_budget(command) and contains_launchctl_submit_command(command):
+    if lifecycle_scan_root_within_budget(command) and contains_launchctl_submit_command(
+        command, ignore_full_line_shell_comments=True,
+    ):
         return _blocked_json(
             "Blocked: launchctl submit/bootstrap is restricted inside a supervised "
             "gateway regardless of the job label, to prevent indirect gateway "
@@ -231,6 +233,7 @@ def gateway_lifecycle_block(
         command,
         cwd=guard_cwd,
         read_remote_script=lambda p: _read_script_for_guard(env, guard_cwd, p, _MAX_REFERENCED_SCRIPT_BYTES),
+        ignore_full_line_shell_comments=True,
     ):
         return _blocked_json(
             "Blocked: command or referenced script cannot restart, stop, or "

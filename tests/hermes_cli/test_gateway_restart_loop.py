@@ -879,6 +879,73 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert calls == ["systemctl status nginx"]
 
 
+class TestTerminalLeadingCommentPreamble:
+    _minimal_config = TestTerminalToolGatewayLifecycleGuard._minimal_config
+    _patch_env = TestTerminalToolGatewayLifecycleGuard._patch_env
+    _make_fake_env = TestTerminalToolGatewayLifecycleGuard._make_fake_env
+
+    @staticmethod
+    def _command(tmp_path, body, form):
+        import shlex
+
+        script = tmp_path / "preamble.sh"
+        script.write_text(body, encoding="utf-8")
+        command = body if form == "direct" else f"bash {shlex.quote(str(script))}"
+        if form == "shell-script":
+            command = "bash -c " + shlex.quote(command)
+        return command
+
+    @pytest.mark.parametrize("form", ["direct", "local-script", "shell-script"])
+    def test_leading_comment_is_inert_only_for_terminal(self, monkeypatch, tmp_path, form):
+        import tools.terminal_tool as tt
+        from cron.lifecycle_guard import GatewayLifecycleBlocked, check_gateway_lifecycle
+
+        body = "\n \t\n#!/bin/sh\n  # Never run hermes gateway restart\n# operator's hint\nprintf safe\n"
+        command = self._command(tmp_path, body, form)
+        calls = []
+
+        class FakeEnv:
+            env = {}
+            cwd = str(tmp_path)
+
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                return {"output": "safe", "returncode": 0}
+
+        self._patch_env(monkeypatch, FakeEnv(), inside_gateway=True)
+        monkeypatch.setattr(tt, "_check_all_guards", lambda *a, **k: {"approved": True})
+        result = json.loads(tt.terminal_tool(command=command, force=True))
+        assert result["exit_code"] == 0, result
+        assert calls == [command]
+        with pytest.raises(GatewayLifecycleBlocked):
+            check_gateway_lifecycle(command)
+
+    @pytest.mark.parametrize("form", ["direct", "local-script", "shell-script"])
+    @pytest.mark.parametrize("body", [
+        "hermes gateway restart\n",
+        "hermes gateway stop\n",
+        "hermes gateway uninstall\n",
+        "launchctl submit -l com.example.helper -- /bin/true\n",
+        "launchctl bootstrap gui/501 /tmp/com.example.helper.plist\n",
+        "printf safe\n# hermes gateway restart\n",
+        "sh <<'EOF'\n# hermes gateway restart\nEOF\n",
+        "value=$(\n# hermes gateway restart\nprintf safe\n)\n",
+        "sh -c '# hermes gateway restart\nprintf safe'\n",
+    ])
+    def test_preamble_does_not_exempt_executable_or_later_text(
+        self, monkeypatch, tmp_path, form, body
+    ):
+        import tools.terminal_tool as tt
+
+        command = self._command(tmp_path, "# harmless preamble\n" + body, form)
+        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
+        result = json.loads(tt.terminal_tool(command=command, force=True))
+        assert result["exit_code"] == 1, result
+        assert "Blocked" in result["error"]
+        if form == "direct" and body.startswith("launchctl"):
+            assert "KeepAlive" in result["error"]
+
+
 # ---------------------------------------------------------------------------
 # cron.lifecycle_guard module — the shared checker create_job/CLI/terminal use
 # ---------------------------------------------------------------------------

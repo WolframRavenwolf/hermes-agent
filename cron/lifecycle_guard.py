@@ -514,7 +514,9 @@ def _executed_command_index(segment: list[str]) -> Optional[int]:
     return index if index < len(segment) else None
 
 
-def contains_launchctl_submit_command(command: str) -> bool:
+def contains_launchctl_submit_command(
+    command: str, *, ignore_full_line_shell_comments: bool = False,
+) -> bool:
     """Detect an executed ``launchctl submit``/``bootstrap``, not quoted text.
 
     Label-independent by design: a NEW job's label is attacker-chosen, so a neutral name defeats any
@@ -522,6 +524,8 @@ def contains_launchctl_submit_command(command: str) -> bool:
 
     See #62891.
     """
+    if ignore_full_line_shell_comments:
+        command = _strip_leading_shell_comment_preamble(command)
     for segment in _iter_command_segments(command):
         index = _executed_command_index(segment)
         if index is not None and _executable_name(segment[index]) == "launchctl":
@@ -531,68 +535,20 @@ def contains_launchctl_submit_command(command: str) -> bool:
     return False
 
 
-def _strip_inert_hash_comments(text: str) -> str:
-    """Remove unquoted, word-start ``#`` comments from referenced-script text.
+def _strip_leading_shell_comment_preamble(text: str) -> str:
+    """Ignore only initial blank/comment lines, never later shell source.
 
-    Applied only before recursing into a referenced script so help/hint
-    documentation cannot false-positive (#106723). Top-level command and cron
-    prompt scanning is unchanged — ``then run hermes gateway restart`` still
-    blocks.
-
-    Word-start rule matches POSIX (and ``tools.shell_heredoc``): ``#`` begins a
-    comment at the start of a word — beginning of the text, after whitespace,
-    or after ``;&|()``. ``echo $#``, ``${#var}``, and ``foo#bar`` stay intact.
-    Fail-closed: an unclosed quote leaves the remainder visible.
+    Terminal opts into this narrow hint allowance (#106723). Once executable
+    text starts, hash lines may belong to heredocs or substitutions; leave the
+    entire remainder to the native conservative scans. Callers budget the
+    original text before stripping. This never rewrites the executed command.
     """
-    if not text or "#" not in text:
-        return text
-    out: list[str] = []
-    in_single = in_double = False
-    i = 0
-    n = len(text)
-    while i < n:
-        ch = text[i]
-        if in_single:
-            out.append(ch)
-            if ch == "'":
-                in_single = False
-            i += 1
-            continue
-        if in_double:
-            out.append(ch)
-            if ch == "\\" and i + 1 < n:
-                out.append(text[i + 1])
-                i += 2
-                continue
-            if ch == '"':
-                in_double = False
-            i += 1
-            continue
-        if ch == "\\" and i + 1 < n:
-            out.append(ch)
-            out.append(text[i + 1])
-            i += 2
-            continue
-        if ch == "'":
-            in_single = True
-            out.append(ch)
-            i += 1
-            continue
-        if ch == '"':
-            in_double = True
-            out.append(ch)
-            i += 1
-            continue
-        if ch == "#" and (i == 0 or text[i - 1].isspace() or text[i - 1] in ";&|()"):
-            newline = text.find("\n", i)
-            if newline == -1:
-                return "".join(out)
-            out.append("\n")
-            i = newline + 1
-            continue
-        out.append(ch)
-        i += 1
-    return "".join(out)
+    offset = 0
+    for line in text.split("\n"):
+        if line.strip(" \t\r") and not line.lstrip(" \t").startswith("#"):
+            break
+        offset += len(line) + 1
+    return text[offset:]
 
 
 def _mask_data_sink_arguments(text: str) -> str:
@@ -644,8 +600,12 @@ def _lifecycle_command_scan_with_data_exemption(text: str) -> bool:
     return contains_gateway_lifecycle_command(_mask_data_sink_arguments(normalized))
 
 
-def _direct_lifecycle_scan(command: str) -> bool:
+def _direct_lifecycle_scan(
+    command: str, *, ignore_full_line_shell_comments: bool = False,
+) -> bool:
     """Pure-string direct scans: lifecycle regex (data-exempted) + submit."""
+    if ignore_full_line_shell_comments:
+        command = _strip_leading_shell_comment_preamble(command)
     return (
         _lifecycle_command_scan_with_data_exemption(command)
         or contains_launchctl_submit_command(command)
@@ -948,19 +908,25 @@ def _read_script_for_scanning(script_path: str) -> str:
 def _contains_unsafe_gateway_action(
     command: str, *, cwd: Optional[str], depth: int, visited: set[Path], budget: _LifecycleScanBudget,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
+    ignore_full_line_shell_comments: bool = False,
 ) -> bool:
     # Charge BEFORE _direct_lifecycle_scan: every scan in it tokenizes with shlex.
     if not budget.charge_text(command):
         return _budget_exhausted("text", depth)
-    if _direct_lifecycle_scan(command):
+    if _direct_lifecycle_scan(
+        command, ignore_full_line_shell_comments=ignore_full_line_shell_comments,
+    ):
         return True
     if depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
         return True
+    if ignore_full_line_shell_comments:
+        command = _strip_leading_shell_comment_preamble(command)
 
     def recurse(text: str, cwd: Optional[str]) -> bool:
         return _contains_unsafe_gateway_action(
             text, cwd=cwd, depth=depth + 1, visited=visited, budget=budget,
             read_remote_script=read_remote_script,
+            ignore_full_line_shell_comments=ignore_full_line_shell_comments,
         )
 
     for payload in _iter_shell_command_payloads(command):
@@ -994,11 +960,6 @@ def _contains_unsafe_gateway_action(
                 return True
         if not script_text:
             continue
-        # `#` comments in a referenced script are documentation, not executed.
-        # Strip them before the recursive scan so help/hint text cannot
-        # false-positive (#106723). Top-level command/prompt scanning is
-        # unchanged.
-        script_text = _strip_inert_hash_comments(script_text)
         # Relative references inside a script resolve against that script's directory, not the cwd.
         if recurse(script_text, _resolve_script_directory(str(resolved)) or cwd):
             return True
@@ -1008,8 +969,13 @@ def _contains_unsafe_gateway_action(
 def contains_gateway_lifecycle_command_or_referenced_script(
     command: str, *, cwd: Optional[str] = None,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
+    ignore_full_line_shell_comments: bool = False,
 ) -> bool:
     """Detect lifecycle/submit commands, including bounded nested scripts.
+
+    Terminal may opt into ignoring leading blank/full-line shell comments at
+    each recursion level. Cron/default callers scan them conservatively. The
+    original text is charged against the walk budget before any stripping.
 
     Total by construction: never raises. Direct scans are pure string ops; the referenced-script
     walk (filesystem, remote backends, shlex on decoded bytes) is best-effort defense-in-depth — an
@@ -1024,6 +990,7 @@ def contains_gateway_lifecycle_command_or_referenced_script(
         return _contains_unsafe_gateway_action(
             command, cwd=cwd, depth=0, visited=set(), budget=_LifecycleScanBudget(),
             read_remote_script=read_remote_script,
+            ignore_full_line_shell_comments=ignore_full_line_shell_comments,
         )
     except Exception:
         logger.warning(
@@ -1032,9 +999,13 @@ def contains_gateway_lifecycle_command_or_referenced_script(
             exc_info=True,
         )
         try:
-            return _direct_lifecycle_scan(command)
+            return _direct_lifecycle_scan(
+                command, ignore_full_line_shell_comments=ignore_full_line_shell_comments,
+            )
         except Exception:
             # If even the data-argument masker fails, fall to raw regex + submit scan: stay total.
+            if ignore_full_line_shell_comments:
+                command = _strip_leading_shell_comment_preamble(command)
             return contains_gateway_lifecycle_command(command) or contains_launchctl_submit_command(command)
 
 
