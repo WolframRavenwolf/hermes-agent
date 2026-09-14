@@ -541,34 +541,26 @@ def _repair_node_deps_on_current_checkout(
 
 
 def _update_whatsapp_bridge_dependencies(npm: str, env: dict) -> bool:
-    """Refresh an installed WhatsApp bridge outside gateway runtime."""
+    """Prepare an already-used checkout or persistent mirror outside runtime."""
     from hermes_cli.update_cmd import _m
+    from hermes_constants import get_hermes_home
     from gateway.platforms.whatsapp_common import (
-        record_whatsapp_bridge_dependency_fingerprint,
-        whatsapp_bridge_dependencies_fresh,
+        WhatsAppBridgeDependencyError,
+        prepare_whatsapp_bridge_runtime,
     )
 
     bridge_dir = _m().PROJECT_ROOT / "scripts" / "whatsapp-bridge"
-    if not (bridge_dir / "node_modules").is_dir():
-        return True
-    if whatsapp_bridge_dependencies_fresh(bridge_dir):
+    mirror = get_hermes_home() / "scripts" / "whatsapp-bridge"
+    if not (bridge_dir / "node_modules").is_dir() and not os.path.lexists(mirror):
         return True
 
-    print("→ Updating WhatsApp bridge dependencies...")
-    result = _m()._run_npm_install_deterministic(
-        npm,
-        bridge_dir,
-        extra_args=("--no-fund", "--no-audit", "--prefer-offline", "--progress=false"),
-        capture_output=False,
-        env=env,
-    )
-    if result.returncode != 0:
-        print("  ⚠ WhatsApp bridge npm install failed")
+    print("→ Preparing WhatsApp bridge runtime...")
+    try:
+        prepare_whatsapp_bridge_runtime(bridge_dir, npm=npm, env=env)
+    except WhatsAppBridgeDependencyError as exc:
+        print(f"  ⚠ {exc}")
         return False
-    if not record_whatsapp_bridge_dependency_fingerprint(bridge_dir):
-        print("  ⚠ WhatsApp bridge dependency version stamp could not be written")
-        return False
-    print("  ✓ WhatsApp bridge dependencies installed")
+    print("  ✓ WhatsApp bridge runtime prepared")
     return True
 
 

@@ -202,12 +202,10 @@ def _is_allowed_bridge_path(url: str) -> bool:
 
 
 def _file_content_hash(path: Path) -> str:
-    """First 16 hex chars of SHA-256 of *path* ("" if unreadable); bridge.js reports its own as ``/health`` ``scriptHash``."""
-    import hashlib
-    try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
-    except OSError:
-        return ""
+    """Hash all managed runtime inputs, retaining custom single-file compatibility."""
+    from gateway.platforms.whatsapp_common import whatsapp_bridge_source_hash
+
+    return whatsapp_bridge_source_hash(path)
 
 
 def check_whatsapp_requirements() -> bool:
@@ -409,6 +407,10 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
              "whatsapp_node_missing", "Node.js is not installed — install Node.js and re-run `hermes gateway`."),
             (bridge_path.exists, ("[%s] Bridge script not found: %s", self.name, bridge_path),
              "whatsapp_bridge_missing", f"WhatsApp bridge script missing at {bridge_path}."),
+            (lambda: bool(_file_content_hash(bridge_path)),
+             ("[%s] WhatsApp bridge runtime is incomplete. Run `hermes whatsapp` before starting the gateway.", self.name),
+             "whatsapp_bridge_runtime_incomplete",
+             "WhatsApp bridge runtime is incomplete - run `hermes whatsapp`, then re-run `hermes gateway`."),
             (lambda: whatsapp_bridge_dependencies_fresh(bridge_path.parent),
              ("[%s] WhatsApp bridge dependencies are missing or stale. Run `hermes whatsapp` before starting the gateway.", self.name),
              "whatsapp_bridge_dependencies_stale",

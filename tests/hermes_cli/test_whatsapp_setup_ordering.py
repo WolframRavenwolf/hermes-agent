@@ -111,9 +111,12 @@ def test_existing_pairing_skip_branch_enables_whatsapp(isolated_home, monkeypatc
 
     monkeypatch.setattr("builtins.input", fake_input)
     monkeypatch.setattr("hermes_cli.main._require_tty", lambda *_a, **_kw: None)
+    prepared = isolated_home / "prepared-bridge"
+    prepared.mkdir()
+    (prepared / "bridge.js").write_text("// prepared runtime")
     monkeypatch.setattr(
-        "gateway.platforms.whatsapp_common.whatsapp_bridge_dependencies_fresh",
-        lambda _bridge_dir: True,
+        "gateway.platforms.whatsapp_common.prepare_whatsapp_bridge_runtime",
+        lambda bridge_dir: prepared,
     )
 
     buf = io.StringIO()
