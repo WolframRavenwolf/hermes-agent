@@ -3137,6 +3137,7 @@ def _prune_job_output(job_output_dir: Path, keep: int) -> int:
 
 _CRON_RESPONSE_SIDECAR_FORMAT = "hermes-cron-response"
 _CRON_RESPONSE_SIDECAR_VERSION = 1
+_MAX_CRON_RESPONSE_BYTES = 1024 * 1024
 _STRUCTURED_OUTPUT_SUFFIX = ".run.md"
 
 
@@ -3157,10 +3158,15 @@ def read_job_output_response(output_file: Path) -> tuple[bool, Optional[str]]:
     """
     sidecar = _response_sidecar_path(output_file)
     try:
-        payload = json.loads(sidecar.read_text(encoding="utf-8"))
+        with sidecar.open("rb") as handle:
+            raw = handle.read(_MAX_CRON_RESPONSE_BYTES + 1)
+        if len(raw) > _MAX_CRON_RESPONSE_BYTES:
+            logger.warning("Ignoring oversized cron response sidecar: %s", sidecar)
+            return False, None
+        payload = json.loads(raw.decode("utf-8"))
     except FileNotFoundError:
         return False, None
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         logger.warning("Failed to read cron response sidecar %s: %s", sidecar, exc)
         return False, None
     if (
