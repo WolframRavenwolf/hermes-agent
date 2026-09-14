@@ -110,10 +110,10 @@ class TestLaunchdRestartAfterUpdate:
         assert "Could not restart the gateway" in out
         assert "hermes gateway restart" in out
 
-    def test_no_plist_is_not_a_launchd_install(self, launchd, capsys):
+    def test_no_plist_is_not_a_launchd_install(self, launchd, capsys, tmp_path):
         """No service definition → nothing to restart, and nothing to warn about."""
         calls, state, _ = launchd
-        state["plist"] = _FakePlist(False)
+        state["plist"] = tmp_path / "missing.plist"
 
         assert update_cmd._restart_launchd_gateway_after_update(supervision_verify=False) == ([], [])
         assert calls == []

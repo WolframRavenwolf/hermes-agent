@@ -501,7 +501,8 @@ def _restart_launchd_gateway_after_update(*, supervision_verify: bool = True) ->
     No ``launchctl list`` gating: a booted-out job (plist present, definition
     deregistered) fails it, and it can exit non-zero while the job is alive — gating on it
     silently skipped the restart yet printed "Update complete!". When the plist exists
-    ``launchd_restart()`` always runs; every failure path is loud with a manual recovery
+    or a failed installation left pending recovery, ``launchd_restart()`` always runs;
+    every failure path is loud with a manual recovery
     command. Returns ``(restarted_labels, failed_labels)``; with ``supervision_verify``
     success also requires a fresh supervised PID ("the call returned" is not "supervised").
 
@@ -515,25 +516,25 @@ def _restart_launchd_gateway_after_update(*, supervision_verify: bool = True) ->
     from hermes_cli.gateway import (
         get_launchd_label, get_launchd_plist_path, launchd_restart, wait_for_launchd_gateway_supervision,
     )
+    from hermes_cli.gateway_launchd_reload import LaunchdReloadError, _launchd_reload_is_pending
+
     current_label = get_launchd_label()
     try:
-        if not get_launchd_plist_path().exists():
-            return [], []  # not a launchd install — nothing to do or warn
-        try:
-            launchd_restart()
-        except subprocess.CalledProcessError as e:
-            stderr = (getattr(e, "stderr", "") or "").strip()
-            print(
-                f"  ⚠ Gateway restart failed: {stderr}\n"
-                "    The gateway may be DOWN on pre-update code. "
-                "Recover manually: hermes gateway restart"
-            )
-            return [], [current_label]
-    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        # A plist exists, so a gateway is SUPPOSED to be supervised; a broken/wedged
-        # launchctl is not proof nothing needs restarting. Count it, tell the operator.
+        plist_path = get_launchd_plist_path()
+        if not plist_path.exists() and not _launchd_reload_is_pending(plist_path):
+            return [], []  # no installed definition or pending launchd recovery
+        launchd_restart()
+    except (subprocess.CalledProcessError, LaunchdReloadError) as e:
+        # Preflight and restart failures belong to this label; siblings must continue.
+        stderr = (getattr(e, "stderr", "") or str(e)).strip()
         print(
-            # The old code `pass`ed here (#74973's second silent variant); count it and tell the operator.
+            f"  ⚠ Gateway restart failed: {stderr}\n"
+            "    The gateway may be DOWN on pre-update code. "
+            "Recover manually: hermes gateway restart"
+        )
+        return [], [current_label]
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        print(
             "  ⚠ Could not restart the gateway "
             f"({e.__class__.__name__}: {e}).\n"
             "    Recover manually: hermes gateway restart"

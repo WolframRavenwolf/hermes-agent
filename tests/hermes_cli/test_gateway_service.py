@@ -12,6 +12,7 @@ pwd = pytest.importorskip("pwd")
 grp = pytest.importorskip("grp")
 
 import hermes_cli.gateway as gateway_cli
+import hermes_cli.gateway_launchd_reload as launchd_reload
 from gateway import status
 from gateway.restart import (
     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT,
@@ -642,15 +643,10 @@ class TestLaunchdServiceRecovery:
         assert "_wait_deadline" in script
 
 
-    def test_refresh_falls_back_to_direct_reload_when_helper_cannot_spawn(
+    def test_refresh_refuses_direct_reload_when_helper_cannot_spawn(
         self, tmp_path, monkeypatch
     ):
-        """If the transient job can't be spawned, still attempt the reload.
-
-        Bailing out would leave the plist rewritten but the service never
-        reloaded. The in-process path waits out the old gateway's drain first so
-        its retry budget isn't spent on guaranteed-EIO bootstraps.
-        """
+        """A submit failure must not kill the CLI's own launchd coalition."""
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         plist_path.write_text("<plist>old content</plist>", encoding="utf-8")
 
@@ -694,17 +690,13 @@ class TestLaunchdServiceRecovery:
 
         monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
 
-        assert gateway_cli.refresh_launchd_plist_if_needed() is True
+        with pytest.raises(launchd_reload.LaunchdReloadError, match="submit unavailable"):
+            gateway_cli.refresh_launchd_plist_if_needed()
 
-        label = gateway_cli.get_launchd_label()
-        domain = gateway_cli._launchd_domain()
         service_calls = [c for c in run_calls if "bootout" in c or "bootstrap" in c]
-        assert service_calls[:2] == [
-            ["launchctl", "bootout", f"{domain}/{label}"],
-            ["launchctl", "bootstrap", domain, str(plist_path)],
-        ]
-        # Drained the old pid between bootout and bootstrap.
-        assert waited and waited[0][0] == 4242
+        assert service_calls == []
+        assert waited == []
+        assert plist_path.read_text() == "<plist>old content</plist>"
 
 
     def test_launchd_domain_uses_user_domain(self, monkeypatch):
@@ -1067,7 +1059,7 @@ class TestGatewaySystemServiceRouting:
         assert result is False
         assert replacement_observed == [True]
 
-    def test_launchd_restart_uses_sigusr1_and_exit_wait_budget(self, monkeypatch, capsys):
+    def test_launchd_restart_uses_sigusr1_and_exit_wait_budget(self, tmp_path, monkeypatch, capsys):
         """launchd_restart must take the same graceful path as systemd_restart.
 
         Regression: it previously sent a bare SIGTERM and waited
@@ -1078,6 +1070,10 @@ class TestGatewaySystemServiceRouting:
         "restarting", dropping the resume_pending handoff.
         """
         calls = []
+        plist = tmp_path / "ai.hermes.gateway.plist"
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist)
+        monkeypatch.setattr(gateway_cli, "generate_launchd_plist", lambda: "current definition")
+        plist.write_text("current definition")
 
         monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway")
         monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "gui/501")
@@ -1134,7 +1130,7 @@ class TestGatewaySystemServiceRouting:
         assert "up to 0s" not in out
 
     def test_launchd_restart_forces_kickstart_when_no_replacement_appears(
-        self, monkeypatch, capsys
+        self, tmp_path, monkeypatch, capsys
     ):
         """A graceful exit with no KeepAlive revival must not report success.
 
@@ -1145,6 +1141,10 @@ class TestGatewaySystemServiceRouting:
         \"✓ Service restart requested\" while the gateway stays down.
         """
         calls = []
+        plist = tmp_path / "ai.hermes.gateway.plist"
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist)
+        monkeypatch.setattr(gateway_cli, "generate_launchd_plist", lambda: "current definition")
+        plist.write_text("current definition")
 
         monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway")
         monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "gui/501")
@@ -2545,6 +2545,8 @@ class TestLaunchdUnloadedJobStderrStaysOffTerminal:
         monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway")
         monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "gui/501")
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: tmp_path / "ai.hermes.gateway.plist")
+        monkeypatch.setattr(gateway_cli, "generate_launchd_plist", lambda: "current definition")
+        (tmp_path / "ai.hermes.gateway.plist").write_text("current definition")
         monkeypatch.setattr(gateway_cli, "_clear_launchd_unsupported_marker", lambda: None)
         monkeypatch.setattr(gateway_cli, "_mark_planned_stop", lambda *a, **k: None)
         monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda *a, **k: True)
@@ -2736,3 +2738,75 @@ class TestTimeoutStopSecCoversCronFloor:
             env={"HERMES_CRON_DRAIN_TIMEOUT": "200"},
         )
         assert "TimeoutStopSec=240" in unit
+
+
+@pytest.mark.macos_only
+class TestLaunchdRefreshOutcome:
+    @pytest.fixture
+    def service(self, tmp_path, monkeypatch):
+        plist = tmp_path / "ai.hermes.gateway-test.plist"
+        plist.write_text("old definition")
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist)
+        monkeypatch.setattr(gateway_cli, "generate_launchd_plist", lambda: "new definition")
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "gui/501")
+        monkeypatch.setattr(gateway_cli, "_launchd_reload_budget", lambda: 0)
+        monkeypatch.setattr(gateway_cli, "_refuse_temp_home_service_write", lambda *a: False)
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+        calls = []
+
+        def run(cmd, **kwargs):
+            calls.append(cmd)
+            return SimpleNamespace(returncode=0, stdout='"PID" = 5150;', stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", run)
+        return plist, calls
+
+    def test_stale_start_does_not_kickstart_after_observed_refresh(self, service, capsys):
+        _, calls = service
+        gateway_cli.launchd_start()
+        assert len([c for c in calls if c[1] == "bootstrap"]) == 1
+        assert not [c for c in calls if c[1] == "kickstart"]
+        assert "Service started" not in capsys.readouterr().out
+
+    def test_deferred_start_does_not_claim_running(self, service, monkeypatch, capsys):
+        _, calls = service
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: 4242)
+        spawned = []
+        monkeypatch.setattr(gateway_cli.subprocess, "Popen", lambda cmd, **kw: spawned.append(cmd))
+        gateway_cli.launchd_start()
+        assert len(spawned) == 1
+        assert not [c for c in calls if c[1] in ("kickstart", "bootout", "bootstrap")]
+        out = capsys.readouterr().out
+        assert "deferred" in out
+        assert "Service started" not in out
+
+    @pytest.mark.parametrize("command", ["start", "install"])
+    def test_failed_refresh_exits_cli_nonzero(self, service, monkeypatch, capsys, command):
+        _, calls = service
+        monkeypatch.setattr(gateway_cli, "is_managed", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
+        monkeypatch.setattr(gateway_cli, "_service_backend", lambda: "launchd")
+        monkeypatch.setattr(gateway_cli, "_dispatch_via_service_manager_if_s6", lambda *a: False)
+        monkeypatch.setattr(gateway_cli.subprocess, "run", lambda cmd, **kw: (
+            calls.append(cmd) or SimpleNamespace(returncode=0, stdout="", stderr="")))
+        with pytest.raises(SystemExit) as error:
+            gateway_cli.gateway_command(SimpleNamespace(gateway_command=command))
+        assert error.value.code == 1
+        out = capsys.readouterr().out
+        assert "Service started" not in out and "Service definition updated" not in out
+        assert not [c for c in calls if c[1] == "kickstart"]
+
+    def test_refusal_raises_typed_failure(self, service, monkeypatch):
+        plist, calls = service
+        monkeypatch.setattr(gateway_cli, "_refuse_temp_home_service_write", lambda *a: True)
+        with pytest.raises(RuntimeError) as error:
+            gateway_cli.refresh_launchd_plist_if_needed()
+        assert type(error.value).__name__ == "LaunchdReloadError"
+        assert plist.read_text() == "old definition"
+        assert calls == []
+
+    def test_current_definition_is_noop(self, service):
+        plist, calls = service
+        plist.write_text("new definition")
+        assert gateway_cli.refresh_launchd_plist_if_needed() is False
+        assert calls == []
