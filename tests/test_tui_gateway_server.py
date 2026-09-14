@@ -2513,7 +2513,7 @@ def test_load_enabled_toolsets_honors_builtin_env_if_config_fails(monkeypatch):
 def test_load_enabled_toolsets_all_env_means_all(monkeypatch):
     monkeypatch.setenv("HERMES_TUI_TOOLSETS", "all")
 
-    assert server._load_enabled_toolsets() is None
+    assert server._load_enabled_toolsets() == ["all"]
 
 
 def test_load_enabled_toolsets_all_env_warns_about_ignored_extra_entries(
@@ -2521,7 +2521,7 @@ def test_load_enabled_toolsets_all_env_warns_about_ignored_extra_entries(
 ):
     monkeypatch.setenv("HERMES_TUI_TOOLSETS", "all,nope")
 
-    assert server._load_enabled_toolsets() is None
+    assert server._load_enabled_toolsets() == ["all"]
     assert "ignoring additional entries: nope" in capsys.readouterr().err
 
 

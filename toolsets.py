@@ -223,7 +223,8 @@ TOOLSETS = {
     "messaging": {
         "description": "Outbound cross-platform messaging (explicit opt-in; sends messages or reactions)",
         "tools": ["send_message"],
-        "includes": []
+        "includes": [],
+        "default_off": True,
     },
     
 
