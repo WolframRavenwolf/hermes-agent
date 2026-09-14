@@ -312,6 +312,116 @@ class TestTranscribeOpenAI:
         assert actual == expected
 
 
+    @pytest.mark.parametrize(("config", "expected"), [
+        pytest.param(None, ["sv"], id="omitted"),
+        pytest.param({}, ["pt"], id="empty-config"),
+        pytest.param({"openai": {"languages": [" en ", " fi "]}},
+                     ["en", "fi"], id="trim-array"),
+        pytest.param({"openai": {"languages": [], "language": "sv"}},
+                     [], id="explicit-auto"),
+    ])
+    def test_gpt_language_config_snapshot(self, monkeypatch, tmp_path, config, expected):
+        from copy import deepcopy
+
+        from tools import transcription_tools
+        from tools.transcription_cloud import _gpt_transcribe_languages
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_LOCAL_STT_LANGUAGE", "pt")
+        (tmp_path / "config.yaml").write_text(
+            "stt:\n  openai:\n    languages: [sv]\n", encoding="utf-8",
+        )
+        before = deepcopy(config)
+        with patch.object(transcription_tools, "_load_stt_config",
+                          wraps=transcription_tools._load_stt_config) as load:
+            kwargs = {} if config is None else {"config": config}
+            assert _gpt_transcribe_languages("openai", None, **kwargs) == expected
+        assert load.call_count == (1 if config is None else 0)
+        assert config == before
+
+
+    @pytest.mark.parametrize("change_at", ["construction", "retry"])
+    @pytest.mark.parametrize("languages", [[" en ", " fi "], []], ids=["array", "auto"])
+    def test_gpt_language_snapshot_wire(self, monkeypatch, tmp_path, change_at, languages):
+        import wave
+        from email import policy
+        from email.parser import BytesParser
+
+        import httpx
+        import openai
+        import yaml
+
+        from tools.transcription_cloud import _transcribe_openai
+        from tools.transcription_tools import _load_stt_config
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_LOCAL_STT_LANGUAGE", "pt")
+        config_file = tmp_path / "config.yaml"
+
+        def write_config(hints):
+            config_file.write_text(yaml.safe_dump({"stt": {
+                "language": "de", "openai": {"languages": hints, "language": "sv"},
+            }}), encoding="utf-8")
+
+        write_config(languages)
+        audio_file = tmp_path / "test.wav"
+        with wave.open(str(audio_file), "wb") as audio:
+            audio.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+            audio.writeframes(b"\x00\x00" * 16000)
+        requests, clients = [], []
+        changed_languages = ["ja", "ko", "zh"]
+
+        def respond(request):
+            message = BytesParser(policy=policy.default).parsebytes(
+                f"Content-Type: {request.headers['content-type']}\r\n\r\n".encode()
+                + request.read()
+            )
+            fields = {}
+            for part in message.iter_parts():
+                name = part.get_param("name", header="content-disposition")
+                if name != "file":
+                    payload = part.get_payload(decode=True)
+                    assert isinstance(payload, bytes)
+                    fields.setdefault(name, []).append(payload.decode())
+            requests.append(fields)
+            if change_at == "retry" and len(requests) == 1:
+                write_config(changed_languages)
+                return httpx.Response(400, json={"error": {"message": "unsupported container"}})
+            return httpx.Response(200, json={"text": "test transcript"})
+
+        real_openai = openai.OpenAI
+
+        def make_client(**kwargs):
+            if change_at == "construction":
+                write_config(changed_languages)
+            http_client = httpx.Client(transport=httpx.MockTransport(respond))
+            client = real_openai(**kwargs, http_client=http_client)
+            clients.append((client, http_client))
+            return client
+
+        monkeypatch.setattr(openai, "OpenAI", make_client)
+        with patch("tools.transcription_cloud._transcode_audio_for_stt",
+                   return_value=(str(audio_file), None)) as transcode:
+            result = _transcribe_openai(
+                str(audio_file), "gpt-transcribe", api_key="sk-test",
+                base_url="https://stt.invalid/v1",
+            )
+        assert result["success"] is True, result
+        assert result["transcript"] == "test transcript"
+        assert len(requests) == (2 if change_at == "retry" else 1)
+        assert transcode.call_count == (1 if change_at == "retry" else 0)
+        assert len(clients) == 1
+        assert all(client.is_closed() and http_client.is_closed for client, http_client in clients)
+        assert _load_stt_config()["openai"]["languages"] == changed_languages
+        expected = {"languages[]": [code.strip() for code in languages]} if languages else {}
+        for fields in requests:
+            assert fields["model"] == ["gpt-transcribe"]
+            assert fields["response_format"] == ["json"]
+            actual = {key: values for key, values in fields.items()
+                      if key in ("language", "languages", "languages[]")}
+            assert actual == expected
+
+
 # ---------------------------------------------------------------------------
 # Main transcribe_audio() dispatch
 # ---------------------------------------------------------------------------
