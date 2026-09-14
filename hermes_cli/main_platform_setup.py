@@ -7,6 +7,7 @@ Split out of ``hermes_cli/main.py``. Names that still live in main are imported 
 import contextlib
 import shutil
 import subprocess
+from pathlib import Path
 import sys
 
 from hermes_cli.cli_output import line_input
@@ -94,24 +95,24 @@ def _whatsapp_allowed_users(wa_mode: str, get_env_value, save_env_value) -> None
         print("  ⚠ No allowlist — the agent will respond to ALL incoming messages")
 
 
-def _whatsapp_install_bridge(bridge_dir) -> bool:
-    """Step 4 of ``hermes whatsapp``: prepare dependencies; False stops setup."""
+def _whatsapp_install_bridge(bridge_dir) -> Path | None:
+    """Prepare the runtime before script checks or pairing; None stops setup."""
     from gateway.platforms.whatsapp_common import (
         WhatsAppBridgeDependencyError,
-        ensure_whatsapp_bridge_dependencies,
+        prepare_whatsapp_bridge_runtime,
     )
 
-    print("\n→ Checking WhatsApp bridge dependencies (installation can take a few minutes)...")
+    print("\n→ Preparing WhatsApp bridge (installation can take a few minutes)...")
     try:
-        changed = ensure_whatsapp_bridge_dependencies(bridge_dir)
+        prepared = prepare_whatsapp_bridge_runtime(bridge_dir)
     except KeyboardInterrupt:
         print("\n  ✗ Install cancelled")
-        return False
+        return None
     except WhatsAppBridgeDependencyError as exc:
         print(f"  ✗ {exc}")
-        return False
-    print("  ✓ Dependencies installed" if changed else "✓ Bridge dependencies already installed")
-    return True
+        return None
+    print("  ✓ Bridge runtime prepared")
+    return prepared
 
 
 def cmd_whatsapp(args):
@@ -137,12 +138,12 @@ def cmd_whatsapp(args):
     _whatsapp_allowed_users(wa_mode, get_env_value, save_env_value)
 
     from gateway.platforms.whatsapp_common import resolve_whatsapp_bridge_dir
-    bridge_dir = resolve_whatsapp_bridge_dir()
+    bridge_dir = _whatsapp_install_bridge(resolve_whatsapp_bridge_dir())
+    if bridge_dir is None:
+        return
     bridge_script = bridge_dir / "bridge.js"
     if not bridge_script.exists():
         print(f"\n✗ Bridge script not found at {bridge_script}")
-        return
-    if not _whatsapp_install_bridge(bridge_dir):
         return
 
     # Existing session: re-pair or keep.

@@ -7,12 +7,13 @@
 
 import { strict as assert } from 'node:assert';
 import { createHash } from 'node:crypto';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { getAggregateVotesInPollMessage } from '@whiskeysockets/baileys';
 
 import {
+  BRIDGE_RUNTIME_FILES, bridgeDependencyFingerprint, bridgeSourceHash, framedFileHash, validatedRuntimeFiles,
   buildPollPayload,
   buildTextSendPayload,
   createBoundedMessageStore,
@@ -44,6 +45,127 @@ import {
   assert.equal(receiptKeys[0].participant, groupKey.participant);
   console.log('  ✓ inbound read receipts preserve the original group message key');
 }
+
+// -- stale-bridge complete runtime source hash ----------------------------
+{
+  const expectedInventory = JSON.parse(readFileSync(new URL('./package.json', import.meta.url))).hermesRuntimeFiles;
+  const bridgeSource = readFileSync(new URL('./bridge.js', import.meta.url), 'utf8');
+  for (const match of bridgeSource.matchAll(/from ['\"]\.\/([^'\"]+)['\"]/g)) {
+    assert.ok(expectedInventory.includes(match[1]), `${match[1]} must be managed`);
+  }
+  assert.deepEqual(BRIDGE_RUNTIME_FILES, expectedInventory);
+
+  const bridgeDir = mkdtempSync(path.join(tmpdir(), 'hermes-wa-hash-'));
+  const runtimeBytes = new Map();
+  for (const name of expectedInventory) {
+    const bytes = name === 'package.json'
+      ? Buffer.from(`${JSON.stringify({
+        name: 'hermes-whatsapp-bridge-test',
+        hermesRuntimeFiles: expectedInventory,
+      })}\n`)
+      : Buffer.from(`${name}:v1\n`);
+    runtimeBytes.set(name, bytes);
+    writeFileSync(path.join(bridgeDir, name), bytes);
+  }
+  const bridgePath = path.join(bridgeDir, 'bridge.js');
+  const expected = framedFileHash(
+    expectedInventory.map(name => [name, runtimeBytes.get(name)]),
+    16,
+  );
+  const originalHash = bridgeSourceHash(bridgePath);
+  assert.equal(originalHash, expected);
+  assert.equal(
+    bridgeDependencyFingerprint(bridgeDir),
+    createHash('sha256').update('package.json\0').update(runtimeBytes.get('package.json')).update('\0package-lock.json\0').update(runtimeBytes.get('package-lock.json')).update('\0').digest('hex'),
+  );
+
+  for (const name of expectedInventory) {
+    const originalBytes = runtimeBytes.get(name);
+    writeFileSync(path.join(bridgeDir, name), Buffer.from(`${name}:v2\n`));
+    assert.notEqual(
+      bridgeSourceHash(bridgePath),
+      originalHash,
+      `${name} must participate in scriptHash`,
+    );
+    writeFileSync(path.join(bridgeDir, name), originalBytes);
+  }
+
+  // A partly present managed inventory is unsafe rather than a legacy bridge.
+  for (const missingName of ['allowlist.js', 'package.json']) {
+    const missingPath = path.join(bridgeDir, missingName);
+    unlinkSync(missingPath);
+    assert.equal(bridgeSourceHash(bridgePath), '', `${missingName} is required`);
+    writeFileSync(missingPath, runtimeBytes.get(missingName));
+  }
+  writeFileSync(path.join(bridgeDir, 'package.json'), '{not valid json\n');
+  assert.equal(bridgeSourceHash(bridgePath), '', 'malformed package.json is unsafe');
+  writeFileSync(path.join(bridgeDir, 'package.json'), runtimeBytes.get('package.json'));
+
+  const customDir = mkdtempSync(path.join(tmpdir(), 'hermes-wa-custom-hash-'));
+  const customPath = path.join(customDir, 'custom-bridge.js');
+  const customBytes = Buffer.from('const custom = true;\n');
+  writeFileSync(customPath, customBytes);
+  assert.equal(
+    bridgeSourceHash(customPath),
+    createHash('sha256').update(customBytes).digest('hex').slice(0, 16),
+  );
+  console.log('  ✓ bridge source hash covers the full runtime and custom single-file bridges');
+}
+
+// -- framed hash boundary ambiguity ---------------------------------------
+{
+  const first = [['a.js', Buffer.from('ab')], ['b.js', Buffer.from('c')]];
+  const second = [['a.js', Buffer.from('a')], ['b.js', Buffer.from('bc')]];
+  assert.equal(
+    Buffer.concat(first.map(([, bytes]) => bytes)).toString(),
+    Buffer.concat(second.map(([, bytes]) => bytes)).toString(),
+    'the legacy concatenation is intentionally ambiguous',
+  );
+  assert.notEqual(framedFileHash(first), framedFileHash(second));
+  console.log('  ✓ framed file hashes distinguish ambiguous byte boundaries');
+}
+
+// -- manifest validator parity/security -----------------------------------
+{
+  const requiredInventory = [
+    'bridge.js',
+    'bridge_helpers.js',
+    'package.json',
+    'package-lock.json',
+  ];
+  assert.deepEqual(
+    validatedRuntimeFiles({ hermesRuntimeFiles: requiredInventory }),
+    requiredInventory,
+  );
+
+  const invalidManifests = [
+    ['leading whitespace', [...requiredInventory, ' extra.js']],
+    ['trailing whitespace', [...requiredInventory, 'extra.js\t']],
+    ['unicode whitespace', [...requiredInventory, '\u00a0extra.js']],
+    ['control whitespace', [...requiredInventory, '\u001cextra.js']],
+    ['slash', [...requiredInventory, 'nested/extra.js']],
+    ['backslash', [...requiredInventory, 'nested\\extra.js']],
+    ['NUL', [...requiredInventory, 'extra\0.js']],
+    ['absolute path', [...requiredInventory, '/extra.js']],
+    ['dot', [...requiredInventory, '.']],
+    ['dot-dot', [...requiredInventory, '..']],
+    ['duplicate', [...requiredInventory, 'bridge.js']],
+    ['non-string', [...requiredInventory, 7]],
+  ];
+  for (const [label, inventory] of invalidManifests) {
+    assert.equal(
+      validatedRuntimeFiles({ hermesRuntimeFiles: inventory }),
+      null,
+      `${label} inventory must be rejected without normalization`,
+    );
+  }
+  for (const malformed of [null, {}, { hermesRuntimeFiles: 'bridge.js' }, { hermesRuntimeFiles: [] }]) {
+    assert.equal(validatedRuntimeFiles(malformed), null);
+  }
+  console.log('  ✓ runtime manifest rejects whitespace, traversal, NUL, duplicates, and malformed values');
+
+}
+
 
 // -- quoted outbound text -------------------------------------------------
 {

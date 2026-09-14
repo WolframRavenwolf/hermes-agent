@@ -91,7 +91,9 @@ def _connect_patches(mock_proc, mock_fh, mock_client_cls=None):
         "plugins.platforms.whatsapp.adapter.asyncio.create_task": MagicMock(),
     }
     base = [
-        patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True),
+        patch.multiple("plugins.platforms.whatsapp.adapter",
+                       check_whatsapp_requirements=lambda: True,
+                       _file_content_hash=lambda _path: "fixture-runtime-hash"),
         patch.object(Path, "exists", return_value=True),
         patch.object(Path, "mkdir", return_value=None),
         patch("subprocess.run", return_value=MagicMock(returncode=0)),
@@ -558,3 +560,37 @@ class TestNoCredsPreflight:
         # but the fatal-error code is NOT the "not paired" one.
         assert result is False
         assert adapter._fatal_error_code != "whatsapp_not_paired"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", ["allowlist.js", "package.json", "bridge_helpers.js", "bridge.js"])
+async def test_incomplete_managed_runtime_never_spawns_or_prepares(tmp_path, monkeypatch, missing):
+    import json
+    from gateway.platforms import whatsapp_common
+    from plugins.platforms.whatsapp import adapter as module
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    inventory = ["bridge.js", "bridge_helpers.js", "allowlist.js", "package.json", "package-lock.json"]
+    for name in inventory:
+        (bridge / name).write_text("// source")
+    (bridge / "package.json").write_text(json.dumps({"hermesRuntimeFiles": inventory}))
+    (bridge / "package-lock.json").write_text('{}')
+    (bridge / "node_modules").mkdir()
+    (bridge / "node_modules" / ".hermes-pkg-hash").write_text(whatsapp_common.whatsapp_bridge_dependency_fingerprint(bridge))
+    (bridge / missing).unlink()
+    adapter = _make_adapter()
+    adapter._bridge_script = str(bridge / "bridge.js")
+    adapter._session_path = tmp_path / "session"
+    adapter._session_path.mkdir()
+    (adapter._session_path / "creds.json").write_text('{}')
+    monkeypatch.setattr(module, "check_whatsapp_requirements", lambda: True)
+    def forbidden(*a, **kw):
+        pytest.fail("runtime prepared, spawned, or killed a process")
+    monkeypatch.setattr(module.subprocess, "Popen", forbidden)
+    monkeypatch.setattr(module.subprocess, "run", forbidden)
+    monkeypatch.setattr(module, "_kill_port_process", forbidden)
+    monkeypatch.setattr(whatsapp_common, "prepare_whatsapp_bridge_runtime", forbidden, raising=False)
+    monkeypatch.setattr(whatsapp_common, "ensure_whatsapp_bridge_dependencies", forbidden)
+    assert await adapter.connect() is False
+    assert adapter._fatal_error_retryable is False
+    assert not list(tmp_path.glob(".bridge.*"))

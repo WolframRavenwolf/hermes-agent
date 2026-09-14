@@ -541,25 +541,26 @@ def _repair_node_deps_on_current_checkout(
 
 
 def _update_whatsapp_bridge_dependencies(npm: str, env: dict) -> bool:
-    """Refresh installed checkout dependencies outside gateway runtime."""
+    """Prepare an already-used checkout or persistent mirror outside runtime."""
     from hermes_cli.update_cmd import _m
+    from hermes_constants import get_hermes_home
     from gateway.platforms.whatsapp_common import (
         WhatsAppBridgeDependencyError,
-        ensure_whatsapp_bridge_dependencies,
+        prepare_whatsapp_bridge_runtime,
     )
 
     bridge_dir = _m().PROJECT_ROOT / "scripts" / "whatsapp-bridge"
-    if not (bridge_dir / "node_modules").is_dir():
+    mirror = get_hermes_home() / "scripts" / "whatsapp-bridge"
+    if not (bridge_dir / "node_modules").is_dir() and not os.path.lexists(mirror):
         return True
 
-    print("→ Checking WhatsApp bridge dependencies...")
+    print("→ Preparing WhatsApp bridge runtime...")
     try:
-        changed = ensure_whatsapp_bridge_dependencies(bridge_dir, npm=npm, env=env)
+        prepare_whatsapp_bridge_runtime(bridge_dir, npm=npm, env=env)
     except WhatsAppBridgeDependencyError as exc:
         print(f"  ⚠ {exc}")
         return False
-    if changed:
-        print("  ✓ WhatsApp bridge dependencies installed")
+    print("  ✓ WhatsApp bridge runtime prepared")
     return True
 
 

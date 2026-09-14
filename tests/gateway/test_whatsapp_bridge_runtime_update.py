@@ -1260,3 +1260,818 @@ def test_public_subprocess_installer_needs_only_writable_bridge_not_parent(tmp_p
         assert not (parent / ".whatsapp-bridge-locks").exists()
     finally:
         parent.chmod(0o700)
+
+
+# Explicit runtime mirror preparation.
+import tempfile
+
+
+
+_RUNTIME_SOURCES = {
+    "bridge.js": "// bridge v{version}\n",
+    "bridge_helpers.js": "// helpers v{version}\n",
+    "allowlist.js": "// allowlist v{version}\n",
+    "outbound_ids.js": "// outbound ids v{version}\n",
+    "owner_message_gate.js": "// owner gate v{version}\n",
+}
+_RUNTIME_FILES = (*_RUNTIME_SOURCES, "package.json", "package-lock.json")
+
+
+def _seed_managed_runtime(root: Path, version: str) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    for name, template in _RUNTIME_SOURCES.items():
+        (root / name).write_text(template.format(version=version), encoding="utf-8")
+    (root / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "hermes-whatsapp-bridge",
+                "version": version,
+                "hermesRuntimeFiles": list(_RUNTIME_FILES),
+                "dependencies": {"example": version},
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (root / "package-lock.json").write_text(
+        json.dumps(
+            {
+                "name": "hermes-whatsapp-bridge",
+                "version": version,
+                "lockfileVersion": 3,
+                "packages": {"": {"version": version}},
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+
+
+@pytest.fixture(autouse=True)
+def _readonly_bundle_for_mirror_tests(monkeypatch):
+    monkeypatch.setattr(whatsapp_common, "_bridge_dir_is_writable", lambda _: False, raising=False)
+
+
+def _runtime_staging_leftovers(target):
+    return sorted(target.parent.glob(f".{target.name}.*-*"))
+
+
+def test_stale_persistent_runtime_is_built_in_staging_then_replaced(
+    tmp_path, monkeypatch
+):
+    bundled = tmp_path / "readonly-install" / "whatsapp-bridge"
+    persistent = tmp_path / "hermes-home" / "scripts" / "whatsapp-bridge"
+    _seed_managed_runtime(bundled, "2.0.0")
+    _seed_managed_runtime(persistent, "1.0.0")
+    (persistent / "node_modules").mkdir()
+    (persistent / "node_modules" / "installed-version").write_text(
+        "old\n", encoding="utf-8"
+    )
+    # Auth/session state is user data, not part of the replaceable runtime.
+    (persistent / "session" / "nested").mkdir(parents=True)
+    (persistent / "session" / "nested" / "creds.json").write_text(
+        "secret-state\n", encoding="utf-8"
+    )
+
+    calls: list[tuple[list[str], Path]] = []
+    monkeypatch.setattr("hermes_constants.find_node_executable", lambda name: "/managed/npm")
+    monkeypatch.setattr(
+        whatsapp_common.subprocess, "run", _successful_npm_ci(calls)
+    )
+
+    resolved = whatsapp_common.prepare_whatsapp_bridge_runtime(
+        bundled_bridge=bundled,
+        persistent_bridge=persistent,
+    )
+
+    assert resolved == persistent
+    assert len(calls) == 1
+    command, staging = calls[0]
+    assert command == ["/managed/npm", "ci", "--silent"]
+    assert staging != persistent
+    assert staging.parent.parent == persistent.parent
+    for name in (*_RUNTIME_SOURCES, "package.json", "package-lock.json"):
+        assert (persistent / name).read_bytes() == (bundled / name).read_bytes()
+    assert (persistent / "node_modules" / "installed-version").read_text(
+        encoding="utf-8"
+    ) == "new\n"
+    assert (persistent / "session" / "nested" / "creds.json").read_text(
+        encoding="utf-8"
+    ) == "secret-state\n"
+    assert (persistent / "node_modules" / ".hermes-pkg-hash").read_text(
+        encoding="utf-8"
+    ) == whatsapp_common.whatsapp_bridge_dependency_fingerprint(persistent)
+    assert _runtime_staging_leftovers(persistent) == []
+
+
+def test_persistent_state_symlink_is_preserved_without_dereferencing(
+    tmp_path, monkeypatch
+):
+    bundled = tmp_path / "install"
+    persistent = tmp_path / "persistent"
+    external_state = tmp_path / "external-creds.json"
+    _seed_managed_runtime(bundled, "2.0.0")
+    _seed_managed_runtime(persistent, "1.0.0")
+    (persistent / "node_modules").mkdir()
+    external_state.write_text("secret-state\n", encoding="utf-8")
+    state_link = persistent / "custom-state-link"
+    try:
+        state_link.symlink_to(external_state)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    calls: list[tuple[list[str], Path]] = []
+    monkeypatch.setattr(
+        whatsapp_common.subprocess, "run", _successful_npm_ci(calls)
+    )
+
+    assert whatsapp_common.prepare_whatsapp_bridge_runtime(
+        bundled_bridge=bundled,
+        persistent_bridge=persistent,
+    ) == persistent
+
+    promoted_link = persistent / "custom-state-link"
+    assert promoted_link.is_symlink()
+    assert os.readlink(promoted_link) == str(external_state)
+    assert external_state.read_text(encoding="utf-8") == "secret-state\n"
+
+
+def test_persistent_root_symlink_is_rejected_fail_closed(tmp_path, monkeypatch):
+    bundled = tmp_path / "install"
+    real_persistent = tmp_path / "real-persistent"
+    persistent_alias = tmp_path / "persistent-alias"
+    _seed_managed_runtime(bundled, "2.0.0")
+    _seed_managed_runtime(real_persistent, "1.0.0")
+    try:
+        persistent_alias.symlink_to(real_persistent, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path / "home")
+
+    with pytest.raises(
+        whatsapp_common.WhatsAppBridgeStateError,
+        match="persistent WhatsApp bridge root must be a real directory",
+    ):
+        whatsapp_common.prepare_whatsapp_bridge_runtime(
+            bundled_bridge=bundled,
+            persistent_bridge=persistent_alias,
+        )
+
+
+def test_state_copier_rejects_simulated_interior_windows_reparse_point(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    interior = source / "junction"
+    interior.mkdir(parents=True)
+    (interior / "secret").write_text("do not traverse", encoding="utf-8")
+    interior_inode = interior.lstat().st_ino
+    real_is_reparse = whatsapp_common._is_windows_reparse_point
+    monkeypatch.setattr(
+        whatsapp_common,
+        "_is_windows_reparse_point",
+        lambda metadata: metadata.st_ino == interior_inode or real_is_reparse(metadata),
+    )
+
+    with pytest.raises(
+        whatsapp_common.WhatsAppBridgeStateError,
+        match="interior junction or reparse point",
+    ):
+        whatsapp_common._copy_persistent_bridge_state(source, destination)
+
+
+def test_final_backup_merge_never_overwrites_newer_live_state(
+    tmp_path, monkeypatch
+):
+    bundled = tmp_path / "install"
+    persistent = tmp_path / "persistent"
+    _seed_managed_runtime(bundled, "2.0.0")
+    _seed_managed_runtime(persistent, "1.0.0")
+    (persistent / "node_modules").mkdir()
+    (persistent / "session").mkdir()
+    state_file = persistent / "session" / "creds.json"
+    state_file.write_text("old-backup-state\n", encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(
+        whatsapp_common.subprocess, "run", _successful_npm_ci(calls)
+    )
+    real_copy = whatsapp_common._copy_persistent_bridge_state
+
+    def inject_live_write(source, destination, *, overwrite=True, **kwargs):
+        if Path(source).name.startswith(".persistent.backup-"):
+            live_state = Path(destination) / "session" / "creds.json"
+            live_state.write_text("newer-live-state\n", encoding="utf-8")
+        return real_copy(source, destination, overwrite=overwrite, **kwargs)
+
+    monkeypatch.setattr(
+        whatsapp_common, "_copy_persistent_bridge_state", inject_live_write
+    )
+
+    assert whatsapp_common.prepare_whatsapp_bridge_runtime(
+        bundled_bridge=bundled,
+        persistent_bridge=persistent,
+    ) == persistent
+    assert state_file.read_text(encoding="utf-8") == "newer-live-state\n"
+
+
+@pytest.mark.parametrize(
+    ("changed_file", "replacement"),
+    [
+        ("bridge.js", "// changed bridge\n"),
+        ("bridge_helpers.js", "// changed helper\n"),
+        ("allowlist.js", "// changed imported source\n"),
+        (
+            "package.json",
+            json.dumps(
+                {
+                    "name": "hermes-whatsapp-bridge",
+                    "version": "9.9.9",
+                    "hermesRuntimeFiles": list(_RUNTIME_FILES),
+                    "dependencies": {},
+                },
+                sort_keys=True,
+            )
+            + "\n",
+        ),
+        (
+            "package-lock.json",
+            '{"name":"hermes-whatsapp-bridge","version":"1.0.0","lockfileVersion":3,"packages":{"":{"version":"9.9.9"}}}\n',
+        ),
+    ],
+)
+def test_each_runtime_source_or_manifest_change_triggers_refresh(
+    tmp_path, monkeypatch, changed_file, replacement
+):
+    bundled = tmp_path / "install"
+    persistent = tmp_path / "persistent"
+    _seed_managed_runtime(bundled, "1.0.0")
+    _seed_managed_runtime(persistent, "1.0.0")
+    (persistent / "node_modules").mkdir()
+    (bundled / changed_file).write_text(replacement, encoding="utf-8")
+
+    calls: list[tuple[list[str], Path]] = []
+    monkeypatch.setattr("hermes_constants.find_node_executable", lambda name: "npm")
+    monkeypatch.setattr(
+        whatsapp_common.subprocess, "run", _successful_npm_ci(calls)
+    )
+
+    assert whatsapp_common.prepare_whatsapp_bridge_runtime(
+        bundled_bridge=bundled,
+        persistent_bridge=persistent,
+    ) == persistent
+
+    assert len(calls) == 1
+    assert (persistent / changed_file).read_text(encoding="utf-8") == replacement
+
+
+def test_current_persistent_runtime_is_reused_without_npm(tmp_path, monkeypatch):
+    bundled = tmp_path / "install"
+    persistent = tmp_path / "persistent"
+    _seed_managed_runtime(bundled, "1.0.0")
+    _seed_managed_runtime(persistent, "1.0.0")
+    (persistent / "node_modules").mkdir()
+    (persistent / "node_modules" / "sentinel").write_text("keep\n", encoding="utf-8")
+
+    (persistent / "node_modules" / ".hermes-pkg-hash").write_text(
+        whatsapp_common.whatsapp_bridge_dependency_fingerprint(persistent)
+    )
+
+    def unexpected_run(*args, **kwargs):
+        raise AssertionError("npm must not run for an identical persistent runtime")
+
+    monkeypatch.setattr(whatsapp_common.subprocess, "run", unexpected_run)
+
+    assert whatsapp_common.prepare_whatsapp_bridge_runtime(
+        bundled_bridge=bundled,
+        persistent_bridge=persistent,
+    ) == persistent
+    assert (persistent / "node_modules" / "sentinel").exists()
+
+
+def test_multiprocess_resolvers_do_not_interleave_and_leave_complete_runtime_and_state(tmp_path):
+    bundle, live = tmp_path / "bundle", tmp_path / "live"
+    _seed_managed_runtime(bundle, "2")
+    _seed_managed_runtime(live, "1")
+    (live / "state").write_text("keep")
+    script = """
+import json, sys
+from pathlib import Path
+from subprocess import CompletedProcess
+from gateway.platforms import whatsapp_common as common
+bundle, live = map(Path, sys.argv[1:3])
+common._bridge_dir_is_writable = lambda _: False
+common._WHATSAPP_BRIDGE_LOCK_TIMEOUT_SECONDS = 0.2
+installed = False
+def npm(argv, *, cwd, **kwargs):
+    global installed
+    installed = True
+    if sys.argv[3] == 'holder':
+        print('installing', flush=True)
+        assert sys.stdin.readline().strip() == 'release'
+    (Path(cwd) / 'node_modules').mkdir()
+    return CompletedProcess(argv, 0, stdout='', stderr='')
+common.subprocess.run = npm
+try:
+    result = common.prepare_whatsapp_bridge_runtime(bundle, live, npm='/offline/npm')
+    print(json.dumps({'path': str(result), 'installed': installed}), flush=True)
+except common.WhatsAppBridgeDependencyError as exc:
+    print(json.dumps({'error': type(exc).__name__, 'installed': installed}), flush=True)
+"""
+    env_one = _maintenance_child_environment(tmp_path, "one")
+    env_two = _maintenance_child_environment(tmp_path, "two")
+    argv = [sys.executable, "-B", "-c", script, str(bundle), str(live)]
+    with subprocess.Popen(argv + ["holder"], env=env_one, stdin=subprocess.PIPE,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as holder:
+        try:
+            assert holder.stdout.readline().strip() == "installing"
+            with subprocess.Popen(argv + ["contender"], env=env_two, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True) as contender:
+                output, errors = contender.communicate(timeout=15)
+                assert contender.returncode == 0, errors
+                assert json.loads(output) == {"error": "WhatsAppBridgeBusyError", "installed": False}
+        finally:
+            output, errors = holder.communicate(input="release\n", timeout=20)
+        assert holder.returncode == 0, errors
+        assert json.loads(output) == {"path": str(live), "installed": True}
+    with subprocess.Popen(argv + ["contender"], env=env_two, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True) as contender:
+        output, errors = contender.communicate(timeout=15)
+        assert contender.returncode == 0, errors
+        assert json.loads(output) == {"path": str(live), "installed": False}
+    for name in _RUNTIME_FILES:
+        assert (live / name).read_bytes() == (bundle / name).read_bytes()
+    assert (live / "state").read_text() == "keep"
+    assert whatsapp_common.whatsapp_bridge_dependencies_fresh(live)
+    assert _runtime_staging_leftovers(live) == []
+
+
+
+def test_failed_npm_ci_keeps_old_functional_runtime(
+    tmp_path, monkeypatch, caplog
+):
+    bundled = tmp_path / "install"
+    persistent = tmp_path / "persistent"
+    _seed_managed_runtime(bundled, "2.0.0")
+    _seed_managed_runtime(persistent, "1.0.0")
+    (persistent / "node_modules").mkdir()
+    (persistent / "node_modules" / "working-old-runtime").write_text(
+        "keep\n", encoding="utf-8"
+    )
+    (persistent / "auth" / "creds").mkdir(parents=True)
+    (persistent / "auth" / "creds" / "me.json").write_text(
+        "auth-state\n", encoding="utf-8"
+    )
+
+    monkeypatch.setattr("hermes_constants.find_node_executable", lambda name: "npm")
+    monkeypatch.setattr(
+        whatsapp_common.subprocess,
+        "run",
+        lambda *args, **kwargs: CompletedProcess(
+            args[0], 1, stdout="", stderr="registry unavailable"
+        ),
+    )
+    caplog.set_level(logging.WARNING, logger=whatsapp_common.logger.name)
+
+    with pytest.raises(whatsapp_common.WhatsAppBridgeDependencyError) as error:
+        whatsapp_common.prepare_whatsapp_bridge_runtime(
+            bundled_bridge=bundled,
+            persistent_bridge=persistent,
+        )
+
+    assert (persistent / "bridge.js").read_text(encoding="utf-8") == "// bridge v1.0.0\n"
+    assert (persistent / "node_modules" / "working-old-runtime").exists()
+    # A failed update must not bless an unknown legacy tree with a new stamp.
+    assert not (persistent / "node_modules" / ".hermes-pkg-hash").exists()
+    assert (persistent / "auth" / "creds" / "me.json").read_text(
+        encoding="utf-8"
+    ) == "auth-state\n"
+    assert "registry unavailable" in str(error.value)
+    assert _runtime_staging_leftovers(persistent) == []
+
+
+def test_swap_failure_rolls_back_old_runtime(tmp_path, monkeypatch, caplog):
+    bundled = tmp_path / "install"
+    persistent = tmp_path / "persistent"
+    _seed_managed_runtime(bundled, "2.0.0")
+    _seed_managed_runtime(persistent, "1.0.0")
+    (persistent / "node_modules").mkdir()
+    (persistent / "node_modules" / "working-old-runtime").write_text(
+        "keep\n", encoding="utf-8"
+    )
+    (persistent / "session").mkdir()
+    (persistent / "session" / "creds.json").write_text("auth\n", encoding="utf-8")
+
+    calls: list[tuple[list[str], Path]] = []
+    monkeypatch.setattr("hermes_constants.find_node_executable", lambda name: "npm")
+    monkeypatch.setattr(
+        whatsapp_common.subprocess, "run", _successful_npm_ci(calls)
+    )
+    real_replace = os.replace
+
+    def fail_staging_promotion(source, destination):
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if ".staging-" in source_path.name and destination_path == persistent:
+            raise OSError("simulated promotion failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(whatsapp_common.os, "replace", fail_staging_promotion)
+    caplog.set_level(logging.WARNING, logger=whatsapp_common.logger.name)
+
+    with pytest.raises(whatsapp_common.WhatsAppBridgeDependencyError) as error:
+        whatsapp_common.prepare_whatsapp_bridge_runtime(
+            bundled_bridge=bundled,
+            persistent_bridge=persistent,
+        )
+
+    assert (persistent / "bridge.js").read_text(encoding="utf-8") == "// bridge v1.0.0\n"
+    assert (persistent / "node_modules" / "working-old-runtime").exists()
+    assert (persistent / "session" / "creds.json").read_text(
+        encoding="utf-8"
+    ) == "auth\n"
+    assert "rolled back" in str(error.value).lower()
+    assert "simulated promotion failure" in str(error.value)
+    assert _runtime_staging_leftovers(persistent) == []
+
+
+def test_staging_tamper_is_not_promoted(tmp_path, monkeypatch, caplog):
+    bundled = tmp_path / "install"
+    persistent = tmp_path / "persistent"
+    _seed_managed_runtime(bundled, "2.0.0")
+    _seed_managed_runtime(persistent, "1.0.0")
+    (persistent / "node_modules").mkdir()
+    (persistent / "node_modules" / "working-old-runtime").write_text(
+        "keep\n", encoding="utf-8"
+    )
+
+    calls: list[tuple[list[str], Path]] = []
+    successful_ci = _successful_npm_ci(calls)
+
+    def tampering_npm_ci(*args, **kwargs):
+        result = successful_ci(*args, **kwargs)
+        (Path(kwargs["cwd"]).parent / "bridge.js").write_text(
+            "// unexpectedly modified during install\n", encoding="utf-8"
+        )
+        return result
+
+    monkeypatch.setattr("hermes_constants.find_node_executable", lambda name: "npm")
+    monkeypatch.setattr(whatsapp_common.subprocess, "run", tampering_npm_ci)
+    caplog.set_level(logging.WARNING, logger=whatsapp_common.logger.name)
+
+    with pytest.raises(whatsapp_common.WhatsAppBridgeDependencyError) as error:
+        whatsapp_common.prepare_whatsapp_bridge_runtime(
+            bundled_bridge=bundled,
+            persistent_bridge=persistent,
+        )
+
+    assert (persistent / "bridge.js").read_text(encoding="utf-8") == "// bridge v1.0.0\n"
+    assert (persistent / "node_modules" / "working-old-runtime").exists()
+    assert "changed while npm ci ran" in str(error.value)
+    assert _runtime_staging_leftovers(persistent) == []
+
+
+def test_staging_creation_failure_keeps_old_runtime(tmp_path, monkeypatch, caplog):
+    bundled = tmp_path / "install"
+    persistent = tmp_path / "persistent"
+    _seed_managed_runtime(bundled, "2.0.0")
+    _seed_managed_runtime(persistent, "1.0.0")
+    (persistent / "node_modules").mkdir()
+    (persistent / "node_modules" / "working-old-runtime").write_text(
+        "keep\n", encoding="utf-8"
+    )
+
+    monkeypatch.setattr(
+        tempfile,
+        "mkdtemp",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    caplog.set_level(logging.WARNING, logger=whatsapp_common.logger.name)
+
+    with pytest.raises(whatsapp_common.WhatsAppBridgeDependencyError) as error:
+        whatsapp_common.prepare_whatsapp_bridge_runtime(
+            bundled_bridge=bundled,
+            persistent_bridge=persistent,
+        )
+
+    assert (persistent / "bridge.js").read_text(encoding="utf-8") == "// bridge v1.0.0\n"
+    assert (persistent / "node_modules" / "working-old-runtime").exists()
+    assert "disk full" in str(error.value)
+
+
+def test_post_promotion_runtime_tamper_rolls_back_before_commit(
+    tmp_path, monkeypatch, caplog
+):
+    bundled = tmp_path / "install"
+    persistent = tmp_path / "persistent"
+    _seed_managed_runtime(bundled, "2.0.0")
+    _seed_managed_runtime(persistent, "1.0.0")
+    (persistent / "node_modules").mkdir()
+    (persistent / "node_modules" / "working-old-runtime").write_text(
+        "keep\n", encoding="utf-8"
+    )
+    calls = []
+    monkeypatch.setattr(
+        whatsapp_common.subprocess, "run", _successful_npm_ci(calls)
+    )
+    real_replace = os.replace
+
+    def tamper_promoted_runtime(source, destination):
+        result = real_replace(source, destination)
+        if ".persistent.staging-" in Path(source).name and Path(destination) == persistent:
+            (persistent / "package-lock.json").write_text(
+                '{"tampered": true}\n', encoding="utf-8"
+            )
+        return result
+
+    monkeypatch.setattr(whatsapp_common.os, "replace", tamper_promoted_runtime)
+    caplog.set_level(logging.WARNING, logger=whatsapp_common.logger.name)
+
+    with pytest.raises(whatsapp_common.WhatsAppBridgeDependencyError) as error:
+        whatsapp_common.prepare_whatsapp_bridge_runtime(
+            bundled_bridge=bundled,
+            persistent_bridge=persistent,
+        )
+    assert (persistent / "bridge.js").read_text(encoding="utf-8") == "// bridge v1.0.0\n"
+    assert (persistent / "node_modules" / "working-old-runtime").exists()
+    assert "fingerprint changed before commit" in str(error.value)
+    assert "rolled back to the prior runtime" in str(error.value)
+
+
+def test_runtime_rollback_failure_is_typed_and_preserves_both_diagnostics(
+    tmp_path, monkeypatch, caplog
+):
+    bundled = tmp_path / "install"
+    persistent = tmp_path / "persistent"
+    _seed_managed_runtime(bundled, "2.0.0")
+    _seed_managed_runtime(persistent, "1.0.0")
+    (persistent / "node_modules").mkdir()
+    calls = []
+    monkeypatch.setattr(
+        whatsapp_common.subprocess, "run", _successful_npm_ci(calls)
+    )
+    real_replace = os.replace
+
+    def tamper_then_block_rollback(source, destination):
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if source_path == persistent and ".persistent.staging-" in destination_path.name:
+            raise OSError("simulated rollback quarantine failure")
+        result = real_replace(source, destination)
+        if ".persistent.staging-" in source_path.name and destination_path == persistent:
+            (persistent / "package-lock.json").write_text(
+                '{"tampered": true}\n', encoding="utf-8"
+            )
+        return result
+
+    monkeypatch.setattr(whatsapp_common.os, "replace", tamper_then_block_rollback)
+    caplog.set_level(logging.ERROR, logger=whatsapp_common.logger.name)
+
+    with pytest.raises(
+        whatsapp_common.WhatsAppBridgeStateError,
+        match="rollback also failed",
+    ) as error:
+        whatsapp_common.prepare_whatsapp_bridge_runtime(
+            bundled_bridge=bundled,
+            persistent_bridge=persistent,
+        )
+
+    detail = str(error.value)
+    assert "fingerprint changed before commit" in detail
+    assert "simulated rollback quarantine failure" in detail
+    assert "Recovery data was preserved" in detail
+    assert persistent.exists()
+    assert list(tmp_path.glob(".persistent.backup-*"))
+    assert "fingerprint changed before commit" in caplog.text
+    assert "simulated rollback quarantine failure" in caplog.text
+
+
+def test_runtime_backup_cleanup_failure_warns_and_preserves_recovery(
+    tmp_path, monkeypatch, caplog
+):
+    bundled = tmp_path / "install"
+    persistent = tmp_path / "persistent"
+    _seed_managed_runtime(bundled, "2.0.0")
+    _seed_managed_runtime(persistent, "1.0.0")
+    (persistent / "node_modules").mkdir()
+    (persistent / "state.json").write_text("state\n", encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(
+        whatsapp_common.subprocess, "run", _successful_npm_ci(calls)
+    )
+    real_remove = whatsapp_common._remove_path_without_following
+
+    def fail_runtime_backup_cleanup(path):
+        if Path(path).name.startswith(".persistent.backup-"):
+            raise OSError("cleanup https://user:secret@invalid/backup failed")
+        return real_remove(path)
+
+    monkeypatch.setattr(
+        whatsapp_common, "_remove_path_without_following", fail_runtime_backup_cleanup
+    )
+    caplog.set_level(logging.WARNING, logger=whatsapp_common.logger.name)
+
+    assert whatsapp_common.prepare_whatsapp_bridge_runtime(
+        bundled_bridge=bundled,
+        persistent_bridge=persistent,
+    ) == persistent
+    backups = list(tmp_path.glob(".persistent.backup-*"))
+    assert len(backups) == 1
+    assert (backups[0] / "state.json").read_text(encoding="utf-8") == "state\n"
+    assert "state-bearing backup remains" in caplog.text
+    assert "secret" not in caplog.text
+    assert "<redacted-url>" in caplog.text
+
+
+def test_runtime_staging_cleanup_failure_warns_and_preserves_recovery(
+    tmp_path, monkeypatch, caplog
+):
+    bundled = tmp_path / "install"
+    persistent = tmp_path / "persistent"
+    _seed_managed_runtime(bundled, "2.0.0")
+    _seed_managed_runtime(persistent, "1.0.0")
+    (persistent / "node_modules").mkdir()
+    monkeypatch.setattr(
+        whatsapp_common.subprocess,
+        "run",
+        lambda command, **kwargs: CompletedProcess(
+            command, 1, stdout="", stderr="primary npm failure"
+        ),
+    )
+    real_remove = whatsapp_common._remove_path_without_following
+
+    def fail_runtime_staging_cleanup(path):
+        if Path(path).name.startswith(".persistent.staging-"):
+            raise OSError("staging cleanup failed")
+        return real_remove(path)
+
+    monkeypatch.setattr(
+        whatsapp_common, "_remove_path_without_following", fail_runtime_staging_cleanup
+    )
+    caplog.set_level(logging.WARNING, logger=whatsapp_common.logger.name)
+
+    with pytest.raises(whatsapp_common.WhatsAppBridgeDependencyError) as error:
+        whatsapp_common.prepare_whatsapp_bridge_runtime(
+            bundled_bridge=bundled,
+            persistent_bridge=persistent,
+        )
+    assert list(tmp_path.glob(".persistent.staging-*"))
+    assert "state-bearing bridge staging" in caplog.text
+    assert "remains available for recovery" in caplog.text
+    assert "primary npm failure" in str(error.value)
+
+
+@pytest.mark.parametrize("move", ["backup", "promote"])
+@pytest.mark.parametrize("control", [KeyboardInterrupt, SystemExit])
+def test_runtime_rename_succeeded_then_control_exception_restores_old(tmp_path, monkeypatch, move, control):
+    bundle, live = tmp_path / "bundle", tmp_path / "live"
+    _seed_managed_runtime(bundle, "2")
+    _seed_managed_runtime(live, "1")
+    (live / "state").write_text("keep")
+    before = _file_snapshot(live)
+    monkeypatch.setattr(subprocess, "run", _successful_npm_ci([]))
+    real_replace = os.replace
+    error = control("interrupted rename")
+    raised = False
+    def rename(source, destination):
+        nonlocal raised
+        result = real_replace(source, destination)
+        if not raised and ((move == "backup" and Path(source) == live) or (move == "promote" and Path(destination) == live)):
+            raised = True
+            raise error
+        return result
+    monkeypatch.setattr(os, "replace", rename)
+    with pytest.raises(control) as caught:
+        whatsapp_common.prepare_whatsapp_bridge_runtime(bundle, live)
+    assert caught.value is error
+    assert _file_snapshot(live) == before
+    assert bool(_runtime_staging_leftovers(live)) is (move == "promote")
+
+
+@pytest.mark.parametrize("failure", ["bundle-tamper", "unsupported-state", "final-merge"])
+def test_runtime_uncertain_copy_retains_recovery_and_reports_failure(tmp_path, monkeypatch, failure):
+    bundle, live = tmp_path / "bundle", tmp_path / "live"
+    _seed_managed_runtime(bundle, "2")
+    _seed_managed_runtime(live, "1")
+    (live / "state").write_text("old")
+    real_run = _successful_npm_ci([])
+    def npm(*a, **kw):
+        result = real_run(*a, **kw)
+        if failure == "bundle-tamper":
+            (bundle / "allowlist.js").write_text("tampered")
+        return result
+    monkeypatch.setattr(subprocess, "run", npm)
+    if failure == "unsupported-state":
+        os.mkfifo(live / "fifo")
+    if failure == "final-merge":
+        real_copy = whatsapp_common._copy_persistent_bridge_state
+        def copy(source, destination, **kwargs):
+            if kwargs.get("overwrite") is False:
+                (Path(destination) / "state").write_text("new live data")
+                raise whatsapp_common.WhatsAppBridgeStateError("uncertain merge")
+            return real_copy(source, destination, **kwargs)
+        monkeypatch.setattr(whatsapp_common, "_copy_persistent_bridge_state", copy)
+    with pytest.raises(whatsapp_common.WhatsAppBridgeDependencyError):
+        whatsapp_common.prepare_whatsapp_bridge_runtime(bundle, live)
+    assert (live / "bridge.js").read_text() == "// bridge v1\n"
+    if failure == "final-merge":
+        recovery = _runtime_staging_leftovers(live)
+        assert any((p / "state").read_text() == "new live data" for p in recovery if (p / "state").is_file())
+
+
+def test_final_state_merge_preserves_file_directory_conflicts(tmp_path):
+    source, destination = tmp_path / "source", tmp_path / "destination"
+    (source / "directory").mkdir(parents=True)
+    (source / "directory" / "old").write_text("old")
+    (source / "file").write_text("old")
+    (destination / "file").mkdir(parents=True)
+    (destination / "file" / "new").write_text("new")
+    (destination / "directory").write_text("new")
+    whatsapp_common._copy_persistent_bridge_state(source, destination, overwrite=False)
+    assert (destination / "file" / "new").read_text() == "new"
+    assert (destination / "directory").read_text() == "new"
+
+
+@pytest.mark.parametrize("owner", ["cli", "dashboard"])
+@pytest.mark.parametrize("failure", [False, True])
+def test_pairing_uses_prepared_script_after_success_only(tmp_path, monkeypatch, owner, failure):
+    from hermes_cli import main_platform_setup as cli
+    from hermes_cli.web_routers import messaging
+    from fastapi import HTTPException
+    unprepared, prepared = tmp_path / "missing", tmp_path / "prepared"
+    prepared.mkdir()
+    (prepared / "bridge.js").write_text("// prepared")
+    home = tmp_path / "home"
+    session = home / "whatsapp" / "session"
+    monkeypatch.setattr("hermes_cli.main.get_hermes_home", lambda: home)
+    monkeypatch.setattr("hermes_cli.main._require_tty", lambda *a: None)
+    monkeypatch.setattr("hermes_cli.config.get_env_value", lambda _: None)
+    enabled = []
+    monkeypatch.setattr("hermes_cli.config.save_env_value", lambda *a: enabled.append(a))
+    monkeypatch.setattr(cli, "_whatsapp_choose_mode", lambda *a: "bot")
+    monkeypatch.setattr(cli, "_whatsapp_allowed_users", lambda *a: None)
+    monkeypatch.setattr(whatsapp_common, "resolve_whatsapp_bridge_dir", lambda: unprepared)
+    calls = []
+    def prepare(target, **kwargs):
+        assert not session.exists()
+        calls.append("prepare")
+        assert target == unprepared
+        if failure:
+            raise whatsapp_common.WhatsAppBridgeDependencyError("preparation failed")
+        return prepared
+    monkeypatch.setattr(whatsapp_common, "prepare_whatsapp_bridge_runtime", prepare, raising=False)
+    def launch(argv, **kwargs):
+        calls.append("pair")
+        assert str(prepared / "bridge.js") in argv
+        assert kwargs["cwd"] == str(prepared)
+        assert session.is_dir()
+        assert ("WHATSAPP_ENABLED", "true") not in enabled
+        (session / "creds.json").write_text('{}')
+        return CompletedProcess(argv, 0)
+    monkeypatch.setattr(subprocess, "run", launch)
+    monkeypatch.setattr(subprocess, "Popen", launch)
+    if owner == "cli":
+        cli.cmd_whatsapp(None)
+    elif failure:
+        with pytest.raises(HTTPException, match="preparation failed"):
+            messaging._spawn_whatsapp_pairing_process(session, "bot")
+    else:
+        messaging._spawn_whatsapp_pairing_process(session, "bot")
+    assert calls == (["prepare"] if failure else ["prepare", "pair"])
+    assert session.exists() is (not failure)
+    if owner == "cli":
+        assert (("WHATSAPP_ENABLED", "true") in enabled) is (not failure)
+
+
+def test_cli_cancellation_returns_none_without_pairing(tmp_path, monkeypatch):
+    from hermes_cli.main_platform_setup import _whatsapp_install_bridge
+    def cancel(*a, **kw):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(whatsapp_common, "prepare_whatsapp_bridge_runtime", cancel, raising=False)
+    assert _whatsapp_install_bridge(tmp_path) is None
+
+
+@pytest.mark.parametrize("used", [False, True])
+def test_updater_prepares_existing_mirror_but_never_initializes_unused_runtime(tmp_path, monkeypatch, used):
+    import hermes_cli.main as hm
+    from hermes_cli.update_cmd_deps import _update_whatsapp_bridge_dependencies
+    bundle = tmp_path / "checkout" / "scripts" / "whatsapp-bridge"
+    home = tmp_path / "home"
+    mirror = home / "scripts" / "whatsapp-bridge"
+    _seed_managed_runtime(bundle, "2")
+    if used:
+        _seed_managed_runtime(mirror, "1")
+    monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path / "checkout")
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: home)
+    calls = []
+    def prepare(target, **kwargs):
+        calls.append((target, kwargs))
+        return mirror
+    monkeypatch.setattr(whatsapp_common, "prepare_whatsapp_bridge_runtime", prepare, raising=False)
+    env = {"PYTHON": "/nix/python"}
+    assert _update_whatsapp_bridge_dependencies("/resolved/npm", env) is True
+    assert calls == ([(bundle, {"npm": "/resolved/npm", "env": env})] if used else [])

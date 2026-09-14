@@ -334,15 +334,15 @@ def _whatsapp_linked_account_from_session(session_path: Path) -> tuple[str | Non
     return account_id, account_name, _whatsapp_phone_from_identifier(account_id)
 
 
-def _ensure_whatsapp_bridge_dependencies(bridge_dir: Path) -> None:
-    """Translate explicit dependency maintenance failures for the dashboard."""
+def _ensure_whatsapp_bridge_dependencies(bridge_dir: Path) -> Path:
+    """Translate explicit runtime preparation failures for the dashboard."""
     from gateway.platforms.whatsapp_common import (
         WhatsAppBridgeDependencyError,
-        ensure_whatsapp_bridge_dependencies,
+        prepare_whatsapp_bridge_runtime,
     )
 
     try:
-        ensure_whatsapp_bridge_dependencies(bridge_dir)
+        return prepare_whatsapp_bridge_runtime(bridge_dir)
     except WhatsAppBridgeDependencyError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -351,7 +351,7 @@ def _spawn_whatsapp_pairing_process(session_path: Path, mode: str) -> subprocess
     from gateway.platforms.whatsapp_common import resolve_whatsapp_bridge_dir
     from hermes_constants import find_node_executable, with_hermes_node_path
 
-    bridge_dir = resolve_whatsapp_bridge_dir()
+    bridge_dir = _ensure_whatsapp_bridge_dependencies(resolve_whatsapp_bridge_dir())
     bridge_script = bridge_dir / "bridge.js"
     if not bridge_script.exists():
         raise HTTPException(status_code=500, detail=f"WhatsApp bridge script was not found at {bridge_script}.")
@@ -359,7 +359,6 @@ def _spawn_whatsapp_pairing_process(session_path: Path, mode: str) -> subprocess
     if not node:
         raise HTTPException(status_code=500, detail="Node.js was not found. WhatsApp setup needs Node.js.")
 
-    _ensure_whatsapp_bridge_dependencies(bridge_dir)
     session_path.mkdir(parents=True, exist_ok=True)
 
     env = with_hermes_node_path()

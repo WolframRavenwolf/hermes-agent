@@ -23,6 +23,7 @@ def test_explicit_maintenance_paths_refresh_and_stamp_whatsapp_dependencies(
     checkout.mkdir()
     (checkout / "package.json").write_text("{}", encoding="utf-8")
     (bridge_dir / "node_modules").mkdir(parents=True)
+    (bridge_dir / "bridge.js").write_text("// bridge")
     (bridge_dir / "package.json").write_text(
         '{"dependencies": {}}', encoding="utf-8"
     )
@@ -54,7 +55,7 @@ def test_explicit_maintenance_paths_refresh_and_stamp_whatsapp_dependencies(
 
     monkeypatch.setattr("subprocess.run", fake_run)
 
-    assert _whatsapp_install_bridge(bridge_dir) is True
+    assert _whatsapp_install_bridge(bridge_dir) == bridge_dir
     stamp = bridge_dir / "node_modules" / ".hermes-pkg-hash"
     cli_stamp = stamp.read_text(encoding="utf-8").strip()
     assert cli_stamp
@@ -96,8 +97,8 @@ def test_explicit_maintenance_paths_refresh_and_stamp_whatsapp_dependencies(
     assert update_stamp and update_stamp != dashboard_stamp
     assert installs == ["cli", "dashboard", "update"]
 
-@pytest.mark.parametrize("changed", [False, True])
-def test_explicit_callers_share_the_owner_and_translate_success(tmp_path, monkeypatch, changed):
+@pytest.mark.parametrize("relocated", [False, True])
+def test_explicit_callers_share_the_owner_and_translate_success(tmp_path, monkeypatch, relocated):
     from gateway.platforms import whatsapp_common
     import hermes_cli.main as hm
     from hermes_cli.update_cmd_deps import _update_whatsapp_bridge_dependencies
@@ -110,12 +111,13 @@ def test_explicit_callers_share_the_owner_and_translate_success(tmp_path, monkey
 
     def shared_owner(target, **kwargs):
         calls.append((target, kwargs))
-        return changed
+        return tmp_path / "prepared" if relocated else target
 
-    monkeypatch.setattr(whatsapp_common, "ensure_whatsapp_bridge_dependencies", shared_owner)
+    monkeypatch.setattr(whatsapp_common, "prepare_whatsapp_bridge_runtime", shared_owner)
     monkeypatch.setattr(subprocess, "run", lambda *a, **kw: pytest.fail("caller installed independently"))
-    assert _whatsapp_install_bridge(bridge) is True
-    assert _ensure_whatsapp_bridge_dependencies(bridge) is None
+    expected = tmp_path / "prepared" if relocated else bridge
+    assert _whatsapp_install_bridge(bridge) == expected
+    assert _ensure_whatsapp_bridge_dependencies(bridge) == expected
     assert _update_whatsapp_bridge_dependencies("/resolved/npm", env) is True
     assert calls == [(bridge, {}), (bridge, {}), (bridge, {"npm": "/resolved/npm", "env": env})]
 
@@ -139,8 +141,8 @@ def test_explicit_callers_translate_typed_failure_and_updater_label(tmp_path, mo
     def failure(*args, **kwargs):
         raise whatsapp_common.WhatsAppBridgeDependencyError("transaction failed")
 
-    monkeypatch.setattr(whatsapp_common, "ensure_whatsapp_bridge_dependencies", failure)
-    assert _whatsapp_install_bridge(bridge) is False
+    monkeypatch.setattr(whatsapp_common, "prepare_whatsapp_bridge_runtime", failure)
+    assert _whatsapp_install_bridge(bridge) is None
     with pytest.raises(HTTPException) as error:
         _ensure_whatsapp_bridge_dependencies(bridge)
     assert error.value.status_code == 500
@@ -159,6 +161,7 @@ def test_updater_preserves_resolved_npm_and_nix_python_in_filtered_environment(t
     (tmp_path / "package.json").write_text("{}")
     (bridge / "package.json").write_text("{}")
     (bridge / "package-lock.json").write_text('{"lockfileVersion": 3}')
+    (bridge / "bridge.js").write_text("// bridge")
     monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(hm, "_resolve_node_runtime_npm", lambda: "/resolved/npm")
     monkeypatch.setattr(hm, "_run_npm_install_deterministic",
