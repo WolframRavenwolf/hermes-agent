@@ -315,3 +315,104 @@ class TestWebExtractTavily:
             assert len(result["results"]) == 1
             assert result["results"][0]["url"] == "https://example.com"
             assert "Extracted content" in result["results"][0]["content"]
+
+    @pytest.mark.parametrize("reported_url", [False, True])
+    def test_single_url_cache_requires_reported_final_provenance(self, monkeypatch, reported_url):
+        """A request fallback can associate a single result, but cannot prove its final URL."""
+        from tools.web_tools import web_extract_tool
+
+        url = "https://8.8.8.8/final-provenance"
+        document = {"raw_content": "single document", "title": "Page"}
+        if reported_url:
+            document["url"] = url
+        monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
+        monkeypatch.setattr("tools.web_tools._load_web_config", lambda: {
+            "extract_backend": "tavily", "cache_enabled": True, "keyless_rescue": False,
+        })
+        with patch("plugins.web.tavily.provider.httpx.post",
+                   return_value=_ok_response({"results": [document]})) as transport:
+            for _ in range(2):
+                result = json.loads(asyncio.run(web_extract_tool([url])))
+                assert result["results"][0]["content"] == "single document"
+            assert transport.call_count == (1 if reported_url else 2)
+
+    def test_url_less_batch_document_has_no_request_provenance(self, monkeypatch):
+        """The submitted matcher cannot undo a URL invented by the native normalizer."""
+        from tools.web_tools import web_extract_tool
+
+        first = "https://8.8.8.8/first"
+        second = "https://8.8.8.8/second"
+        monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
+        monkeypatch.setattr("tools.web_tools._load_web_config", lambda: {
+            "extract_backend": "tavily", "cache_enabled": True, "keyless_rescue": False,
+        })
+        response = _ok_response({"results": [
+            {"raw_content": "unassociated document"},
+            {"url": second, "raw_content": "second document"},
+        ]})
+        with patch("plugins.web.tavily.provider.httpx.post", return_value=response) as transport:
+            result = json.loads(asyncio.run(web_extract_tool([first, second])))
+            assert transport.call_args.kwargs["json"]["urls"] == [first, second]
+            assert "unassociated document" not in json.dumps(result)
+            assert [entry["url"] for entry in result["results"]] == [first, second]
+            assert result["results"][0]["error"]
+            assert result["results"][1]["content"] == "second document"
+
+
+    def test_reordered_batch_pairs_by_query_and_caches_each_request(self, monkeypatch):
+        from tools.web_tools import web_extract_tool
+
+        urls = ["https://8.8.8.8/page?page=1", "https://8.8.8.8/page?page=2"]
+        monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
+        monkeypatch.setattr("tools.web_tools._load_web_config", lambda: {
+            "extract_backend": "tavily", "cache_enabled": True, "keyless_rescue": False,
+        })
+        response = _ok_response({"results": [
+            {"url": urls[1], "raw_content": "second"},
+            {"url": urls[0], "raw_content": "first"},
+        ]})
+        with patch("plugins.web.tavily.provider.httpx.post", return_value=response) as transport:
+            results = json.loads(asyncio.run(web_extract_tool(urls + [urls[0]])))["results"]
+            assert [r["content"] for r in results] == ["first", "second", "first"]
+            for url, text in zip(urls, ["first", "second"]):
+                result = json.loads(asyncio.run(web_extract_tool([url])))["results"][0]
+                assert result["url"] == url and result["content"] == text
+            assert transport.call_count == 1
+
+    def test_unmatched_batch_redirect_does_not_steal_missing_request(self, monkeypatch):
+        from tools.web_tools import web_extract_tool
+
+        urls = ["https://8.8.8.8/first", "https://8.8.8.8/second"]
+        monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
+        monkeypatch.setattr("tools.web_tools._load_web_config", lambda: {
+            "extract_backend": "tavily", "cache_enabled": True, "keyless_rescue": False,
+        })
+        response = _ok_response({"results": [
+            {"url": urls[1], "raw_content": "second"},
+            {"url": "https://8.8.4.4/unrelated", "raw_content": "unrelated"},
+        ]})
+        with patch("plugins.web.tavily.provider.httpx.post", return_value=response):
+            results = json.loads(asyncio.run(web_extract_tool(urls)))["results"]
+            assert [r["url"] for r in results] == urls
+            assert results[0]["error"] and not results[0]["content"]
+            assert results[1]["content"] == "second"
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_native_tavily_observable_collision_is_ambiguous_without_stamping_vendor_marker(monkeypatch, reverse):
+    from plugins.web.tavily.provider import TavilyWebSearchProvider
+    from tools.web_tools_extract import _pair_results
+    urls = ["https://a.example", "https://b.example"]
+    raw = {"results": [
+        {"url": urls[1], "raw_content": "A redirected body", "_request_url": urls[0]},
+        {"url": urls[1], "raw_content": "B body"},
+    ]}
+    if reverse:
+        raw["results"].reverse()
+    with patch("plugins.web.tavily.provider.httpx.post", return_value=_ok_response(raw)) as post:
+        rows = TavilyWebSearchProvider().extract(urls)
+    assert all("_request_url" not in r for r in rows)
+    paired = _pair_results(urls, rows)
+    assert paired[0].get("error") and "ambiguous" in paired[1]["error"].lower()
+    assert all(not r["content"] for r in paired)
+    post.assert_called_once()
