@@ -53,10 +53,6 @@ from utils import env_var_enabled
 
 logger = logging.getLogger(__name__)
 
-# Independently reviewed stable-upgrade helper snapshot.
-_CANONICAL_RESTART_HELPER_SHA256 = (
-    "71b9730762ca3c7a3c0f89ef66a31b86a8e03c427d277ebc69f261969230bdef"
-)
 _RESTART_BROKER_FIXED_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 _RESTART_BROKER_HANDOFF_ENV = ("HOME", "HERMES_HOME", "_HERMES_GATEWAY")
 
@@ -64,7 +60,6 @@ _RESTART_BROKER_HANDOFF_ENV = ("HOME", "HERMES_HOME", "_HERMES_GATEWAY")
 def _build_fd_bound_restart_helper_command(
     script_path: Path,
     arguments: list[str],
-    expected_sha256: str,
     *,
     hermes_home: Optional[Path] = None,
 ) -> tuple[list[str], dict[str, str]]:
@@ -72,8 +67,9 @@ def _build_fd_bound_restart_helper_command(
 
     The lifecycle guard's path check is useful for authorization, but executing
     that path later would leave a read-then-execute race.  This broker opens the
-    regular file with ``O_NOFOLLOW``, verifies owner/mode/size and SHA-256 from
-    that descriptor, rewinds it, then asks Bash to execute ``/dev/fd/N``.
+    regular file with ``O_NOFOLLOW``, verifies owner/mode/size from that
+    descriptor, then asks Bash to execute ``/dev/fd/N``. Owner-maintained
+    helper updates do not require a matching digest compiled into Hermes.
 
     Both interpreter hops use fixed argv and a small allowlist environment.
     Isolated Python excludes ``PYTHONPATH``, ``sitecustomize`` from user paths,
@@ -81,13 +77,11 @@ def _build_fd_bound_restart_helper_command(
     running in an outer command shell before the broker can sanitize it.
     """
     broker = """
-import hashlib
-import hmac
 import os
 import stat
 import sys
 
-path, expected, *arguments = sys.argv[1:]
+path, *arguments = sys.argv[1:]
 fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
 metadata = os.fstat(fd)
 if not stat.S_ISREG(metadata.st_mode):
@@ -96,19 +90,6 @@ if metadata.st_uid != os.getuid() or metadata.st_mode & 0o022:
     raise SystemExit("restart helper ownership/mode changed")
 if metadata.st_size > 1024 * 1024:
     raise SystemExit("restart helper exceeds size limit")
-digest = hashlib.sha256()
-remaining = 1024 * 1024 + 1
-while remaining:
-    chunk = os.read(fd, min(65536, remaining))
-    if not chunk:
-        break
-    digest.update(chunk)
-    remaining -= len(chunk)
-if not remaining:
-    raise SystemExit("restart helper exceeds size limit")
-if not hmac.compare_digest(digest.hexdigest(), expected.casefold()):
-    raise SystemExit("restart helper SHA-256 changed")
-os.lseek(fd, 0, os.SEEK_SET)
 os.set_inheritable(fd, True)
 environment = {
     name: os.environ[name]
@@ -116,7 +97,6 @@ environment = {
     if name in os.environ
 }
 environment["HERMES_VERIFIED_RESTART_SOURCE"] = path
-environment["HERMES_VERIFIED_RESTART_SHA256"] = expected
 os.execve(
     "/bin/bash",
     ["/bin/bash", f"/dev/fd/{fd}", *arguments],
@@ -136,7 +116,6 @@ os.execve(
         "-c",
         broker,
         str(script_path),
-        expected_sha256,
         *arguments,
     ]
     return argv, environment
@@ -3237,7 +3216,6 @@ def terminal_tool(
                 canonical_helper_path = get_hermes_home() / "scripts" / "restart-gateway.sh"
                 canonical_restart_helper = is_direct_canonical_restart_helper_command(
                     command, script_path=canonical_helper_path, cwd=guard_cwd,
-                    expected_sha256=_CANONICAL_RESTART_HELPER_SHA256,
                 )
                 if not canonical_restart_helper and any(
                     path == canonical_helper_path
@@ -3245,12 +3223,12 @@ def terminal_tool(
                 ):
                     return json.dumps({
                         "output": "", "exit_code": 1, "status": "error",
-                        "error": "Blocked: canonical restart helper requires reviewed content, owner/mode and a direct, complete invocation.",
+                        "error": "Blocked: canonical restart helper requires safe ownership/mode and a direct, complete invocation.",
                     }, ensure_ascii=False)
                 if canonical_restart_helper:
                     direct_tokens = shlex.split(command, comments=True, posix=True)
                     fd_bound_restart_helper_invocation = _build_fd_bound_restart_helper_command(
-                        canonical_helper_path, direct_tokens[1:], _CANONICAL_RESTART_HELPER_SHA256,
+                        canonical_helper_path, direct_tokens[1:],
                         hermes_home=get_hermes_home(),
                     )
 

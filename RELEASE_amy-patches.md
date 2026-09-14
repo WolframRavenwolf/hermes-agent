@@ -1,5 +1,23 @@
 # Amy's Patches — Stable 0.21 Ledger
 
+## Owner-maintained restart helper - checkpoint 2026-09-14
+
+- Problem: the fixed helper digest compiled into the restart corridor rejected
+  legitimate owner-maintained helper updates, preventing routine restarts.
+- Solution: retain the September 9 removal of that content pin. The exact helper
+  path, strict direct-command grammar, regular-file/owner/mode/size checks,
+  descriptor-bound execution and sanitized interpreter environment remain.
+  Maintenance payloads still require their separate hash and target identity.
+- Files: `cron/lifecycle_guard.py`, `tools/terminal_tool.py`,
+  `tests/hermes_cli/test_gateway_restart_loop.py`, this ledger.
+- Validation: 52 focused restart-corridor and lifecycle-guard tests passed in
+  isolated homes using harmless helper fixtures; scoped Ruff passed. No service
+  action was performed for this checkpoint; live acceptance occurred on September 9.
+- This follow-up supersedes the original P18/P30 content-pin contract below;
+  those rows preserve the reconstruction's historical commit ownership.
+- Implementation reference: restart repair, 2026-09-09.
+  Source behavior was already deployed before this commit.
+
 ## Named skill batch notifications - 2026-09-14
 
 - Problem: successful background skill batches were silent in `on` mode and

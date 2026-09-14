@@ -913,7 +913,6 @@ class TestVerifiedRestartCorridor:
     _minimal_config = TestTerminalToolGatewayLifecycleGuard._minimal_config
     _patch_env = TestTerminalToolGatewayLifecycleGuard._patch_env
     def _helper(self, tmp_path, monkeypatch):
-        import hashlib
         import hermes_constants
         import tools.terminal_tool as tt
         helper = tmp_path / "scripts" / "restart-gateway.sh"
@@ -924,21 +923,19 @@ class TestVerifiedRestartCorridor:
             "printf 'verified:%s:%s\\n' \"${1:-normal}\" \"${BASH_ENV:-clean}\"\n"
         )
         helper.chmod(0o700)
-        digest = hashlib.sha256(helper.read_bytes()).hexdigest()
         # This fixture is harmless, never the operational restart helper.
-        monkeypatch.setattr(tt, "_CANONICAL_RESTART_HELPER_SHA256", digest, raising=False)
         monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
         from types import SimpleNamespace
         env = SimpleNamespace(env={}, cwd=str(tmp_path), execute=lambda *a, **k: {"output": "shell-boundary crossed", "returncode": 0})
         self._patch_env(monkeypatch, env, inside_gateway=True)
         monkeypatch.setattr(tt, "_get_env_config", lambda: {**self._minimal_config(), "cwd": str(tmp_path)})
         monkeypatch.setattr(tt, "_check_all_guards", lambda *a, **k: {"approved": True})
-        return helper, digest
+        return helper
 
     @pytest.mark.parametrize("arg", ["", " --dry-run", " --delay 1 --stability 2"])
     def test_verified_normal_helper_runs_without_environment_shell(self, tmp_path, monkeypatch, arg):
         import tools.terminal_tool as tt
-        helper, _ = self._helper(tmp_path, monkeypatch)
+        helper = self._helper(tmp_path, monkeypatch)
         injected = tmp_path / "startup-ran"
         startup = tmp_path / "startup.sh"
         startup.write_text(f"touch {injected}\n")
@@ -949,6 +946,14 @@ class TestVerifiedRestartCorridor:
         assert result["output"] == f"verified:{arg.split()[0] if arg else 'normal'}:clean"
         assert not injected.exists()
 
+    def test_updated_owner_helper_runs_without_content_pin(self, tmp_path, monkeypatch):
+        import tools.terminal_tool as tt
+        helper = self._helper(tmp_path, monkeypatch)
+        helper.write_text("#!/bin/bash\nprintf updated-helper\n")
+        result = json.loads(tt.terminal_tool(command=str(helper)))
+        assert result["exit_code"] == 0, result
+        assert result["output"] == "updated-helper"
+
     @pytest.mark.parametrize("form", [
         "{h} --worker-label injected", "bash {h}", "env {h}",
         "{h} > /tmp/out", "{h} &", "{h};", "{h} && true",
@@ -957,17 +962,15 @@ class TestVerifiedRestartCorridor:
     ])
     def test_helper_exception_rejects_non_direct_or_incomplete_handoff(self, tmp_path, monkeypatch, form):
         import tools.terminal_tool as tt
-        helper, _ = self._helper(tmp_path, monkeypatch)
+        helper = self._helper(tmp_path, monkeypatch)
         result = json.loads(tt.terminal_tool(command=form.format(h=helper)))
         assert result["exit_code"] != 0
 
-    @pytest.mark.parametrize("change", ["content", "mode", "symlink"])
+    @pytest.mark.parametrize("change", ["mode", "symlink"])
     def test_replaced_helper_is_not_trusted(self, tmp_path, monkeypatch, change):
         import tools.terminal_tool as tt
-        helper, _ = self._helper(tmp_path, monkeypatch)
-        if change == "content":
-            helper.write_text(helper.read_text() + "# exchanged\n")
-        elif change == "mode":
+        helper = self._helper(tmp_path, monkeypatch)
+        if change == "mode":
             helper.chmod(0o722)
         else:
             target = helper.with_suffix(".other")
@@ -978,30 +981,29 @@ class TestVerifiedRestartCorridor:
 
     def test_background_never_reopens_verified_helper_in_shell(self, tmp_path, monkeypatch):
         import tools.terminal_tool as tt
-        helper, _ = self._helper(tmp_path, monkeypatch)
+        helper = self._helper(tmp_path, monkeypatch)
         result = json.loads(tt.terminal_tool(command=str(helper), background=True))
         assert result["exit_code"] == 1
         assert "foreground" in result["error"]
 
-    def test_broker_rechecks_bytes_after_authorization(self, tmp_path, monkeypatch):
+    def test_broker_rechecks_mode_after_authorization(self, tmp_path, monkeypatch):
         import tools.terminal_tool as tt
-        helper, _ = self._helper(tmp_path, monkeypatch)
+        helper = self._helper(tmp_path, monkeypatch)
         def swap_after_authorization(*args, **kwargs):
-            helper.write_text("#!/bin/bash\nprintf exchanged\n")
+            helper.chmod(0o722)
             return {"approved": True}
         monkeypatch.setattr(tt, "_check_all_guards", swap_after_authorization)
         result = json.loads(tt.terminal_tool(command=str(helper)))
         assert result["exit_code"] != 0
-        assert "SHA-256 changed" in result["output"]
-        assert "exchanged" not in result["output"]
+        assert "ownership/mode changed" in result["output"]
 
     def test_complete_maintenance_grammar_is_accepted_without_running_payload(self, tmp_path, monkeypatch):
         from cron import lifecycle_guard as guard
-        helper, digest = self._helper(tmp_path, monkeypatch)
+        helper = self._helper(tmp_path, monkeypatch)
         assert guard.is_direct_canonical_restart_helper_command(
             f"{helper} --maintenance-script /safe/cutover.sh --maintenance-sha256 {'a' * 64} "
             f"--expected-version 0.21.0 --expected-head {'b' * 40} --require-platform mattermost",
-            script_path=helper, expected_sha256=digest,
+            script_path=helper,
         )
 
     def test_terminal_descendant_cannot_restart_ancestor_with_marker_removed(self, tmp_path, monkeypatch):
