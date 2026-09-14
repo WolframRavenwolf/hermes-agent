@@ -4699,7 +4699,7 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
                     file=sys.stderr,
                     flush=True,
                 )
-            return None
+            return ["all"]
 
         if not unresolved:
             return built_in

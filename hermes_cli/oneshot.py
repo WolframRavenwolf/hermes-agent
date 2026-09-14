@@ -115,7 +115,7 @@ def _validate_explicit_toolsets(toolsets: object = None) -> tuple[list[str] | No
                 "hermes -z: --toolsets all enables every toolset; "
                 f"ignoring additional entries: {', '.join(ignored)}\n"
             )
-        return None, None
+        return ["all"], None
 
     mcp_names: set[str] = set()
     mcp_disabled: set[str] = set()

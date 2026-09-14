@@ -1,5 +1,7 @@
 """Tests for toolsets.py — toolset resolution, validation, and composition."""
 
+import pytest
+
 import toolsets as toolsets_mod
 from tools.registry import ToolRegistry
 from toolsets import (
@@ -361,4 +363,323 @@ class TestResolveToolsetMemo:
         second = resolve_toolset("hermes-cli", include_registry=False)
         assert first == second
         assert first  # non-empty sanity
+
+
+@pytest.fixture
+def isolated_tool_definitions(monkeypatch, tmp_path):
+    """Use real selection/assembly with a private registry and cache state."""
+    import model_tools
+    import tools.registry as registry_mod
+
+    messaging_entry = registry_mod.registry.get_entry("send_message")
+    reg = ToolRegistry()
+    monkeypatch.setattr(registry_mod, "registry", reg)
+    monkeypatch.setattr(model_tools, "registry", reg)
+    monkeypatch.setattr(model_tools, "_tool_defs_cache", {})
+    monkeypatch.setattr(model_tools, "_last_resolved_tool_names", [])
+    monkeypatch.setattr(toolsets_mod, "_resolve_toolset_memo", {})
+    monkeypatch.setattr(registry_mod, "_check_fn_cache", {})
+    monkeypatch.setattr(registry_mod, "_check_fn_last_good", {})
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    # Exercise native tool-search assembly with a local context length so
+    # schema discovery never needs model-metadata network access.
+    (tmp_path / "config.yaml").write_text(
+        "model:\n  context_length: 200000\n"
+        "tools:\n  tool_search:\n    enabled: auto\n"
+    )
+    return model_tools, reg, messaging_entry
+
+
+@pytest.fixture(params=["_test_optin_leaf", "_test_optin_composite"])
+def default_off_catalog(request, monkeypatch, isolated_tool_definitions):
+    model_tools, reg, _ = isolated_tool_definitions
+    # Registry membership supplies the leaf's tool. The composite can also
+    # own default_off, proving exclusion resolves includes rather than just
+    # subtracting the static direct-tools list.
+    for name, includes in (
+        ("_test_optin_leaf", []),
+        ("_test_optin_composite", ["_test_optin_leaf"]),
+    ):
+        monkeypatch.setitem(TOOLSETS, name, {
+            "description": "Test opt-in toolset",
+            "tools": [],
+            "includes": includes,
+            "default_off": name == request.param,
+        })
+    reg.register(
+        name="test_regular_tool",
+        toolset="_test_regular",
+        schema=_make_schema("test_regular_tool"),
+        handler=_dummy_handler,
+    )
+    return model_tools, reg
+
+
+def _test_catalog_names(definitions, skip_tool_search_assembly):
+    names = {td["function"]["name"] for td in definitions}
+    if not skip_tool_search_assembly and definitions:
+        # Native assembly defers synthetic non-core tools. Inspect its real
+        # model-facing catalog listing instead of bypassing the bridge.
+        assert names == {"tool_search", "tool_describe", "tool_call"}
+        listing = next(td["function"]["description"] for td in definitions
+                       if td["function"]["name"] == "tool_search")
+        return {name for name in ("test_regular_tool", "test_optin_tool")
+                if name in listing}
+    return names
+
+
+@pytest.mark.parametrize("skip_tool_search_assembly", [False, True])
+@pytest.mark.parametrize(
+    "enabled, disabled, available, expected",
+    [
+        (None, None, True, {"test_regular_tool"}),
+        (["_test_optin_leaf"], None, True, {"test_optin_tool"}),
+        (["_test_optin_composite"], None, True, {"test_optin_tool"}),
+        (["_test_optin_leaf"], ["_test_optin_leaf"], True, set()),
+        (["_test_optin_composite"], ["_test_optin_leaf"], True, set()),
+        (["_test_optin_leaf"], ["_test_optin_composite"], True, set()),
+        (["_test_optin_leaf"], None, False, set()),
+        (["_test_optin_composite"], None, False, set()),
+        (None, ["_test_optin_leaf"], True, {"test_regular_tool"}),
+    ],
+    ids=["implicit", "leaf", "composite", "disable-leaf",
+         "disable-through-composite", "disable-composite", "unavailable-leaf",
+         "unavailable-composite", "implicit-disabled"],
+)
+def test_default_off_tool_definitions(
+    default_off_catalog, skip_tool_search_assembly,
+    enabled, disabled, available, expected,
+):
+    model_tools, reg = default_off_catalog
+    reg.register(
+        name="test_optin_tool",
+        toolset="_test_optin_leaf",
+        schema=_make_schema("test_optin_tool"),
+        handler=_dummy_handler,
+        check_fn=lambda: available,
+    )
+
+    definitions = model_tools.get_tool_definitions(
+        enabled_toolsets=enabled,
+        disabled_toolsets=disabled,
+        skip_tool_search_assembly=skip_tool_search_assembly,
+    )
+
+    assert _test_catalog_names(definitions, skip_tool_search_assembly) == expected
+
+
+@pytest.mark.parametrize("skip_tool_search_assembly", [False, True])
+@pytest.mark.parametrize("explicit", ["_test_optin_leaf", "_test_optin_composite"])
+def test_default_off_quiet_cache_keeps_selections_separate(
+    default_off_catalog, skip_tool_search_assembly, explicit,
+):
+    model_tools, reg = default_off_catalog
+    reg.register(
+        name="test_optin_tool",
+        toolset="_test_optin_leaf",
+        schema=_make_schema("test_optin_tool"),
+        handler=_dummy_handler,
+        check_fn=lambda: True,
+    )
+    results = []
+    for enabled in (None, [explicit], None):
+        definitions = model_tools.get_tool_definitions(
+            enabled_toolsets=enabled,
+            quiet_mode=True,
+            skip_tool_search_assembly=skip_tool_search_assembly,
+        )
+        results.append(_test_catalog_names(definitions, skip_tool_search_assembly))
+
+    assert model_tools._tool_defs_cache, "quiet calls must exercise memoization"
+    assert results == [
+        {"test_regular_tool"}, {"test_optin_tool"}, {"test_regular_tool"},
+    ]
+
+
+@pytest.mark.parametrize("skip_tool_search_assembly", [False, True])
+@pytest.mark.parametrize(
+    "enabled, disabled, available, expected",
+    [
+        (None, None, True, set()),
+        ([], None, True, set()),
+        (["all"], None, True, {"send_message"}),
+        (["*"], None, True, {"send_message"}),
+        (["messaging"], None, True, {"send_message"}),
+        (["messaging"], ["messaging"], True, set()),
+        (["messaging"], None, False, set()),
+    ],
+    ids=["implicit", "empty", "all", "wildcard", "explicit", "disabled", "unavailable"],
+)
+def test_messaging_schema_requires_opt_in(
+    isolated_tool_definitions, monkeypatch, skip_tool_search_assembly,
+    enabled, disabled, available, expected,
+):
+    from tools.send_message_tool import SEND_MESSAGE_SCHEMA, _check_send_message
+
+    model_tools, reg, entry = isolated_tool_definitions
+    assert entry is not None
+    assert entry.toolset == "messaging"
+    assert entry.schema == SEND_MESSAGE_SCHEMA
+    assert entry.check_fn is _check_send_message
+    # Preserve the contributor's schema, handler and availability guard. Only
+    # its requirements are fixture-controlled; no handler or transport runs.
+    reg.register(
+        name=entry.name, toolset=entry.toolset, schema=entry.schema,
+        handler=entry.handler, check_fn=entry.check_fn,
+    )
+    monkeypatch.setattr(
+        "gateway.session_context.get_session_env",
+        lambda name, default="": "telegram" if available else "local",
+    )
+    monkeypatch.setattr("gateway.status.is_gateway_running", lambda: False)
+
+    definitions = model_tools.get_tool_definitions(
+        enabled_toolsets=enabled,
+        disabled_toolsets=disabled,
+        quiet_mode=True,
+        skip_tool_search_assembly=skip_tool_search_assembly,
+    )
+
+    assert {td["function"]["name"] for td in definitions} == expected
+    if expected:
+        assert definitions[0]["function"]["parameters"]["properties"] == (
+            SEND_MESSAGE_SCHEMA["parameters"]["properties"]
+        )
+
+
+@pytest.fixture
+def messaging_catalog(isolated_tool_definitions, monkeypatch):
+    from agent.delegation_context import KANBAN_ENV_KEYS, DELEGATED_CHILD_ENV_MARKER
+    from tools.send_message_tool import SEND_MESSAGE_SCHEMA, _check_send_message
+
+    model_tools, reg, entry = isolated_tool_definitions
+    assert entry.schema == SEND_MESSAGE_SCHEMA
+    assert entry.check_fn is _check_send_message
+    reg.register(
+        name=entry.name, toolset=entry.toolset, schema=entry.schema,
+        handler=entry.handler, check_fn=entry.check_fn,
+    )
+    for name in (*KANBAN_ENV_KEYS, DELEGATED_CHILD_ENV_MARKER):
+        monkeypatch.delenv(name, raising=False)
+    available = {"value": True}
+    monkeypatch.setattr(
+        "gateway.session_context.get_session_env",
+        lambda name, default="": "telegram" if available["value"] else "local",
+    )
+    monkeypatch.setattr("gateway.status.is_gateway_running", lambda: False)
+    return model_tools, reg, available
+
+
+def _resolve_explicit_all(adapter, value, monkeypatch):
+    if adapter == "oneshot":
+        from hermes_cli.oneshot import _normalize_toolsets, _validate_explicit_toolsets
+
+        resolved, error = _validate_explicit_toolsets(value)
+        assert error is None
+        # _run_agent normalizes the validator result once more.
+        return _normalize_toolsets(resolved)
+
+    from tui_gateway.server import _load_enabled_toolsets
+
+    monkeypatch.setenv("HERMES_TUI_TOOLSETS", value)
+    return _load_enabled_toolsets()
+
+
+@pytest.mark.parametrize("adapter, value", [
+    ("oneshot", "all"), ("oneshot", "*"), ("oneshot", "all,*"),
+    ("oneshot", " , all , web, _unknown_all_test , "),
+    ("oneshot", ["all", "*", "web,_unknown_all_test"]),
+    ("oneshot", (" * ", "all", "web", "_unknown_all_test")),
+    ("tui", "all"), ("tui", "*"), ("tui", "all,*"),
+    ("tui", " , * , web, _unknown_all_test , "),
+])
+@pytest.mark.parametrize("skip_tool_search_assembly", [False, True])
+@pytest.mark.parametrize("disabled, available", [
+    (None, True), (["messaging"], True), (None, False),
+    (["all"], True), (["*"], True),
+])
+def test_explicit_all_resolvers_preserve_messaging(
+    messaging_catalog, monkeypatch, capsys, adapter, value,
+    skip_tool_search_assembly, disabled, available,
+):
+    model_tools, _, requirements = messaging_catalog
+    requirements["value"] = available
+    resolved = _resolve_explicit_all(adapter, value, monkeypatch)
+    if "_unknown_all_test" in str(value):
+        assert "ignoring additional entries: web, _unknown_all_test" in capsys.readouterr().err
+
+    definitions = model_tools.get_tool_definitions(
+        enabled_toolsets=resolved, disabled_toolsets=disabled,
+        quiet_mode=True, skip_tool_search_assembly=skip_tool_search_assembly,
+    )
+
+    names = {td["function"]["name"] for td in definitions}
+    assert ("send_message" in names) is (available and disabled is None)
+    if disabled in (["all"], ["*"]):
+        assert definitions == []
+
+
+@pytest.mark.parametrize("adapter", ["oneshot", "tui"])
+@pytest.mark.parametrize("value", ["all", "*"])
+@pytest.mark.parametrize("skip_tool_search_assembly", [False, True])
+def test_explicit_all_resolvers_cache_and_late_registration(
+    messaging_catalog, monkeypatch, adapter, value, skip_tool_search_assembly,
+):
+    model_tools, reg, _ = messaging_catalog
+    resolved = _resolve_explicit_all(adapter, value, monkeypatch)
+    plugin_names = set()
+    for suffix in ("before_lookup", "after_cached_lookup"):
+        name = "test_late_" + suffix
+        toolset = "_late_" + suffix
+        # Native registration after adapter resolution, then after a cache hit.
+        reg.register(
+            name=name, toolset=toolset, schema=_make_schema(name),
+            handler=_dummy_handler,
+        )
+        plugin_names.add(name)
+        assert {"messaging", toolset} <= set(toolsets_mod.get_toolset_names())
+        assert {"messaging", toolset} <= set(get_all_toolsets())
+        for enabled, explicit in ((None, False), (resolved, True),
+                                  (None, False), (resolved, True)):
+            definitions = model_tools.get_tool_definitions(
+                enabled_toolsets=enabled, quiet_mode=True,
+                skip_tool_search_assembly=skip_tool_search_assembly,
+            )
+            names = {td["function"]["name"] for td in definitions}
+            expected = plugin_names | ({"send_message"} if explicit else set())
+            if skip_tool_search_assembly:
+                assert names == expected
+            else:
+                assert ("send_message" in names) is explicit
+                listing = next(td["function"]["description"] for td in definitions
+                               if td["function"]["name"] == "tool_search")
+                assert {name for name in plugin_names if name in listing} == plugin_names
+        assert model_tools._tool_defs_cache, "quiet calls must exercise memoization"
+
+
+@pytest.mark.parametrize("skip_tool_search_assembly", [False, True])
+def test_default_resolvers_keep_messaging_implicit(
+    messaging_catalog, monkeypatch, skip_tool_search_assembly,
+):
+    from hermes_cli.oneshot import _normalize_toolsets, _validate_explicit_toolsets
+    from tui_gateway.server import _load_enabled_toolsets
+
+    model_tools, _, _ = messaging_catalog
+    monkeypatch.delenv("HERMES_TUI_TOOLSETS", raising=False)
+    selections = [_load_enabled_toolsets()]
+    for value in (None, [], " , "):
+        resolved, error = _validate_explicit_toolsets(value)
+        assert error is None
+        assert _normalize_toolsets(value) is None  # native config-fallback signal
+        selections.append(_normalize_toolsets(resolved))
+    defaults = model_tools.get_tool_definitions(
+        quiet_mode=True, skip_tool_search_assembly=skip_tool_search_assembly,
+    )
+    assert "send_message" not in {td["function"]["name"] for td in defaults}
+    for enabled in selections:
+        definitions = model_tools.get_tool_definitions(
+            enabled_toolsets=enabled, quiet_mode=True,
+            skip_tool_search_assembly=skip_tool_search_assembly,
+        )
+        assert "send_message" not in {td["function"]["name"] for td in definitions}
 
