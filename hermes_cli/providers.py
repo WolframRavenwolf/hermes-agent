@@ -713,10 +713,10 @@ def determine_api_mode(provider: str, base_url: str = "", model: str = "") -> st
     Resolution order:
       1. Host-mandated mode (special endpoints that only accept one protocol).
       2. Nous Portal dual-wire (model-derived; overlay alone is openai_chat).
-      3. Known provider → transport → TRANSPORT_TO_API_MODE.
-         Plugin-profile transports apply only on their declared endpoint.
-      4. Direct provider checks (bedrock).
-      5. Default: 'chat_completions'.
+      3. Own-endpoint plugin profile, unless a Hermes overlay owns the provider.
+      4. Known provider → transport → TRANSPORT_TO_API_MODE.
+      5. Direct provider checks (bedrock).
+      6. Default: 'chat_completions'.
 
     *model* is optional but required for dual-wire providers (Nous) whose
     transport depends on the catalog id, not just the provider/host.
@@ -733,6 +733,32 @@ def determine_api_mode(provider: str, base_url: str = "", model: str = "") -> st
     if provider_norm in {"nous", "nous-portal", "nousresearch"}:
         return nous_api_mode(model)
 
+    declared_url = ""
+    selected_url = (base_url or "").strip().rstrip("/")
+    canonical = normalize_provider(provider or "")
+    if canonical not in HERMES_OVERLAYS:
+        try:
+            from providers import get_provider_profile
+
+            profile = get_provider_profile(canonical)
+        except Exception:
+            profile = None
+        if profile is not None:
+            # Match auth's URL field convention; API-key env values are not URLs.
+            url_env = next((v for v in profile.env_vars if v.endswith("_URL")), "")
+            declared_url = (profile.base_url or "").strip()
+            if url_env:
+                from agent.secret_scope import get_secret
+
+                declared_url = (get_secret(url_env) or "").strip() or declared_url
+            declared_url = declared_url.rstrip("/")
+            if declared_url and (not selected_url or selected_url == declared_url):
+                # A catalog-only entry supplies generic metadata, not the
+                # plugin's endpoint-specific wire protocol.
+                if profile.api_mode in TRANSPORT_TO_API_MODE.values():
+                    return profile.api_mode
+                return "chat_completions"
+
     pdef = get_provider(provider)
     if pdef is not None:
         # ``get_provider`` bridges ProviderProfile-only plugins into a
@@ -743,8 +769,7 @@ def determine_api_mode(provider: str, base_url: str = "", model: str = "") -> st
         # Host-mandated overrides have already returned above.
         if (
             pdef.source == "plugin-profile"
-            and base_url
-            and base_url.rstrip("/") != pdef.base_url.rstrip("/")
+            and (not declared_url or (selected_url and selected_url != declared_url))
         ):
             return "chat_completions"
         return TRANSPORT_TO_API_MODE.get(pdef.transport, "chat_completions")
