@@ -119,6 +119,10 @@ def _inject_context_from(job: dict, prompt: str) -> tuple[str, bool]:
                     latest_output,
                 )
             injected = True
+            from cron.context import load_context
+            discussion = load_context(source_job_id)
+            if discussion:
+                prompt += f"\n\n## Discussion of job '{source_job_id}' reports\n{discussion}"
         except (OSError, PermissionError) as e:
             # silent skip — never put error text into the prompt
             logger.warning("context_from: failed to read output for job %r: %s", source_job_id, e)

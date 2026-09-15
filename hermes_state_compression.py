@@ -276,6 +276,7 @@ class SessionCompressionMixin:
                     (parent_session_id,))
             if not messages:
                 raise RuntimeError("Compression child handoff must not be empty")
+            self._stamp_compression_origins(conn, parent_session_id, messages)
             self._publish_child_session_row(
                 conn, parent, parent_session_id=parent_session_id, child_session_id=child_session_id,
                 source=source, model=model, model_config=model_config, system_prompt=system_prompt,
@@ -297,6 +298,13 @@ class SessionCompressionMixin:
             conn.execute(
                 "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
                 (total_messages, total_tool_calls, child_session_id))
+            seed_end = conn.execute("SELECT MAX(id) FROM messages WHERE session_id=?",
+                                    (child_session_id,)).fetchone()[0]
+            child_config = dict(model_config or {})
+            child_config["_compression_seed"] = {"version": 1,
+                "parent_session_id": parent_session_id, "last_row_id": seed_end}
+            conn.execute("UPDATE sessions SET model_config=? WHERE id=?",
+                         (json.dumps(child_config), child_session_id))
             updated = conn.execute(
                 "UPDATE sessions SET ended_at = ?, end_reason = 'compression' "
                 "WHERE id = ? AND ended_at IS NULL", (time.time(), parent_session_id))

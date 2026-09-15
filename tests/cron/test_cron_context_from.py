@@ -440,3 +440,30 @@ class TestContinuityFlag:
         assert "previous run" in prompt.lower()
 
 
+
+
+
+def test_discussion_appends_to_native_output_selection(cron_env):
+    from cron.context import record_conversation
+    from cron.scheduler_prompt import _inject_context_from
+    from hermes_state import SessionDB
+    directory = cron_env / "cron" / "output" / "abcdef"
+    directory.mkdir()
+    output = directory / "run.md"
+    native_log = "# Cron Job: Brief\n\n## Prompt\nNative prompt data\n\n## Response\nReport subject"
+    output.write_text(native_log)
+    db = SessionDB()
+    try:
+        db.create_session("discussion", source="telegram")
+        marker = "[Cron delivery: Brief]\nReport subject"
+        db.append_message("discussion", "user", marker)
+        record_conversation(output, "discussion", marker)
+        db.append_message("discussion", "user", "Correction for the next run")
+        for source in ["self", "abcdef"]:
+            prompt, injected = _inject_context_from({"id": "abcdef", "context_from": [source]}, "Next task")
+            assert injected and native_log in prompt
+            assert "Correction for the next run" in prompt
+            assert prompt.count("Correction for the next run") == 1
+            assert "Next task" in prompt
+    finally:
+        db.close()

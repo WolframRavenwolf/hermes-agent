@@ -2717,15 +2717,25 @@ def _save_compose_deliver(
             if not owns_delivery:
                 raise _FireClaimLostDuringSideEffect
             d.delivery_attempted = True
-            d.delivery_error = _deliver_result(
-                job,
-                deliver_content,
-                adapters=adapters,
-                loop=loop,
-                # Failure summaries (and drift/blocked-config alerts composed into deliver_content
-                # on the failure path) honor the job's failure_deliver override (NS-788).
-                for_failure=not d.success,
-            )
+            # Carry the fenced output identity only through this delivery attempt,
+            # never into the durable job definition.
+            delivery_job = {**job, "_context_output_file": str(output_file)}
+            try:
+                d.delivery_error = _deliver_result(
+                    delivery_job,
+                    deliver_content,
+                    adapters=adapters,
+                    loop=loop,
+                    # Failure summaries honor failure_deliver (NS-788).
+                    for_failure=not d.success,
+                )
+            finally:
+                # Preserve the native delivery bookkeeping consumed by the run tail.
+                for key in ("last_delivery_queued", "last_delivery_unverified", "_bot_chat_delivery_receipts"):
+                    if key in delivery_job:
+                        job[key] = delivery_job[key]
+                    else:
+                        job.pop(key, None)
     except Exception as de:
         if isinstance(de, _FireClaimLostDuringSideEffect):
             raise
