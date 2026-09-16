@@ -3,7 +3,7 @@
 * **Search memo** — in-memory, per-process, single-flighted: concurrent identical queries share one
   paid request. Limits bucket to 10/20/50/100 so near-identical requests share an entry.
 * **Extract cache** — disk-backed under ``cache/web`` (cross-process) with a JSON sidecar index:
-  URL digest → (file, fetched_at, title). Hits re-run the normal truncate pipeline.
+  URL digest → (file, fetched_at, title, final_url, content_sha256). Hits re-run the truncate pipeline.
 Lives here, not in tool dispatch, so hits sit *after* every safety check and skip only the vendor call.
 """
 
@@ -253,18 +253,46 @@ def _is_local_dev_url(url: str) -> bool:
         return True
 
 
+def is_valid_extract_url(url: object) -> bool:
+    """Pure HTTP(S) authority check shared by final results and cache provenance."""
+    if not isinstance(url, str):
+        return False
+    # Inspect the raw authority before urllib strips tabs/newlines or leading C0 controls.
+    authority = re.match(r"https?://([^/?#]*)", url, re.IGNORECASE)
+    if authority is None or any(
+        char.isspace() or ord(char) < 32 or 127 <= ord(char) <= 159
+        for char in authority.group(1)
+    ):
+        return False
+    try:
+        parts = urlparse(url)
+        # urllib parses ports lazily; hostname alone accepts invalid port strings/ranges.
+        _ = parts.port
+        return parts.scheme in {"http", "https"} and bool(parts.hostname)
+    except ValueError:
+        return False
+
+
 def _cacheable(url: str) -> bool:
-    """Extract-cache gate: enabled, not a local-dev host, not user-exempted."""
-    return cache_enabled() and not (_is_local_dev_url(url) or _is_cache_exempt_host(url))
+    """Extract-cache gate: valid URL, enabled, not local-dev or user-exempted."""
+    return (is_valid_extract_url(url) and cache_enabled()
+            and not (_is_local_dev_url(url) or _is_cache_exempt_host(url)))
 
 
 def extract_cache_get(url: str, format: Optional[str] = None, provider: str = "") -> Optional[dict]:
-    """Return {'url','title','content'} for a fresh cached page, else None."""
-    if not _cacheable(url):
+    """Return digest-bound text with known final provenance and currently allowed URLs, else None."""
+    from tools.website_policy import check_website_access
+    if not _cacheable(url) or check_website_access(url) is not None:
         return None
     with _index_lock:
         entry = _load_index().get(_url_digest(url, format, provider))
     if not entry or (time.time() - float(entry.get("fetched_at", 0))) >= ttl_seconds():
+        return None
+    # Legacy/unknown provenance cannot establish whether a redirect is still allowed.
+    final_url = entry.get("final_url")
+    if not isinstance(final_url, str) or not final_url.strip():
+        return None
+    if not _cacheable(final_url) or check_website_access(final_url) is not None:
         return None
     try:
         file_path, cache_root = Path(entry["file"]), _cache_dir()
@@ -272,18 +300,30 @@ def extract_cache_get(url: str, format: Optional[str] = None, provider: str = ""
         if cache_root.resolve() not in file_path.resolve().parents:
             return None
         content = file_path.read_text(encoding="utf-8")
+        # Bind this single read to the same entry whose final URL passed policy.
+        # Legacy/malformed digests and interleaved body/index publication are misses.
+        if entry.get("content_sha256") != hashlib.sha256(content.encode("utf-8")).hexdigest():
+            return None
     except Exception:  # noqa: BLE001 — evicted/pruned file == miss (or no cache dir)
         return None
     logger.info("web_extract cache hit: %s", url)
-    return {"url": url, "title": entry.get("title", ""), "content": content, "error": None, "cached": True}
+    return {"url": final_url, "final_url": final_url, "title": entry.get("title", ""),
+            "content": content, "error": None, "cached": True}
 
 
 def extract_cache_put(
-    url: str, content: str, title: str = "", format: Optional[str] = None, provider: str = ""
+    url: str, content: str, title: str = "", format: Optional[str] = None, provider: str = "",
+    *, final_url: Optional[str] = None,
 ) -> None:
     """Store one successful extraction's full clean text for TTL reuse; pages over the truncate-store
-    ceiling are not cached (serving a capped copy back as if whole would silently lose the tail)."""
-    if not content or not _cacheable(url):
+    ceiling are not cached (serving a capped copy back as if whole would silently lose the tail).
+    The caller must supply the reported final URL; request fallback alone is not provenance."""
+    from tools.website_policy import check_website_access
+    if not isinstance(final_url, str) or not final_url.strip():
+        return
+    if not content or not _cacheable(url) or not _cacheable(final_url):
+        return
+    if check_website_access(url) is not None or check_website_access(final_url) is not None:
         return
     try:
         from tools.web_tools_truncate import MAX_STORED_TEXT_CHARS
@@ -291,11 +331,16 @@ def extract_cache_put(
         if len(content) > MAX_STORED_TEXT_CHARS or file_path is None:
             return
         from tools.spill_safety import write_text_exclusive
+        # read_text uses universal newlines; hash our own canonical text, never the shared file.
+        content = content.replace("\r\n", "\n").replace("\r", "\n")
+        content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
         write_text_exclusive(file_path, content, private=False, overwrite=True)
         with _index_lock:
             index = _load_index()
             index[_url_digest(url, format, provider)] = {
-                "url": url, "file": str(file_path), "title": title or "", "fetched_at": time.time(),
+                "url": url, "final_url": final_url, "file": str(file_path),
+                "title": title or "", "fetched_at": time.time(),
+                "content_sha256": content_sha256,
             }
             _save_index(index)
     except Exception as exc:  # noqa: BLE001 — cache writes are best-effort

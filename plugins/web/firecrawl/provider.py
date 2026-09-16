@@ -240,6 +240,11 @@ _UNSAFE_REDIRECT_MSG = "Blocked: URL targets a private or internal network addre
 
 
 async def _scrape_one(url: str, formats: List[str], format: Optional[str]) -> Dict[str, Any]:
+    """Only the local call argument proves ownership, including early refusals/errors."""
+    return {**await _scrape_one_result(url, formats, format), "_request_url": url}
+
+
+async def _scrape_one_result(url: str, formats: List[str], format: Optional[str]) -> Dict[str, Any]:
     """Scrape one URL (60s timeout) and re-check SSRF + website policy against the
     post-redirect URL. Never raises for scrape errors; returns an error entry instead."""
     if blocked := check_website_access(url):
@@ -257,16 +262,19 @@ async def _scrape_one(url: str, formats: List[str], format: Optional[str]) -> Di
         # SDK may return a typed object for metadata (raw __dict__ here, unlike _to_plain_object).
         if not isinstance(metadata, dict):
             metadata = metadata.model_dump() if hasattr(metadata, "model_dump") else getattr(metadata, "__dict__", {})
-        title, final_url = metadata.get("title", ""), metadata.get("sourceURL", url)
+        title = metadata.get("title", "")
+        reported_final_url = metadata.get("sourceURL") or None
+        final_url = reported_final_url or url
         if not is_safe_url(final_url):
             logger.info("Blocked redirected web_extract for unsafe final URL: %s", final_url)
             return _error_entry(final_url, _UNSAFE_REDIRECT_MSG, title=title, raw=True)
         if final_blocked := check_website_access(final_url):
             logger.info("Blocked redirected web_extract for %s by rule %s", final_blocked["host"], final_blocked["rule"])
-            return _error_entry(final_url, final_blocked["message"], title=title, raw=True, blocked=final_blocked)
+            return _error_entry(url, final_blocked["message"], raw=True, blocked=final_blocked)
         markdown, html = payload.get("markdown"), payload.get("html")
         content = markdown if format == "markdown" or (format is None and markdown) else html or markdown or ""
-        return {"url": final_url, "title": title, "content": content, "raw_content": content, "metadata": metadata}
+        return {"url": final_url, "title": title, "content": content, "raw_content": content, "metadata": metadata,
+                "final_url": reported_final_url}
     except Exception as scrape_err:  # noqa: BLE001
         logger.debug("Firecrawl scrape failed for %s: %s", url, scrape_err)
         return _error_entry(url, str(scrape_err), raw=True)
@@ -306,13 +314,13 @@ class FirecrawlWebSearchProvider(BaseWebSearchProvider):
         ``format``: "markdown" | "html" | both (markdown preferred)."""
         from tools.interrupt import is_interrupted as _is_interrupted
         if _is_interrupted():
-            return [{"url": u, "error": "Interrupted", "title": ""} for u in urls]
+            return [{"url": u, "error": "Interrupted", "title": "", "_request_url": u} for u in urls]
         if _use_keyless_ring():
             return await asyncio.to_thread(keyless_extract, "Firecrawl", "firecrawl", urls, logger)
         format = kwargs.get("format")
         formats = [format] if format in ("markdown", "html") else ["markdown", "html"]
         return [
-            {"url": url, "error": "Interrupted", "title": ""} if _is_interrupted() else await _scrape_one(url, formats, format)
+            {"url": url, "error": "Interrupted", "title": "", "_request_url": url} if _is_interrupted() else await _scrape_one(url, formats, format)
             for url in urls
         ]
 

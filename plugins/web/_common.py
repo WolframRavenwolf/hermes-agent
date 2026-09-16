@@ -64,7 +64,7 @@ def page_error(url: str, error: str) -> Dict[str, Any]:
 
 
 def extract_fail(urls: List[str], error: str) -> List[Dict[str, Any]]:
-    return [page_error(u, error) for u in urls]
+    return [{**page_error(u, error), "_request_url": u} for u in urls]
 
 
 # --- Keyless ring hand-off (shared by exa / parallel / keenable) ---------------
@@ -107,7 +107,7 @@ def run_search(vendor: str, logger: logging.Logger, body: Callable[[], Dict[str,
 
 
 def _extract_interrupted(urls: List[str]) -> List[Dict[str, Any]]:
-    return [{"url": u, "error": "Interrupted", "title": ""} for u in urls]
+    return [{"url": u, "error": "Interrupted", "title": "", "_request_url": u} for u in urls]
 
 
 def run_extract(
