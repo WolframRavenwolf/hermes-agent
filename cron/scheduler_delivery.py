@@ -246,6 +246,14 @@ def _seed_cron_session(
     from gateway.mirror import mirror_to_session
     seeded_session_id: Optional[str] = None
     session_store = getattr(adapter, "_session_store", None)
+    if platform_name.lower() == "mattermost":
+        if session_store is None or chat_type not in {"dm", "group", "channel"}:
+            return False
+        session_config = session_store.config
+        needs_user = (chat_type != "dm" and session_config.group_sessions_per_user
+                      and (not thread_id or session_config.thread_sessions_per_user))
+        if needs_user and (not user_id or str(user_id).startswith("system:")):
+            return False
     if session_store is not None:
         try:
             platform_enum = Platform(platform_name.lower())
@@ -259,11 +267,33 @@ def _seed_cron_session(
                 if discord_keys_on_thread and platform_enum == Platform.DISCORD
                 else str(chat_id)
             )
-            dest_source = SessionSource(
-                platform=platform_enum, chat_id=seed_chat_id, chat_name=chat_name,
-                chat_type=chat_type,
+            source_fields = dict(
+                chat_id=seed_chat_id, chat_name=chat_name, chat_type=chat_type,
                 user_id=user_id, user_name=user_name, thread_id=thread_id,
                 scope_id=str(scope_id) if scope_id else None)
+            if platform_enum == Platform.MATTERMOST:
+                from gateway.session import build_session_key
+                from hermes_cli.profiles import get_active_profile_name
+                try:
+                    # Cron's runtime scope owns the history; the receiving bot owns routing.
+                    owner = get_active_profile_name()
+                    if not isinstance(owner, str) or not owner.strip():
+                        return False
+                    dest_source = adapter.build_source(**source_fields)
+                    if (getattr(dest_source, "profile_route_rejected", False) is True
+                            or (dest_source.profile or owner) != owner):
+                        return False
+                    expected_key = build_session_key(
+                        dest_source, group_sessions_per_user=session_config.group_sessions_per_user,
+                        thread_sessions_per_user=session_config.thread_sessions_per_user,
+                        profile=owner if session_config.multiplex_profiles else None)
+                    if session_store._generate_session_key(dest_source) != expected_key:
+                        return False
+                except Exception:
+                    logger.debug("Mattermost: cron continuation ownership unavailable", exc_info=True)
+                    return False
+            else:
+                dest_source = SessionSource(platform=platform_enum, **source_fields)
             # Create the row and pass its exact id to the mirror — origin-heuristic rediscovery
             # bails on populated chats.
             _entry = session_store.get_or_create_session(dest_source)
@@ -278,6 +308,7 @@ def _seed_cron_session(
 def _seed_cron_thread_session(
     job: dict, adapter, platform_name: str, chat_id: str, thread_id: str, mirror_text: str,
     chat_name: Optional[str] = None, is_dm: bool = False, scope_id: Optional[str] = None,
+    *, chat_type: Optional[str] = None, user_id: Optional[str] = None,
 ) -> None:
     """Seed the freshly-opened cron thread's session with the brief (never raises), else the
     user's in-thread reply resolves to a transcript without it. Threads are participant-shared
@@ -289,8 +320,9 @@ def _seed_cron_thread_session(
     try:
         ok = _seed_cron_session(
             job, adapter, platform_name, chat_id, text,
-            thread_id=str(thread_id), chat_type="dm" if is_dm else "thread",
-            user_id="system:cron", user_name="Cron", chat_name=chat_name, scope_id=scope_id,
+            thread_id=str(thread_id), chat_type=chat_type or ("dm" if is_dm else "thread"),
+            user_id=user_id if platform_name == "mattermost" else "system:cron",
+            user_name="Cron", chat_name=chat_name, scope_id=scope_id,
             discord_keys_on_thread=True)
         if ok:
             logger.info(
@@ -1105,6 +1137,8 @@ class _TargetDelivery:
     inchannel_continuable: bool
     opened_thread_id: Optional[str]
     live_adapter_ready: bool = False
+    cron_attach: bool = False
+    mattermost_receipt: Optional[dict] = None
 
     @property
     def is_relay(self) -> bool:
@@ -1239,6 +1273,13 @@ def _live_route_metadata(t: _TargetDelivery) -> tuple[Optional[str], dict, dict]
         if thread_id:
             media_metadata["thread_id"] = thread_id
 
+    if t.platform == Platform.MATTERMOST and not t.is_relay:
+        if route_thread_id:
+            route_metadata["mattermost_explicit_thread"] = True
+            media_metadata["mattermost_explicit_thread"] = True
+        if t.cron_attach:
+            route_metadata["cron_attach"] = True
+
     # Relay egress needs metadata.scope_id (fail-closed tenant guard; scope cache is COLD after a
     # restart; router stamps HOME only). Origin targets only: a wrong fan-out scope is worse than
     # none.
@@ -1257,6 +1298,7 @@ def _live_send_text(
     from agent.async_utils import safe_schedule_threadsafe
     from gateway.delivery import DeliveryRouter, DeliveryTarget
     job = t.job
+    mattermost_live = t.platform_name == "mattermost" and not t.is_relay
     router = DeliveryRouter(t.config, t.target_adapters)
     route_target = DeliveryTarget(
         platform=t.platform, chat_id=str(t.chat_id), thread_id=route_thread_id, is_explicit=True)
@@ -1270,6 +1312,12 @@ def _live_send_text(
     try:
         send_result = future.result(timeout=60)
     except TimeoutError:
+        if mattermost_live:
+            # Cancelling the concurrent future cannot prove that a POST never
+            # started. An unknown commitment must not authorize another send.
+            t.mattermost_receipt = {"suppress_replay": True, "content_uncertain": True}
+            target_errors.append(f"Mattermost live delivery confirmation timed out for {t.where}; replay suppressed")
+            return False, True, None
         # Slow confirmation != failure; future.cancel() disambiguates. False -> already in flight,
         # cannot be un-sent, standalone resend would DUPLICATE: assume delivered. True -> never
         # started (loop wedged): MUST fall through to standalone or it is silently dropped.
@@ -1288,6 +1336,9 @@ def _live_send_text(
     except Exception as ex:
         # Real send error (not a slow confirmation): fall through to standalone.
         target_errors.append(f"live adapter send failed: {ex}")
+        if mattermost_live:
+            t.mattermost_receipt = {"suppress_replay": True, "content_uncertain": True}
+            return False, False, None
         raise
 
     # _deliver_to_platform returns a SendResult, or a plain dict {"success": True, "delivered":
@@ -1296,6 +1347,26 @@ def _live_send_text(
     delivered_message_id = _result_field(send_result, "message_id")
     _evidence_gap: list = []
     send_success = _confirm_adapter_delivery(send_result, job["id"], _evidence_gap)
+    if mattermost_live:
+        raw = dict(send_raw_response) if isinstance(send_raw_response, dict) else {}
+        uncertain = bool(raw.get("_delivery_uncertain") or raw.get("content_uncertain"))
+        suppress_replay = bool(
+            send_success or delivered_message_id or raw.get("message_ids") or raw.get("id")
+            or _result_field(send_result, "continuation_message_ids") or uncertain
+            or raw.get("source_confirmed_prefix") or raw.get("source_attempted_prefix")
+            or _result_field(send_result, "filtered") or _result_field(send_result, "delivered") is False)
+        complete = (send_success and not uncertain and not raw.get("cron_metadata_error")
+                    and raw.get("source_confirmed_prefix") == text_to_send
+                    and raw.get("source_attempted_prefix") == text_to_send
+                    and bool(raw.get("cron_root_id"))
+                    and raw.get("cron_chat_type") in {"dm", "group", "channel"})
+        t.mattermost_receipt = {**raw, "suppress_replay": suppress_replay, "text_complete": complete}
+        if t.cron_attach and send_success and not complete:
+            target_errors.append(raw.get("cron_metadata_error") or
+                                 f"Mattermost cron report lacks a complete verified content receipt for {t.where}")
+            return False, False, delivered_message_id
+        if t.cron_attach and complete:
+            t.thread_id = raw["cron_root_id"]
     if send_success and _evidence_gap:
         unverified_targets.append(t.where)
 
@@ -1309,7 +1380,7 @@ def _live_send_text(
         else:
             err, shape = getattr(send_result, "error", None), type(send_result).__name__
         msg = f"live adapter send to {t.where} returned unconfirmed result ({shape}, error={err})"
-        _warn_live_lane_failure(job, msg, t.is_relay)
+        _warn_live_lane_failure(job, msg, t.is_relay or bool((t.mattermost_receipt or {}).get("suppress_replay")))
         target_errors.append(msg)
         return False, False, None
     if send_raw_response and t.thread_id and send_raw_response.get("thread_fallback"):
@@ -1348,6 +1419,14 @@ def _seed_live_delivery_sessions(t: _TargetDelivery, delivered_message_id) -> No
     Thread seeding is deferred here so open-succeeds/deliver-fails never seeds an unseen brief."""
     job = t.job
     origin = t.origin
+    if t.cron_attach:
+        receipt = t.mattermost_receipt or {}
+        if receipt.get("text_complete"):
+            _seed_cron_thread_session(
+                job, t.runtime_adapter, t.platform_name, t.chat_id, receipt["cron_root_id"], t.mirror_text,
+                chat_type=receipt["cron_chat_type"], user_id=t.origin_user_id,
+                chat_name=origin.get("chat_name"), scope_id=origin.get("scope_id"))
+        return
     seed_kwargs = dict(
         chat_name=origin.get("chat_name"), is_dm=t.is_dm_target, scope_id=origin.get("scope_id"))
     thread_seeded = False
@@ -1419,6 +1498,10 @@ def _deliver_via_live_adapter(
                 target_errors=target_errors, delivery_errors=delivery_errors,
                 unverified_targets=unverified_targets,
             )
+
+        if t.cron_attach and (t.mattermost_receipt or {}).get("text_complete"):
+            route_thread_id = t.thread_id
+            media_metadata.update(thread_id=t.thread_id, mattermost_explicit_thread=True)
 
         # Media rides the same DM-topic-aware routing as text. Skipped after a confirmation
         # timeout (loop contended, text already assumed delivered) — record the drop instead.
@@ -1518,6 +1601,9 @@ def _deliver_standalone(
 ) -> None:
     """Standalone fallback for a target the live lane did not deliver."""
     job = t.job
+    if (t.mattermost_receipt or {}).get("suppress_replay"):
+        delivery_errors.extend(target_errors or [f"Mattermost replay suppressed for {t.where}"])
+        return
     if t.is_relay:
         # Relay owns the destination and credential; a native retry could duplicate — fail closed.
         if not target_errors:
@@ -1544,7 +1630,7 @@ def _deliver_standalone(
     _maybe_mirror_cron_delivery(
         job, t.platform_name, t.chat_id, t.mirror_text, thread_id=t.thread_id,
         user_id=t.origin_user_id,
-        enabled=t.mirror_this_target)
+        enabled=t.mirror_this_target and not t.cron_attach)
 
 
 def _prepare_target_delivery(
@@ -1632,8 +1718,12 @@ def _prepare_target_delivery(
     # successful send. DM-only platforms return None → mirror the origin DM. in_channel SKIPS
     # this: it posts flat and _seed_cron_channel_session CREATES the session.
     opened_thread_id: Optional[str] = None
+    cron_attach = (platform == Platform.MATTERMOST and live_adapter_ready
+                   and transport is not None and not transport.is_relay
+                   and mirror_this_target and not in_channel_surface)
     if (
         mirror_this_target
+        and not cron_attach
         and not in_channel_surface
         and runtime_adapter is not None
         and loop is not None
@@ -1650,7 +1740,7 @@ def _prepare_target_delivery(
         origin=origin, origin_target=origin_target, origin_user_id=origin_user_id,
         is_dm_target=is_dm_target, mirror_text=mirror_text, mirror_this_target=mirror_this_target,
         in_channel_surface=in_channel_surface, inchannel_continuable=inchannel_continuable,
-        opened_thread_id=opened_thread_id, live_adapter_ready=live_adapter_ready)
+        opened_thread_id=opened_thread_id, live_adapter_ready=live_adapter_ready, cron_attach=cron_attach)
 
 
 def _unresolved_delivery_outcome(job: dict, for_failure: bool) -> Optional[str]:

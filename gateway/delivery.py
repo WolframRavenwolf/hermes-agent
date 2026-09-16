@@ -189,7 +189,10 @@ class DeliveryRouter:
                     result = await self._deliver_to_platform(target, content, metadata)
                     if target.chat_id and _send_result_error(result) is None:
                         self.dead_targets.clear(target.platform.value, target.chat_id)
-                results[target.to_string()] = {"success": True, "result": result}
+                error = _send_result_error(result)
+                results[target.to_string()] = {"success": error is None, "result": result}
+                if error is not None:
+                    results[target.to_string()]["error"] = error or f"{target.platform.value} delivery failed"
             except Exception as e:
                 # Hard failures raise. Record a whole-chat death so future deliveries short-circuit.
                 dead_kind = classify_dead_error(str(e)) if tracked else None
@@ -311,5 +314,9 @@ class DeliveryRouter:
             send_metadata["thread_id"] = await _ensure_named_dm_topic(adapter, target.chat_id, named_topic, refresh=True)
             send_metadata["telegram_dm_topic_created_for_send"] = True
         if error is not None:
+            if target.platform == Platform.MATTERMOST and is_cron_artifact and not transport.is_relay:
+                # Cron needs the acknowledged prefix/uncertainty to decide
+                # whether standalone replay is legal. Never erase that receipt.
+                return result
             raise RuntimeError(error or f"{target.platform.value} delivery failed")
         return result
