@@ -904,7 +904,7 @@ class GatewaySlashCommandsMixin(
         return EphemeralReply(t("gateway.yolo.enabled"))
 
     async def _handle_verbose_command(self, event: MessageEvent) -> str:
-        """Handle /verbose — cycle tool progress display mode (off → new → all → verbose → log) per
+        """Handle /verbose — cycle tool progress display mode (off → new → all → verbose → full → log) per
         *current platform*, saved to ``display.platforms.<platform>.tool_progress``. Gated by
         ``display.tool_progress_command`` (default off)."""
         from gateway.run import _load_gateway_config
@@ -919,7 +919,7 @@ class GatewaySlashCommandsMixin(
             return t("gateway.verbose.not_enabled")
         # Cycle mode (per-platform), reading the current effective mode via the resolver.
         from gateway.display_config import resolve_display_setting
-        cycle = ["off", "new", "all", "verbose", "log"]
+        cycle = ["off", "new", "all", "verbose", "full", "log"]
         current = resolve_display_setting(user_config, platform_key, "tool_progress", "all")
         new_mode = cycle[(cycle.index(current if current in cycle else "all") + 1) % len(cycle)]
         description = t(f"gateway.verbose.mode_{new_mode}")
@@ -950,8 +950,8 @@ class GatewaySlashCommandsMixin(
             return EphemeralReply("Busy input mode could not be saved to config. Mode unchanged.")
         profile_name = self._busy_profile_name_for_source(event.source)
         if profile_name:
-            from gateway.run import _load_gateway_runtime_config
-            self._snapshot_profile_busy_modes(profile_name, _load_gateway_runtime_config())
+            from gateway.run import _load_gateway_config
+            self._snapshot_profile_busy_modes(profile_name, _load_gateway_config())
         else:
             self._busy_input_mode = arg
             # busy_input_mode is also the source of truth for the text mode — re-derive it so the

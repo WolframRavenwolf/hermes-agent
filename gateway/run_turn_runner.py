@@ -20,8 +20,12 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from agent.interrupt_compat import _accepts_keyword
-from agent.replay_cleanup import strip_stale_dangerous_confirmations
+from agent.replay_cleanup import canonicalize_replay_history
 from gateway.config import Platform
+from gateway.full_progress_redaction import (
+    _redact_full_progress_args,
+    _redact_full_progress_string,
+)
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.turn_context import TurnContext
@@ -33,6 +37,51 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+
+# Exact refusals retained for older adapters/connectors without destination preflight.
+# Substring matching would also silence transient thread-resolution errors.
+_CARD_DESTINATION_REFUSALS = {
+    "No Slack thread target",
+    "slack task_card requires a thread anchor",
+    "slack task_card requires a thread anchor (Slack streams are thread replies)",
+}
+
+
+def _renders_exec_approval_buttons(adapter_cls: type) -> bool:
+    """True when the adapter class renders native approval buttons. BasePlatformAdapter subclasses
+    say so through ``supports_exec_approval_buttons``; anything else (test doubles, relay-style
+    duck types) counts when it defines ``send_exec_approval`` itself."""
+    probe = getattr(adapter_cls, "supports_exec_approval_buttons", None)
+    if callable(probe) and issubclass(adapter_cls, BasePlatformAdapter):
+        return bool(probe())
+    return getattr(adapter_cls, "send_exec_approval", None) is not None
+
+
+# Rendered on a native clarify card whose wait ended without a click (mirrors the notice the
+# Slack click handler shows on a dead entry).
+_CLARIFY_EXPIRED_NOTICE = "⏳ This prompt expired — please send a new request."
+
+
+async def _await_exact_task_through_cancellation(
+    task: asyncio.Task,
+) -> tuple[Any, bool]:
+    """Await one child despite repeated cancellation of its parent waiter.
+
+    Returns the child's result and whether parent cancellation was observed.
+    Every wait is shielded, so another cancellation cannot reach the exact
+    once-created child. A cancellation originating from the child itself is
+    propagated immediately rather than mistaken for a parent cancellation.
+    """
+    parent_cancelled = False
+    while True:
+        try:
+            return await asyncio.shield(task), parent_cancelled
+        except asyncio.CancelledError:
+            if task.cancelled():
+                raise
+            parent_cancelled = True
+            if task.done():
+                return task.result(), parent_cancelled
 
 
 class _ExecApprovalDeclined(RuntimeError):
@@ -158,7 +207,7 @@ class TurnRunner:
             if status in SUBAGENT_FAILURE_STATUSES and ctx._run_still_current():
                 line = format_subagent_failure_line(
                     kwargs.get("goal"), status, error=kwargs.get("summary") or preview,
-                    duration_seconds=kwargs.get("duration_seconds"),
+                    duration_seconds=kwargs.get("duration_seconds"), failure_reason=kwargs.get("failure_reason"),
                 )
                 self._schedule(self._runner._deliver_platform_notice(ctx.source, line), "subagent failure notice scheduling error")
         except Exception:
@@ -237,6 +286,18 @@ class TurnRunner:
             adapter = self._runner._adapter_for_source(ctx.source)
         except Exception:
             adapter = None
+        if ctx.progress_mode == "full":
+            safe_args = _redact_full_progress_args(args if isinstance(args, dict) else {})
+            args_str = json.dumps(safe_args, ensure_ascii=False, default=str)
+            # Keep image Markdown inert even when an adapter rewrites it inside
+            # JSON strings. Escaping after serialization preserves literal
+            # backslashes and decoded keys/values; splitting measures these bytes.
+            if not callable(getattr(adapter, "format_literal_message", None)):
+                args_str = args_str.replace("![", r"\u0021[")
+            safe_name = _redact_full_progress_string(str(tool_name))
+            ctx.last_was_terminal_block[0] = False
+            ctx.progress_queue.put(("__full__", f"{emoji} {safe_name}\n{args_str}"))
+            return None
         code_full, code_short = self._progress_terminal_blocks(adapter, tool_name, args, emoji)
         verbose = ctx.progress_mode == "verbose"
         code = code_full if verbose else code_short
@@ -298,11 +359,13 @@ class TurnRunner:
         task_order: List[str] = dataclasses.field(default_factory=list)
         fallback_msg_id: Optional[str] = None
         native_failed: bool = False
-        # TERMINAL authorization refusal, distinct from native_failed: the
-        # connector refused this destination, so no later publication in this
-        # turn may re-deliver the task text through the text fallback. Declared
-        # rather than set dynamically so the state is visible where it lives.
-        egress_declined: bool = False
+        # TERMINAL for the turn, distinct from native_failed: no later publication
+        # in this turn may deliver task text through the native lane OR the text
+        # fallback. Two causes, both properties of the destination rather than of
+        # one attempt: the connector's egress guard refused the chat, or the chat
+        # cannot host a card (no thread anchor). Declared rather than set
+        # dynamically so the state is visible where it lives.
+        publication_suppressed: bool = False
         anonymous_seq: int = 0
 
         @staticmethod
@@ -348,7 +411,7 @@ class TurnRunner:
         text = st.fallback_text()
         from gateway.relay.egress import declined_send
 
-        if getattr(st, "egress_declined", False):
+        if st.publication_suppressed:
             return
         if st.fallback_msg_id:
             result = await st.adapter.edit_message(
@@ -366,7 +429,7 @@ class TurnRunner:
                     "guard; suppressing progress delivery for the rest of this "
                     "turn (the destination is not approved)"
                 )
-                st.egress_declined = True
+                st.publication_suppressed = True
                 return
         result = await self._send_progress_text(st, text)
         if getattr(result, "success", False) and getattr(result, "message_id", None):
@@ -376,10 +439,21 @@ class TurnRunner:
         ctx = self._ctx
         if not st.tasks:
             return
-        if getattr(st, "egress_declined", False):
-            # The connector refused this destination earlier in the turn; every
-            # later publication would re-deliver the same task text there.
+        if st.publication_suppressed:
+            # Publication was suppressed earlier in the turn (egress refusal or a chat
+            # that cannot host a card); every later publication would re-deliver the
+            # same task text there.
             return
+        # Resolve eligibility in the owning adapter BEFORE transport I/O: a first
+        # timeout/disconnect must not turn an un-cardable chat into text fallback.
+        # Optional for older adapters; only an explicit False refuses publication.
+        destination_supported = getattr(st.adapter, "native_task_card_destination_supported", None)
+        if callable(destination_supported) and destination_supported(
+            ctx.source.chat_id, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
+        ) is False:
+            self._task_card_uncardable_destination(st)
+            if st.publication_suppressed:
+                return
         if not st.native_failed:
             result = await st.adapter.send_native_task_card_progress(
                 chat_id=ctx.source.chat_id, tasks=st.visible_tasks(), title="Hermes is working",
@@ -399,7 +473,7 @@ class TurnRunner:
                 # event skipped this branch (the lane is already "failed") and
                 # went straight to the text fallback. A refusal does not expire
                 # after one tick.
-                st.egress_declined = True
+                st.publication_suppressed = True
                 st.native_failed = True
                 logger.warning(
                     "Slack native task-card progress DECLINED by the connector's "
@@ -408,12 +482,36 @@ class TurnRunner:
                 )
                 return
             st.native_failed = True
-            logger.warning(
-                "Slack native task-card progress failed; falling back "
-                "to an editable text update: %s", getattr(result, "error", "unknown error"),
-            )
+            if getattr(result, "error", None) in _CARD_DESTINATION_REFUSALS:
+                self._task_card_uncardable_destination(st, getattr(result, "error", "unknown error"))
+                if st.publication_suppressed:
+                    return
+            else:
+                logger.warning(
+                    "Slack native task-card progress failed; falling back "
+                    "to an editable text update: %s", getattr(result, "error", "unknown error"),
+                )
         # Once the native rail fails, every later lifecycle event edits the same fallback message.
         await self._task_card_send_or_edit_fallback(st)
+
+    def _task_card_uncardable_destination(self, st, reason: str = "no thread anchor") -> None:
+        """The chat cannot host a card (flat DM: no thread anchor) — a property of the destination,
+        not a transient outage. The text fallback exists to keep a WORKING card lane live through a
+        transient failure, not to invent text bubbles the operator never asked for: with Slack's tier
+        default (``tool_progress: off``) the lane goes silent for the turn. An operator who WROTE
+        ``new``/``all`` asked for text progress, so the editable fallback carries it instead."""
+        if self._ctx.tool_progress_enabled:
+            st.native_failed = True
+            logger.info(
+                "Slack native task cards are unsupported for this destination (%s); "
+                "tool progress continues as an editable text update", reason,
+            )
+            return
+        st.publication_suppressed = True
+        logger.info(
+            "Slack native task cards are unsupported for this destination (%s); "
+            "tool progress stays off for this turn", reason,
+        )
 
     def _task_card_drain(self, st) -> bool:
         changed = False
@@ -427,8 +525,8 @@ class TurnRunner:
         return changed
 
     async def _send_native_task_card_progress(self, adapter) -> None:
-        """Drain the progress queue into Slack-native plan/task cards; on any native failure, fall
-        back to an editable in-thread message so progress stays live.
+        """Drain progress into native cards; supported destinations retain editable fallback.
+        Unsupported destinations and egress refusals suppress publication, never finalization.
 
         See #29483.
         """
@@ -485,6 +583,12 @@ class TurnRunner:
             with suppress(Exception):
                 raw_limit = int(adapter.max_message_length_for_chat(ctx.source.chat_id) or 4000)
                 len_fn = adapter.message_len_fn_for_chat(ctx.source.chat_id)
+            if ctx.progress_mode == "full":
+                # Native sends may format before splitting (MarkdownV2 escaping
+                # expands JSON). Fit both the raw edit and the formatted send.
+                raw_len_fn = len_fn
+                format_text = getattr(adapter, "format_literal_message", adapter.format_message)
+                len_fn = lambda text: max(raw_len_fn(text), raw_len_fn(format_text(text)))
         return self._ProgressEditState(
             adapter=adapter, progress_lines=[], progress_msg_id=None,
             # "separate" = one message per tool (pre-v0.9 behavior)
@@ -493,8 +597,18 @@ class TurnRunner:
             # Leave room for platform quirks / formatting; tiny test adapters keep a usable limit.
             _PROGRESS_TEXT_LIMIT=max(1, raw_limit - (64 if raw_limit > 128 else 0)),
             # Overflow edits pass metadata (Telegram topic/thread routing) only when edit_message takes it.
-            _edit_accepts_metadata=bool(ctx._progress_metadata) and _accepts_keyword(adapter.edit_message, "metadata"),
+            _edit_accepts_metadata=(bool(ctx._progress_metadata) or (
+                ctx.progress_mode == "full" and callable(getattr(adapter, "format_literal_message", None))
+            )) and _accepts_keyword(adapter.edit_message, "metadata"),
         )
+
+    def _progress_egress_metadata(self, adapter):
+        metadata = self._ctx._progress_metadata
+        if self._ctx.progress_mode == "full":
+            metadata = {**(metadata or {}), "_interim_send": True}
+            if callable(getattr(adapter, "format_literal_message", None)):
+                metadata["_literal_text"] = True
+        return metadata
 
     async def _edit_progress_message(self, st, message_id: str, content: str):
         ctx = self._ctx
@@ -502,7 +616,9 @@ class TurnRunner:
         if getattr(st.adapter, "REQUIRES_EDIT_FINALIZE", False):
             kwargs["finalize"] = True
         if st._edit_accepts_metadata:
-            kwargs["metadata"] = ctx._progress_metadata
+            kwargs["metadata"] = (self._progress_egress_metadata(st.adapter)
+                                  if callable(getattr(st.adapter, "format_literal_message", None))
+                                  else ctx._progress_metadata)
         return await st.adapter.edit_message(**kwargs)
 
     @staticmethod
@@ -523,8 +639,9 @@ class TurnRunner:
 
     async def _send_progress_text(self, st, text: str):
         ctx = self._ctx
+        metadata = self._progress_egress_metadata(st.adapter)
         result = await st.adapter.send(
-            chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
+            chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to, metadata=metadata,
         )
         self._track_progress_result(result)
         return result
@@ -560,6 +677,131 @@ class TurnRunner:
         return True
 
     @staticmethod
+    def _is_full_marker(raw) -> bool:
+        return isinstance(raw, tuple) and len(raw) == 2 and raw[0] == "__full__"
+
+    @staticmethod
+    def _full_progress_result_ids(result) -> tuple[str, ...]:
+        # Telegram send receipts name the FIRST id and carry the complete ordered
+        # list in raw_response; other native adapters name the LAST id.
+        raw = getattr(result, "raw_response", None)
+        native_ids = raw.get("message_ids", ()) if isinstance(raw, dict) else ()
+        ids = (*native_ids, *getattr(result, "continuation_message_ids", ()), getattr(result, "message_id", None))
+        return tuple(dict.fromkeys(str(mid) for mid in ids if mid is not None))
+
+    def _track_full_progress_result(self, result) -> None:
+        """Own every proven native ID, including IDs returned on partial failure."""
+        ctx = self._ctx
+        if not ctx._cleanup_progress:
+            return
+        for message_id in self._full_progress_result_ids(result):
+            if message_id not in ctx._cleanup_msg_ids:
+                ctx._cleanup_msg_ids.append(message_id)
+
+    def _split_full_entry(self, st, entry: str) -> list[str]:
+        """Split even a single entry without dropping whitespace or Unicode."""
+        chunks = []
+        while entry:
+            if st._progress_len_fn(entry) <= st._PROGRESS_TEXT_LIMIT:
+                chunks.append(entry)
+                break
+            low, high, best = 1, len(entry), 0
+            while low <= high:
+                mid = (low + high) // 2
+                if st._progress_len_fn(entry[:mid]) <= st._PROGRESS_TEXT_LIMIT:
+                    best, low = mid, mid + 1
+                else:
+                    high = mid - 1
+            # No valid non-empty chunk exists for a pathological length function.
+            # Preserve master's terminating, lossless best effort in that case.
+            best = max(1, best)
+            chunks.append(entry[:best])
+            entry = entry[best:]
+        return chunks
+
+    async def _send_full_progress_text(self, st, text):
+        ctx = self._ctx
+        result = await st.adapter.send(
+            chat_id=ctx.source.chat_id, content=text,
+            reply_to=ctx._progress_reply_to,
+            metadata=self._progress_egress_metadata(st.adapter),
+        )
+        self._track_full_progress_result(result)
+        return result
+
+    async def _finalize_full_progress(self, st):
+        """Close an acknowledged editable buffer before immutable continuations."""
+        try:
+            if st.can_edit and st.progress_msg_id is not None and st.progress_lines:
+                result = await self._edit_progress_message(
+                    st, st.progress_msg_id, self._progress_text(st.progress_lines),
+                )
+                self._track_full_progress_result(result)
+                if not result.success:
+                    st.can_edit = False
+        finally:
+            # The buffer was already acknowledged. Even a failed final edit is
+            # never evidence that a duplicate send would be safe.
+            self._reset_progress_bubble(st)
+
+    async def _deliver_full_progress_entry(self, st, entry):
+        """Deliver one full entry once, confined to the native progress owner."""
+        if not self._ctx._run_still_current() or self._agent_interrupted():
+            return
+        chunks = self._split_full_entry(st, entry)
+        if len(chunks) > 1:
+            await self._finalize_full_progress(st)
+            for chunk in chunks:
+                if not self._ctx._run_still_current() or self._agent_interrupted():
+                    break
+                result = await self._send_full_progress_text(st, chunk)
+                if not result.success:
+                    # Native partial receipts have IDs but no exact delivered
+                    # source range. Own those IDs and stop; never replay guesses.
+                    break
+            self._reset_progress_bubble(st)
+            return
+
+        combined = self._progress_text(st.progress_lines + [entry])
+        if st.progress_lines and st._progress_len_fn(combined) > st._PROGRESS_TEXT_LIMIT:
+            await self._finalize_full_progress(st)
+            combined = entry
+        if st.can_edit and st.progress_msg_id is not None:
+            result = await self._edit_progress_message(st, st.progress_msg_id, combined)
+            self._track_full_progress_result(result)
+            multipart = (bool(getattr(result, "continuation_message_ids", ()))
+                         or len(self._full_progress_result_ids(result)) > 1)
+            if result.success and not multipart:
+                st.progress_lines.append(entry)
+                return
+            self._reset_progress_bubble(st)
+            if result.success or multipart:
+                # A split result's primary ID never represents the whole entry.
+                return
+            st.can_edit = False
+            if getattr(result, "retryable", False):
+                return
+            # Only the new entry needs a fallback, never the acknowledged prefix.
+        # Either awaited edit above may have outlived this run.
+        if not self._ctx._run_still_current() or self._agent_interrupted():
+            return
+        result = await self._send_full_progress_text(st, entry)
+        if (st.can_edit and result.success and result.message_id
+                and not getattr(result, "continuation_message_ids", ())
+                and len(self._full_progress_result_ids(result)) == 1):
+            st.progress_msg_id, st.progress_lines = result.message_id, [entry]
+        else:
+            self._reset_progress_bubble(st)
+
+    async def _send_full_progress_entry(self, st, entry):
+        # One child owns the whole delivery operation. Repeated cancellation of
+        # the queue consumer cannot orphan or recreate its in-flight sends.
+        child = asyncio.create_task(self._deliver_full_progress_entry(st, entry))
+        _, cancelled = await _await_exact_task_through_cancellation(child)
+        if cancelled:
+            raise asyncio.CancelledError
+
+    @staticmethod
     def _is_reset_marker(raw) -> bool:
         return isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__"
 
@@ -581,6 +823,8 @@ class TurnRunner:
         return raw
 
     async def _flush_progress_edit(self, st) -> None:
+        if self._ctx.progress_mode == "full":
+            return  # Full entries are acknowledged before their buffer is retained.
         if st.can_edit and st.progress_lines and st.progress_msg_id:
             with suppress(Exception):
                 await self._edit_progress_message(st, st.progress_msg_id, self._progress_text(st.progress_lines))
@@ -590,7 +834,10 @@ class TurnRunner:
         with suppress(Exception):
             while not ctx.progress_queue.empty():
                 raw = ctx.progress_queue.get_nowait()
-                if self._is_reset_marker(raw):
+                if self._is_full_marker(raw):
+                    child = asyncio.create_task(self._deliver_full_progress_entry(st, raw[1]))
+                    await _await_exact_task_through_cancellation(child)
+                elif self._is_reset_marker(raw):
                     # Content-bubble marker during drain: close the current progress bubble
                     # and start a fresh one for tool lines that arrived after.
                     await self._roll_progress_overflow_if_needed(st)
@@ -667,6 +914,9 @@ class TurnRunner:
                 if self._is_reset_marker(raw):
                     self._reset_progress_bubble(st)
                     continue
+                if self._is_full_marker(raw):
+                    await self._send_full_progress_entry(st, raw[1])
+                    continue
                 msg = self._progress_absorb(st, raw)
                 if not await self._roll_progress_overflow_if_needed(st):
                     # Throttle edits: batch rapid tool updates into fewer API calls (grammY pattern:
@@ -683,7 +933,13 @@ class TurnRunner:
                 last_edit_ts = time.monotonic()
                 await self._progress_restore_typing(st)
             except queue.Empty:
-                await asyncio.sleep(0.3)
+                try:
+                    await asyncio.sleep(0.3)
+                except asyncio.CancelledError:
+                    if ctx.progress_mode != "full":
+                        raise
+                    await self._drain_progress_on_cancel(st)
+                    return
             except asyncio.CancelledError:
                 await self._drain_progress_on_cancel(st)
                 return
@@ -870,6 +1126,10 @@ class TurnRunner:
                         initial_reply_to_id=ctx.event_message_id, run_still_current=ctx._run_still_current,
                     )
                     ctx.stream_consumer_holder[0] = stream_consumer
+                    # #105341: a consumer created only for interim commentary (text streaming off)
+                    # is never fed the final reply's deltas — mark it so the duplicate-risk
+                    # diagnostic in ``_run_agent_mark_streamed_delivery`` stays silent.
+                    stream_consumer.stream_deltas_enabled = want_stream_deltas
             except Exception as err:
                 logger.debug("Could not set up stream consumer: %s", err)
         # Deltas tee to the stream consumer (when text streaming is on) and to streaming TTS.
@@ -1273,10 +1533,19 @@ class TurnRunner:
         # Boundary rule (see _approval_send_outcome): a send timeout is AMBIGUOUS — the card may
         # have posted with a late ack. Only a definitive failure tears down the registration;
         # ambiguous falls through to the bounded wait so a late reply resolves.
-        response = _clarify_send_then_wait(fut, clarify_id=clarify_id, session_key=session_key, clarify_mod=clarify_mod)
-        # Only re-arm typing when the user actually answered — the undeliverable sentinel and the
-        # timeout/cancellation strings start with '[' and must pass through untouched.
-        if not (isinstance(response, str) and response.startswith("[")):
+        response, answered = _clarify_send_then_wait(
+            fut, clarify_id=clarify_id, session_key=session_key, clarify_mod=clarify_mod)
+        # Branch on the explicit flag, never on the text: a real answer can start with '[' (a
+        # "[A] staging" label, "[urgent] ..." free text) and must not be mistaken for a sentinel.
+        if not answered:
+            # No answer arrived (timeout, /new, run end): retire the native card so it stops
+            # looking answerable. Adapters without a persistent card have no such method.
+            retire = getattr(type(ctx._status_adapter), "retire_clarify_card", None)
+            if callable(retire):
+                self._schedule(
+                    retire(ctx._status_adapter, clarify_id, _CLARIFY_EXPIRED_NOTICE),
+                    "Clarify card retire failed to schedule")
+        else:
             # Reopen typing IMMEDIATELY, not on the LLM's first post-answer token (native streaming
             # otherwise re-seeds lazily on the first delta: ~48s of dead air). request_reopen_seed is
             # a no-op outside the reopen-pending native state.
@@ -1296,6 +1565,7 @@ class TurnRunner:
         """Send the approval request from the agent thread: the adapter's interactive button
         approvals (``send_exec_approval``) when available, else plain text with ``/approve`` steps."""
         from gateway.run import _approval_send_outcome, _format_exec_approval_fallback, _interim_metadata, _redact_approval_command
+        from gateway.run_turn_runner_approval_settle import register_timeout_notice
         ctx = self._ctx
         adapter = ctx._status_adapter
         # Slack's assistant_threads_setStatus disables the compose box, so the user can't type
@@ -1309,7 +1579,7 @@ class TurnRunner:
         desc = approval_data.get("description", "dangerous command")
         flags = {k: approval_data.get(k, d) for k, d in (("allow_permanent", True), ("allow_session", True), ("smart_denied", False))}
         # Check the *class*, not the instance — MagicMock auto-creates attributes in tests.
-        if getattr(type(adapter), "send_exec_approval", None) is not None:
+        if _renders_exec_approval_buttons(type(adapter)):
             try:
                 fut = self._schedule(
                     adapter.send_exec_approval(
@@ -1322,6 +1592,11 @@ class TurnRunner:
                     raise RuntimeError("send_exec_approval: loop unavailable")
                 outcome = _approval_send_outcome(fut, timeout=15)
                 if outcome == "sent":
+                    # Without this, a card whose timer runs out keeps live buttons and nobody
+                    # learns the command did NOT run (only the TUI registered a settle hook).
+                    register_timeout_notice(
+                        self, approval_data, command=cmd,
+                        card_message_id=getattr(fut.result(timeout=0), "message_id", None))
                     return
                 if outcome == "ambiguous":
                     # Timeout ≠ failure: the card may have posted with a late ack. The prompt
@@ -1377,6 +1652,9 @@ class TurnRunner:
             )
             if fut is not None:
                 fut.result(timeout=15)
+                # No card to edit on the text path: the prompt has no buttons to drop and carries
+                # the /approve instructions, so the timeout notice is posted as a new message.
+                register_timeout_notice(self, approval_data, command=cmd, card_message_id=None)
         except Exception as e:
             logger.error("Failed to send approval request: %s", e)
 
@@ -1409,9 +1687,9 @@ class TurnRunner:
                     "conversation context (possible FTS write corruption)",
                     ctx.session_key, len(agent_history), len(selected),
                 )
-                # The live history bypassed _build_gateway_agent_history's cleanup — re-apply the
-                # stale-confirmation expiry so a dangerous confirmation can't slip through.
-                agent_history = strip_stale_dangerous_confirmations(selected, now=time.time())
+                # The live history bypassed _build_gateway_agent_history's cleanup — re-apply
+                # the full canonicalization so no replay transform can slip through.
+                agent_history = canonicalize_replay_history(selected)
         # MEDIA paths already in history are excluded from this turn's extraction (compression-safe).
         return agent_history, observed_group_context, _collect_history_media_paths(agent_history)
 
@@ -1730,7 +2008,16 @@ class TurnRunner:
                 model, runtime_kwargs.get("provider"), ctx.session_key or "",
             )
         except Exception as exc:
-            return {"final_response": f"⚠️ Provider authentication failed: {exc}", "messages": [], "api_calls": 0, "tools": []}
+            # Model/credential resolution failed before the turn began; the raw text (URLs, status
+            # codes) belongs in the log, and the chat gets the commands that fix it.
+            logger.warning("Model resolution failed for session %s: %s", ctx.session_key or "", exc)
+            return {
+                "final_response": (
+                    "⚠️ I couldn't connect to the AI model service, so this message wasn't processed. "
+                    "Use /login to sign in again, or /model to pick a different model. If it keeps "
+                    "failing, run `hermes doctor` on the host."),
+                "messages": [], "api_calls": 0, "tools": [],
+            }
         pr = runner._provider_routing
         reasoning_config = runner._resolve_session_reasoning_config(source=ctx.source, session_key=ctx.session_key, model=model)
         runner._reasoning_config = reasoning_config
