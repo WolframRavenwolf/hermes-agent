@@ -280,8 +280,9 @@ class TestInvokingProfileIsVerifiedLikeItsSiblings:
         assert calls["verify"] == 0
         assert "boom" in capsys.readouterr().out
 
-    def test_no_plist_means_the_gateway_is_not_launchd_managed(self, monkeypatch):
+    def test_no_plist_means_the_gateway_is_not_launchd_managed(self, monkeypatch, tmp_path):
         calls = _patch_launchd_env(monkeypatch, plist_exists=False)
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: tmp_path / "missing.plist")
 
         assert _run_fleet_restart() == ([], [])
         assert calls["restart"] == 0

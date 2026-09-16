@@ -19,7 +19,7 @@ import textwrap
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from hermes_cli import setup_platforms
+from hermes_cli import gateway_launchd_reload, setup_platforms
 
 # UV's bundled Python ships a minimal PATH; ensure launchctl/systemctl are discoverable.
 if os.name == "posix":
@@ -3699,19 +3699,24 @@ def _launchctl_label_supervising_process(label: str) -> bool:
 
 
 def _retry_launchctl_bootstrap_until_registered(
-    domain: str, plist_path, label: str, *, deadline: float
+    domain: str, plist_path, label: str, *, deadline: float,
+    last_error: list | None = None,
 ) -> bool:
     """Retry ``_launchctl_bootstrap`` until the label supervises a process or ``deadline`` passes. Under
     load bootstrap can fail even after bootout, during a drain (default 180s) — ~10s is too short."""
     attempt = 0
     while True:
         attempt += 1
+        if last_error is not None:
+            last_error.clear()
         try:
             _launchctl_bootstrap(domain, plist_path, label, timeout=30)
             if _launchctl_label_supervising_process(label):
                 return True
             outcome = f"exited 0 but {domain}/{label} has no supervised process (launchctl list)"
         except subprocess.CalledProcessError as exc:
+            if last_error is not None:
+                last_error.append(exc)
             outcome = f"failed (rc={exc.returncode}) for {domain}/{label}"
         except subprocess.TimeoutExpired:
             outcome = f"timed out for {domain}/{label}"
@@ -3821,11 +3826,11 @@ def _launchd_fallback_to_detached(reason: str, *, exit_on_failure: bool = True) 
     return False
 
 
-def _launchd_degrade_or_raise(exc: subprocess.CalledProcessError, what: str) -> None:
+def _launchd_degrade_or_raise(exc: subprocess.CalledProcessError, what: str) -> bool:
     """Shared launchctl failure policy: domain unmanageable (5/125) → detached fallback; else re-raise."""
     if not _launchctl_domain_unsupported(exc.returncode):
         raise exc
-    _launchd_fallback_to_detached(f"{what} exit {exc.returncode}")
+    return _launchd_fallback_to_detached(f"{what} exit {exc.returncode}")
 
 
 def generate_launchd_plist() -> str:
@@ -3927,15 +3932,17 @@ def generate_launchd_plist() -> str:
 def launchd_plist_is_current() -> bool:
     """Check if the installed launchd plist matches the currently generated one."""
     plist_path = get_launchd_plist_path()
-    if not plist_path.exists():
+    image = gateway_launchd_reload._launchd_file_image(plist_path)
+    if image is None:
         return False
-    installed = plist_path.read_text(encoding="utf-8")
+    installed = image.data.decode("utf-8")
     norm = _normalize_launchd_plist_for_comparison
     return norm(installed) == norm(generate_launchd_plist())
 
 
 def _spawn_deferred_launchd_reload(
-    *, domain: str, label: str, target: str, plist_path: Path, gateway_pid: int
+    *, domain: str, label: str, target: str, plist_path: Path, gateway_pid: int,
+    attempt: str,
 ) -> bool:
     """Hand the bootout/bootstrap cycle to a transient ``launchctl submit`` job; True if spawned. The
     helper waits for the OLD gateway to exit (bootstrap during drain fails EIO), then retries bootstrap
@@ -3952,7 +3959,16 @@ def _spawn_deferred_launchd_reload(
     stamp = "$(date '+%Y-%m-%d %H:%M:%S %z')"
     # Require a POSITIVE PID: `launchctl list` also exits 0 for a registered-but-not-running
     # definition, and a crashed job reports `"PID" = -1` (mirrors _parse_launchd_pid_from_list_output).
-    listed = f"launchctl list {q_label} 2>/dev/null | grep -qE '\\\"PID\\\" = [0-9]+;'"
+    listed = f"launchctl list {q_label} 2>/dev/null | grep -qE '\\\"PID\\\" = [1-9][0-9]*;'"
+    # The existing native helper completes the same attempt, never a newer reload.
+    clear_pending = shlex.join([
+        get_python_path(), "-c",
+        "from pathlib import Path; from hermes_cli.gateway_launchd_reload import "
+        "_clear_launchd_reload_pending, _report_launchd_reload; "
+        f"warning = _clear_launchd_reload_pending(Path({str(plist_path)!r}), {attempt!r}, "
+        f"unsupported_marker=Path({str(_launchd_unsupported_marker_path())!r})); "
+        "_report_launchd_reload(warning=warning)",
+    ])
     # Unique per reload so concurrent/repeated reloads never collide.
     submit_label = f"{label}.reload.{os.getpid()}.{int(time.time())}"
     reload_script = (
@@ -3971,7 +3987,7 @@ def _spawn_deferred_launchd_reload(
         f"  if [ $(date +%s) -ge $_deadline ]; then break; fi;   sleep 2; done; "
         f"if ! {listed}; then "
         f"  echo \"[{stamp}] FAILED launchd reload for {q_target} — service NOT registered after {_reload_budget}s of retries\" >> {q_log}; "
-        f"fi; "
+        f"else {clear_pending}; fi; "
         # Submitted jobs stay registered after the script exits; removing our own label ends the one-shot job.
         f"launchctl remove {shlex.quote(submit_label)} 2>/dev/null"
     )
@@ -3993,83 +4009,40 @@ def _spawn_deferred_launchd_reload(
             stderr=subprocess.DEVNULL,
         )
     except Exception as e:
-        # Fall through to in-process bootout/bootstrap: risky in the coalition, but better than a never-reloaded plist.
         logger.warning("Deferred launchd reload could not be spawned: %s", e)
         _append_launchd_reload_log(
-            f"FAILED to spawn launchd reload helper for {target}: {e} — falling back to in-process bootout/bootstrap"
+            f"FAILED to spawn launchd reload helper for {target}: {e}"
         )
-        return False
+        raise gateway_launchd_reload.LaunchdReloadError(f"Could not spawn launchd reload helper: {e}") from e
     return True
 
 
-def refresh_launchd_plist_if_needed() -> bool:
-    """Rewrite the installed plist when the generated one differs, then bootout/bootstrap so launchd
-    re-reads it immediately."""
+def refresh_launchd_plist_if_needed(*, check_bootstrap: bool = False) -> bool:
+    """False means no refresh; True means this refresh owns the start, possibly deferred.
+
+    Refused or failed refreshes raise rather than allowing callers to start stale state.
+    """
     plist_path = get_launchd_plist_path()
-    if not plist_path.exists() or launchd_plist_is_current():
+    if launchd_plist_is_current() and not gateway_launchd_reload._launchd_reload_is_pending(plist_path):
         return False
 
     new_plist = generate_launchd_plist()
     if _refuse_temp_home_service_write(new_plist, "launchd plist"):
-        return False
+        raise gateway_launchd_reload.LaunchdReloadError("Refusing to update launchd plist with a temporary HERMES_HOME")
 
-    plist_path.write_text(new_plist, encoding="utf-8")
-    label = get_launchd_label()
-    domain = _launchd_domain()
-    target = f"{domain}/{label}"
-
-    # Inside the gateway's launchd process tree (agent self-update) a direct bootout kills THIS CLI
-    # before bootstrap runs, leaving the job unloaded with no KeepAlive.
-    try:
-        from gateway.status import get_running_pid
-        gateway_pid = get_running_pid()
-    except Exception:
-        gateway_pid = None
-
-    # POSIX ancestry is NOT a reliable "bootout will kill us" test (coalition membership survives
-    # reparenting), so always prefer the detached helper; in-process is only the spawn-failure fallback.
-    if (
-        gateway_pid is not None
-        and hasattr(os, "setsid")  # POSIX-only; launchd is macOS so always true here
-    ) and _spawn_deferred_launchd_reload(
-        domain=domain, label=label, target=target, plist_path=plist_path, gateway_pid=gateway_pid
-    ):
-        print(
+    with gateway_launchd_reload._launchd_plist_update(plist_path, new_plist) as attempt:
+        deferred, warning = gateway_launchd_reload._reload_launchd_plist(
+            plist_path, attempt, check_bootstrap=check_bootstrap,
+        )
+    if deferred:
+        message = (
             "↻ Updated gateway launchd service definition; reload deferred to "
             "a transient launchd job (survives the bootout of this process)"
         )
-        return True
-
-    # Bootout/bootstrap so launchd reads the new definition; bootstrap can fail silently under load
-    # during a drain, and KeepAlive can't revive an unregistered job.
-    # Captured: best-effort (the job may already be unloaded), keep expected noise off the terminal.
-    subprocess.run(["launchctl", "bootout", target], check=False, timeout=90, **_CAPTURE_TEXT)
-    _reload_budget = _launchd_reload_budget()
-    # Wait out the old gateway's drain first so the budget isn't burned on guaranteed EIO ("already loaded").
-    if gateway_pid is not None and not _wait_for_pid_exit(gateway_pid, _reload_budget):
-        _append_launchd_reload_log(
-            f"old gateway pid {gateway_pid} still alive after "
-            f"{int(_reload_budget)}s drain wait — bootstrapping {target} anyway"
-        )
-    _deadline = time.monotonic() + _reload_budget
-    bootstrap_succeeded = _retry_launchctl_bootstrap_until_registered(
-        domain, plist_path, label, deadline=_deadline
-    )
-    if not bootstrap_succeeded:
-        _append_launchd_reload_log(
-            f"FAILED launchd reload of {target} — service NOT registered after "
-            f"retrying for {int(_reload_budget)}s (in-process fallback path)"
-        )
-        logger.error(
-            "launchd reload of %s failed — service not registered after %ds of retries; see %s",
-            target, int(_reload_budget), _launchd_reload_log_path(),
-        )
-        print(
-            "✗ Updated the launchd plist but the service did not re-register; "
-            f"see {_launchd_reload_log_path()}"
-        )
-        return False
-    print("↻ Updated gateway launchd service definition to match the current Hermes install")
+    else:
+        _clear_launchd_unsupported_marker()
+        message = "↻ Updated gateway launchd service definition to match the current Hermes install"
+    gateway_launchd_reload._report_launchd_reload(message, warning=warning)
     return True
 
 
@@ -4077,19 +4050,12 @@ def launchd_install(force: bool = False):
     plist_path = get_launchd_plist_path()
 
     if plist_path.exists() and not force:
-        if not launchd_plist_is_current():
+        if not launchd_plist_is_current() or gateway_launchd_reload._launchd_reload_is_pending(plist_path):
             print(f"↻ Repairing outdated launchd service at: {plist_path}")
-            if refresh_launchd_plist_if_needed():
-                print("✓ Service definition updated")
-            else:
-                # The plist was rewritten but launchd never registered it (or the write was refused):
-                # a success line here would hide an unloaded service with no KeepAlive.
-                from hermes_constants import display_hermes_home
-                print(
-                    "⚠ Service definition could not be reloaded with launchd. "
-                    "Run 'hermes gateway install --force' or check "
-                    f"{display_hermes_home()}/logs/launchd-reload.log for details."
-                )
+            try:
+                refresh_launchd_plist_if_needed(check_bootstrap=True)
+            except subprocess.CalledProcessError as e:
+                _launchd_degrade_or_raise(e, "launchctl reload")
             return
         print(f"Service already installed at: {plist_path}")
         print("Use --force to reinstall")
@@ -4098,16 +4064,21 @@ def launchd_install(force: bool = False):
     plist_path.parent.mkdir(parents=True, exist_ok=True)
     new_plist = generate_launchd_plist()
     if _refuse_temp_home_service_write(new_plist, "launchd plist"):
-        return
+        raise gateway_launchd_reload.LaunchdReloadError("Refusing to install launchd plist with a temporary HERMES_HOME")
     print(f"Installing launchd service to: {plist_path}")
-    plist_path.write_text(new_plist, encoding="utf-8")
 
     try:
-        _launchctl_bootstrap(_launchd_domain(), plist_path, get_launchd_label(), timeout=30)
+        with gateway_launchd_reload._launchd_plist_update(plist_path, new_plist) as attempt:
+            with gateway_launchd_reload._launchd_actuation():
+                _launchctl_bootstrap(_launchd_domain(), plist_path, get_launchd_label(), timeout=30)
+                if not _launchctl_label_supervising_process(get_launchd_label()):
+                    raise gateway_launchd_reload.LaunchdReloadError("launchd installation has no observed supervision")
+                warning = gateway_launchd_reload._clear_launchd_reload_pending(plist_path, attempt)
     except subprocess.CalledProcessError as e:
         _launchd_degrade_or_raise(e, "launchctl bootstrap")
         return
 
+    gateway_launchd_reload._report_launchd_reload(warning=warning)
     print()
     print("✓ Service installed and loaded!")
     _clear_launchd_unsupported_marker()
@@ -4124,8 +4095,11 @@ def launchd_uninstall():
     subprocess.run(
         ["launchctl", "bootout", f"{_launchd_domain()}/{get_launchd_label()}"],
         check=False, timeout=90, **_CAPTURE_TEXT)
-    if plist_path.exists():
+    removed = plist_path.exists()
+    if removed:
         plist_path.unlink()
+    gateway_launchd_reload._cancel_launchd_reload_pending(plist_path)
+    if removed:
         print(f"✓ Removed {plist_path}")
     print("✓ Service uninstalled")
 
@@ -4134,19 +4108,13 @@ def launchd_start():
     plist_path = get_launchd_plist_path()
     label = get_launchd_label()
 
-    # Self-heal if the plist is missing entirely (e.g., manual cleanup, failed upgrade)
-    if not plist_path.exists():
-        new_plist = generate_launchd_plist()
-        if _refuse_temp_home_service_write(new_plist, "launchd plist"):
-            sys.exit(1)
-        print("↻ launchd plist missing; regenerating service definition")
-        plist_path.parent.mkdir(parents=True, exist_ok=True)
-        plist_path.write_text(new_plist, encoding="utf-8")
-        if _launchd_bootstrap_and_kickstart(plist_path, label):
-            _launchd_ok("✓ Service started")
+    # Stale, missing, or pending definitions all use the same publication/reload owner.
+    try:
+        refreshed = refresh_launchd_plist_if_needed(check_bootstrap=True)
+    except subprocess.CalledProcessError as e:
+        _launchd_degrade_or_raise(e, "launchctl reload")
         return
 
-    refreshed = refresh_launchd_plist_if_needed()
     if refreshed:
         # refresh_launchd_plist_if_needed() bootstrapped the plist (either via
         # a detached helper or in-process). The service config has RunAtLoad=true
@@ -4154,7 +4122,7 @@ def launchd_start():
         # the label is registered. Issuing an immediate kickstart would race a
         # second gateway instance into existence before the first one finishes
         # booting.
-        _launchd_ok("✓ Service started")
+        # The refresh reports whether activation was observed or merely deferred.
         return
     try:
         _launchctl_kickstart_current(label)
@@ -4259,7 +4227,13 @@ def _wait_for_launchd_service_pid(
         time.sleep(0.5)
 
 
-def launchd_restart():
+def launchd_restart() -> bool | None:
+    """Return True only when this invocation starts the native detached fallback."""
+    try:
+        if refresh_launchd_plist_if_needed(check_bootstrap=True):
+            return
+    except subprocess.CalledProcessError as e:
+        return _launchd_degrade_or_raise(e, "launchctl reload")
     label = get_launchd_label()
     domain = _launchd_domain()
     target = f"{domain}/{label}"
@@ -4297,8 +4271,7 @@ def launchd_restart():
         _launchd_ok("✓ Service restarted")
     except subprocess.CalledProcessError as e:
         if not _launchd_error_indicates_unloaded(e):
-            _launchd_degrade_or_raise(e, "launchctl kickstart")
-            return
+            return _launchd_degrade_or_raise(e, "launchctl kickstart")
         # Job not loaded — bootstrap and start fresh
         print("↻ launchd job was unloaded; reloading")
         try:
@@ -4310,8 +4283,7 @@ def launchd_restart():
             subprocess.run(["launchctl", "bootstrap", _launchd_domain(), plist_path], check=True, timeout=30)
             subprocess.run(["launchctl", "kickstart", target], check=True, timeout=30)
         except subprocess.CalledProcessError as e2:
-            _launchd_degrade_or_raise(e2, "launchctl")
-            return
+            return _launchd_degrade_or_raise(e2, "launchctl")
         _launchd_ok("✓ Service restarted")
 
 
@@ -4339,7 +4311,12 @@ def wait_for_launchd_gateway_supervision(
     the wait.
     """
     if _launchd_unsupported_marker_exists():
-        return True
+        try:
+            if not gateway_launchd_reload._launchd_reload_is_pending(get_launchd_plist_path()):
+                return True
+        except (OSError, gateway_launchd_reload.LaunchdReloadError):
+            return False
+        # An old detached fallback cannot confirm a newly requested reload.
 
     label = label or get_launchd_label()
     deadline = time.monotonic() + max(timeout, 0.0)
@@ -5938,6 +5915,9 @@ def gateway_command(args):
     """Handle gateway subcommands."""
     try:
         return _gateway_command_inner(args)
+    except gateway_launchd_reload.LaunchdReloadError as e:
+        print_error(str(e))
+        sys.exit(1)
     except UserSystemdUnavailableError as e:
         # Actionable message, not a traceback, when the user D-Bus session is unreachable.
         print_error("User systemd not reachable:")
@@ -6335,6 +6315,13 @@ def _cmd_restart(args):
         return
     if not restart_all and _dispatch_via_service_manager_if_s6("restart"):
         return
+    if is_macos():
+        plist_path = get_launchd_plist_path()
+        if not plist_path.exists() and gateway_launchd_reload._launchd_reload_is_pending(plist_path):
+            # A failed first install still owns launchd recovery, including --all.
+            # Recover before the ordinary all-profile stop/wait/start sequence.
+            launchd_restart()
+            return
     if restart_all:
         _restart_all(system)
         return
