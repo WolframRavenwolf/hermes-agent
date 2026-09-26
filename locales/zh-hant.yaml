@@ -86,6 +86,9 @@ gateway:
     switch_failed:         "分支已建立，但無法切換到該分支。"
     branched_one:          "⑂ 已分支至 **{title}**（已複製 {count} 則訊息）\n原始：`{parent}`\n分支：`{new}`\n使用 `/resume` 切換回原始工作階段。"
     branched_many:         "⑂ 已分支至 **{title}**（已複製 {count} 則訊息）\n原始：`{parent}`\n分支：`{new}`\n使用 `/resume` 切換回原始工作階段。"
+    branched_thread_one:   "⑂ 已在新討論串中分支到 **{title}**（已複製 {count} 則訊息）\n討論串：{thread}\n原始：`{parent}` — 本聊天保持在原會話\n分支：`{new}`\n使用 `/branch --here` 可在本聊天中分支。"
+    branched_thread_many:  "⑂ 已在新討論串中分支到 **{title}**（已複製 {count} 則訊息）\n討論串：{thread}\n原始：`{parent}` — 本聊天保持在原會話\n分支：`{new}`\n使用 `/branch --here` 可在本聊天中分支。"
+    thread_fallback:       "此處無法建立討論串，因此分支取代了本聊天的會話。"
 
   commands:
     usage:                 "用法：`/commands [page]`"
@@ -430,6 +433,7 @@ Future messages in this room will use that transcript until `/reset` or another 
     mode_new:              "⚙️ 工具進度：**NEW** — 工具變更時顯示（預覽長度：`display.tool_preview_length`，預設 40）。"
     mode_all:              "⚙️ 工具進度：**ALL** — 顯示每次工具呼叫（預覽長度：`display.tool_preview_length`，預設 40）。"
     mode_verbose:          "⚙️ 工具進度：**VERBOSE** — 顯示每次工具呼叫及完整參數。"
+    mode_full:             "⚙️ 工具進度：**FULL** — 顯示經遮蔽的完整 JSON 參數，絕不截斷。"
     mode_log:              "⚙️ 工具進度：**LOG** — 聊天中保持靜默；工具呼叫寫入 ~/.hermes/logs/tool_calls.log。"
     saved_suffix:          "_（已為 **{platform}** 儲存 — 下一則訊息生效）_"
     save_failed:           "_（無法儲存到設定：{error}）_"

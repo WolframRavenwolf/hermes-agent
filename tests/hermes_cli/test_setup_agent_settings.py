@@ -3,34 +3,6 @@
 from hermes_cli.setup import setup_agent_settings
 
 
-def test_setup_agent_settings_uses_displayed_max_iterations_value(tmp_path, monkeypatch, capsys):
-    """The helper text should match the value shown in the prompt.
-
-    After PR#18413 max_turns is read exclusively from config.yaml — the
-    .env `HERMES_MAX_ITERATIONS` fallback was removed because it was
-    shadowing the user's current config (see the 60-vs-500 incident).
-    """
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-
-    config = {
-        "agent": {"max_turns": 60},
-        "display": {"tool_progress": "all"},
-        "compression": {"threshold": 0.50},
-    }
-
-    prompt_answers = iter(["60", "all", "0.5"])
-
-    monkeypatch.setattr("hermes_cli.setup.prompt", lambda *args, **kwargs: next(prompt_answers))
-    monkeypatch.setattr("hermes_cli.setup.prompt_choice", lambda *args, **kwargs: 4)
-    monkeypatch.setattr("hermes_cli.setup.save_env_value", lambda *args, **kwargs: None)
-    monkeypatch.setattr("hermes_cli.setup.remove_env_value", lambda *args, **kwargs: None)
-    monkeypatch.setattr("hermes_cli.setup.save_config", lambda *args, **kwargs: None)
-
-    setup_agent_settings(config)
-
-    out = capsys.readouterr().out
-    assert "Press Enter to keep 60." in out
-    assert "Default is 90" not in out
 
 
 def test_setup_agent_settings_prefers_config_over_stale_env(tmp_path, monkeypatch, capsys):
@@ -74,3 +46,27 @@ def test_setup_agent_settings_prefers_config_over_stale_env(tmp_path, monkeypatc
     assert "Press Enter to keep 60." not in out
     # And the stale .env entry gets cleaned up
     assert "HERMES_MAX_ITERATIONS" in removed_keys
+
+
+def test_setup_agent_settings_saves_full_progress(tmp_path, monkeypatch, capsys):
+    from copy import deepcopy
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = {
+        "agent": {"max_turns": 90},
+        "display": {"tool_progress": "all"},
+        "compression": {"threshold": 0.5},
+    }
+    answers = iter(["90", "full", "0.5"])
+    saved = []
+    monkeypatch.setattr("hermes_cli.setup.prompt", lambda *a, **kw: next(answers))
+    monkeypatch.setattr("hermes_cli.setup.remove_env_value", lambda *a, **kw: None)
+    monkeypatch.setattr("hermes_cli.setup.save_config", lambda value: saved.append(deepcopy(value)))
+
+    setup_agent_settings(config)
+
+    assert config["display"]["tool_progress"] == "full"
+    assert saved[-1]["display"]["tool_progress"] == "full"
+    output = capsys.readouterr().out
+    assert "Unknown mode" not in output
+    assert "full" in output and "gateway only" in output

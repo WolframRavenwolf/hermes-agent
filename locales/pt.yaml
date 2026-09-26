@@ -86,6 +86,9 @@ gateway:
     switch_failed:         "Ramo criado, mas não foi possível mudar para ele."
     branched_one:          "⑂ Ramificado para **{title}** ({count} mensagem copiada)\nOriginal: `{parent}`\nRamo: `{new}`\nUsa `/resume` para voltar ao original."
     branched_many:         "⑂ Ramificado para **{title}** ({count} mensagens copiadas)\nOriginal: `{parent}`\nRamo: `{new}`\nUsa `/resume` para voltar ao original."
+    branched_thread_one:   "⑂ Ramificado para **{title}** em um novo tópico ({count} mensagem copiada)\nTópico: {thread}\nOriginal: `{parent}` — este chat permanece nele\nRamo: `{new}`\nUse `/branch --here` para ramificar neste chat."
+    branched_thread_many:  "⑂ Ramificado para **{title}** em um novo tópico ({count} mensagens copiadas)\nTópico: {thread}\nOriginal: `{parent}` — este chat permanece nele\nRamo: `{new}`\nUse `/branch --here` para ramificar neste chat."
+    thread_fallback:       "Não foi possível criar um tópico aqui, então o ramo substituiu a sessão deste chat."
 
   commands:
     usage:                 "Uso: `/commands [page]`"
@@ -430,6 +433,7 @@ Future messages in this room will use that transcript until `/reset` or another 
     mode_new:              "⚙️ Progresso de ferramentas: **NEW** — mostrado quando a ferramenta muda (comprimento da pré-visualização: `display.tool_preview_length`, predefinição 40)."
     mode_all:              "⚙️ Progresso de ferramentas: **ALL** — cada chamada de ferramenta é mostrada (comprimento da pré-visualização: `display.tool_preview_length`, predefinição 40)."
     mode_verbose:          "⚙️ Progresso de ferramentas: **VERBOSE** — cada chamada de ferramenta com os argumentos completos."
+    mode_full:             "⚙️ Progresso de ferramentas: **FULL** — argumentos JSON completos e ocultados, nunca truncados."
     mode_log:              "⚙️ Progresso de ferramentas: **LOG** — silencioso no chat; as chamadas de ferramentas são gravadas em ~/.hermes/logs/tool_calls.log."
     saved_suffix:          "_(guardado para **{platform}** — produz efeito na próxima mensagem)_"
     save_failed:           "_(não foi possível guardar na configuração: {error})_"
