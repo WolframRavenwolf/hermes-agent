@@ -1,3 +1,4 @@
+import type { GatewayEventName } from '@hermes/shared'
 import { act, cleanup } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -7,7 +8,7 @@ const SID = 'timeline-session'
 
 let stream: MessageStreamHarness
 
-const event = (type: string, timestamp: number, payload: Record<string, unknown> = {}) =>
+const event = (type: GatewayEventName, timestamp: number, payload: Record<string, unknown> = {}) =>
   act(() => stream.handleEvent({ payload: { ...payload, timestamp }, session_id: SID, type }))
 
 describe('live transcript timeline events', () => {
@@ -65,13 +66,43 @@ describe('live transcript timeline events', () => {
     expect([assistant?.timestamp, assistant?.completedAt]).toEqual([301.875, 301.875])
   })
 
-  it('uses the gateway event time for a review summary system row', () => {
-    event('review.summary', 401.625, { text: 'Review saved.' })
+  it.each([SID, 'background-session'])('keeps a full model-switch warning in its owning session %s', sessionId => {
+    event('message.start', 450)
+    if (sessionId !== SID) {
+      act(() => stream.handleEvent({ session_id: sessionId, type: 'message.start', payload: { timestamp: 450 } }))
+    }
+    const focusedBefore = stream.state(SID)
+    const before = stream.state(sessionId)
+    const text = '  PROVIDER AUTOMATICALLY CHANGED: openai-codex -> openrouter. Additional costs may apply.\n\n' +
+      'Catalog validation notice. Keep <b>literal markup</b> and \u001b[31mcontrol text\u001b[0m.\n'
+    expect(before.busy).toBe(true)
 
-    const system = stream.state(SID).messages.find(message => message.role === 'system')
+    act(() => stream.handleEvent({
+      session_id: sessionId,
+      type: 'status.update',
+      payload: { kind: 'model-switch-warning', text, timestamp: 451.625 }
+    }))
 
-    expect(system?.timestamp).toBe(401.625)
-    expect(system?.parts[0].timestamp).toBe(401.625)
+    const after = stream.state(sessionId)
+    const system = after.messages.at(-1)
+    expect(after.messages).toHaveLength(before.messages.length + 1)
+    expect(system).toMatchObject({
+      role: 'system',
+      parts: [{ type: 'text', text: `warning: ${text}`, timestamp: 451.625 }],
+      timestamp: 451.625
+    })
+    expect({ ...after, messages: before.messages }).toEqual(before)
+    expect(after.messages.slice(0, -1)).toEqual(before.messages)
+    if (sessionId !== SID) {
+      expect(stream.state(SID)).toEqual(focusedBefore)
+    }
+
+    act(() => stream.handleEvent({
+      session_id: sessionId,
+      type: 'status.update',
+      payload: { kind: 'progress', text: 'Working...', timestamp: 452 }
+    }))
+    expect(stream.state(sessionId)).toEqual(after)
   })
 
   it('uses session.info time when it is the only stop boundary', () => {
