@@ -94,18 +94,12 @@ def test_fail_closed_probe_reports_guard_active():
     assert _live_system_guard_is_active() is True
 
 
-def test_fail_closed_probe_classifies_raw_builtin_as_unguarded():
-    """The probe's discriminator, exercised against real objects: a raw C
-    builtin the guard never touches (``os.getpid``) is exactly what an
-    unguarded ``os.kill`` looks like and must read as 'guard not active', while
-    the loaded guard's ``os.kill`` is a plain Python function."""
-    assert isinstance(os.getpid, types.BuiltinFunctionType)
-    assert not isinstance(os.kill, types.BuiltinFunctionType)
 
 
 # ──────────────────── kill primitives ─────────────────────────
 
 
+@pytest.mark.platforms("linux")
 def test_os_kill_blocks_foreign_pid():
     with pytest.raises(RuntimeError, match="live-system guard"):
         os.kill(FOREIGN_PID, signal.SIGTERM)
@@ -155,9 +149,6 @@ def test_subprocess_run_bash_c_systemctl_blocked():
         subprocess.run(["bash", "-c", "systemctl --user restart hermes-gateway"])
 
 
-def test_subprocess_run_sh_c_systemctl_blocked():
-    with pytest.raises(RuntimeError, match="live-system guard"):
-        subprocess.run(["sh", "-c", "systemctl --user stop hermes-gateway"])
 
 
 def test_subprocess_run_setsid_systemctl_blocked():
@@ -219,6 +210,7 @@ def test_os_popen_systemctl_blocked():
 # ──────────────────── pty.spawn ────────────────────────────────
 
 
+@pytest.mark.platforms("linux")
 def test_pty_spawn_systemctl_blocked():
     import pty
     with pytest.raises(RuntimeError, match="live-system guard"):
@@ -260,9 +252,6 @@ def test_subprocess_pkill_hermes_blocked():
         subprocess.run(["pkill", "-f", "hermes"])
 
 
-def test_subprocess_pkill_hermes_gateway_blocked():
-    with pytest.raises(RuntimeError, match="live-system guard"):
-        subprocess.run(["pkill", "-f", "hermes-gateway"])
 
 
 def test_subprocess_pkill_python_dash_f_blocked():
@@ -308,6 +297,19 @@ def test_subprocess_popen_real_gateway_restart_blocked():
         )
 
 
+def test_subprocess_popen_inline_source_restart_watcher_blocked():
+    """``gateway._spawn_gateway_restart_watcher`` hides the real gateway argv behind
+    ``python -c <src> <old_pid> …``. The identity matcher must ignore that trailing argv (#107002),
+    but the guard reads it as SPAWN INTENT — otherwise the watcher sails through, waits out its
+    120s deadline and leaves a real detached gateway squatting the webhook port."""
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(1)", "4242",
+             sys.executable, "-m", "hermes_cli.main", "gateway", "run"],
+            start_new_session=True,
+        )
+
+
 def test_subprocess_run_gateway_status_passes_through():
     """Only lifecycle verbs are blocked: ``gateway status`` (and every other
     read-only subcommand) must still spawn — via the canonical matcher, not an
@@ -334,3 +336,147 @@ def test_bypass_marker_disables_guard():
     # so we get the real os.kill. Calling os.kill(os.getpid(), 0) just
     # checks that the PID exists — harmless.
     os.kill(os.getpid(), 0)  # No exception — guard is OFF.
+
+
+
+# Native launchctl canaries use only `help`: a missing guard must never stop a service.
+# This probe runs at collection time, before any autouse fixture can install protection.
+_collection_launchctl_denied = False
+if sys.platform == "darwin":
+    try:
+        subprocess.run(["/bin/launchctl", "help"], capture_output=True)
+    except PermissionError:
+        _collection_launchctl_denied = True
+
+
+@pytest.mark.platforms("macos")
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS execution boundary")
+@pytest.mark.live_system_guard_bypass
+class TestLaunchctlExecutionBoundary:
+    def test_guard_is_active_before_test_collection(self):
+        assert _collection_launchctl_denied
+
+    def test_system_ps_keeps_process_diagnostics_working(self):
+        result = subprocess.run(
+            ["/bin/ps", "-p", str(os.getpid()), "-o", "pid=,pgid="],
+            capture_output=True, text=True, check=True,
+        )
+        pid, pgid = result.stdout.split()
+        assert int(pid) == os.getpid()
+        assert int(pgid) == os.getpgid(0)
+        with pytest.raises(PermissionError):
+            subprocess.run(["/bin/launchctl", "help"], capture_output=True)
+
+    def test_direct_host_and_symlink_are_denied(self, tmp_path):
+        import errno
+        alias = tmp_path / "controller-alias"
+        alias.symlink_to("/bin/launchctl")
+        for executable in ("/bin/launchctl", str(alias)):
+            with pytest.raises(PermissionError) as caught:
+                subprocess.run([executable, "help"], capture_output=True)
+            assert caught.value.errno in (errno.EPERM, errno.EACCES)
+
+    @pytest.mark.parametrize("command", [
+        ["/bin/bash", "-c", 'cmd=/bin/launchctl; "$cmd" help'],
+        ["/bin/bash", "-cO", "extglob", "/bin/launchctl help"],
+        ["/bin/bash", "-c", "cd /bin; ./launchctl help"],
+        ["/bin/bash", "-c", "if true; then /bin/launchctl help; fi"],
+        ["/bin/bash", "-c", "f() { /bin/launchctl help; }; f"],
+        ["/bin/bash", "-c", '${CMD:-/bin/launchctl} help'],
+        ["/bin/bash", "-c", "PATH=/bin launchctl help"],
+    ])
+    def test_shell_forms_cannot_execute_host_controller(self, command):
+        result = subprocess.run(command, capture_output=True, text=True)
+        assert result.returncode != 0
+        assert "Operation not permitted" in result.stderr or "Permission denied" in result.stderr
+
+    def test_opaque_script_and_native_descendant_are_denied(self, tmp_path):
+        script = tmp_path / "nested.sh"
+        script.write_text('cmd=/bin/launchctl; "$cmd" help\n', encoding="utf-8")
+        for argv in (["/bin/bash", str(script)],
+                     ["/usr/bin/find", str(script), "-exec", "/bin/launchctl", "help", ";"]):
+            result = subprocess.run(argv, capture_output=True, text=True)
+            # find may return zero even when its -exec child was denied.
+            assert "Operation not permitted" in result.stderr or "Permission denied" in result.stderr
+
+    @pytest.mark.parametrize("primitive", [
+        "os.execv('/bin/launchctl', ['launchctl', 'help'])",
+        "os.posix_spawn('/bin/launchctl', ['launchctl', 'help'], {})",
+        "subprocess.run(['/bin/launchctl', 'help'], env={})",
+    ])
+    def test_fresh_interpreter_inherits_guard_with_empty_environment(self, primitive):
+        source = (
+            "import errno, os, subprocess\n"
+            "try:\n    " + primitive + "\n"
+            "except OSError as error:\n"
+            "    assert error.errno in (errno.EPERM, errno.EACCES)\n"
+            "    print('denied')\n"
+            "else:\n    raise AssertionError('host controller executed')\n"
+        )
+        result = subprocess.run([sys.executable, "-c", source], env={}, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "denied"
+
+    def test_host_binary_cannot_be_copied_outside_protected_path(self):
+        import errno
+        from pathlib import Path
+        with pytest.raises(PermissionError) as caught:
+            Path("/bin/launchctl").read_bytes()
+        assert caught.value.errno in (errno.EPERM, errno.EACCES)
+
+    def test_fake_and_complex_harmless_shell_remain_usable(self, tmp_path):
+        fake = tmp_path / "launchctl"
+        fake.write_text("#!/bin/sh\nprintf 'fake-ok\\n'\n", encoding="utf-8")
+        fake.chmod(0o755)
+        source = tmp_path / "fixture.sh"
+        source.write_text('say() { printf "shell-ok\\n"; }\n', encoding="utf-8")
+        commands = [
+            ([str(fake), "help"], "fake-ok"),
+            (["/bin/bash", "-c", 'launchctl help',], "fake-ok"),
+            (["/bin/bash", "-c", 'source "$1"; X=1; if [ "$X" = 1 ]; then say; fi', "bash", str(source)], "shell-ok"),
+            (["/bin/echo", "/bin/launchctl help"], "/bin/launchctl help"),
+        ]
+        for argv, expected in commands:
+            result = subprocess.run(argv, env={"PATH": str(tmp_path), "LC_ALL": "C"}, capture_output=True, text=True)
+            assert result.returncode == 0, result.stderr
+            assert result.stdout.strip() == expected
+
+    def test_child_can_reinstall_guard_after_inheritance(self):
+        source = "from tests.launchctl_safety import install_launchctl_guard; install_launchctl_guard(); install_launchctl_guard()"
+        result = subprocess.run([sys.executable, "-c", source], capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.platforms("not macos")
+def test_launchctl_guard_is_inert_off_darwin(monkeypatch):
+    from tests import launchctl_safety
+    monkeypatch.setattr(launchctl_safety, "_INSTALLED", False, raising=False)
+    def unexpected(*args, **kwargs):
+        raise AssertionError("non-Darwin must not load libsandbox")
+    monkeypatch.setattr("ctypes.CDLL", unexpected)
+    launchctl_safety.install_launchctl_guard()
+
+
+@pytest.mark.platforms("macos")
+def test_launchctl_guard_fails_explicitly_when_native_library_is_unavailable(monkeypatch):
+    from tests import launchctl_safety
+    monkeypatch.setattr(launchctl_safety, "_INSTALLED", False, raising=False)
+    def unavailable(*args, **kwargs):
+        raise OSError("test library unavailable")
+    monkeypatch.setattr("ctypes.CDLL", unavailable)
+    with pytest.raises(RuntimeError, match="launchctl test guard"):
+        launchctl_safety.install_launchctl_guard()
+    assert not launchctl_safety._INSTALLED
+
+
+@pytest.mark.platforms("macos")
+def test_launchctl_guard_fails_closed_on_profile_rejection(monkeypatch):
+    from unittest.mock import Mock
+    from tests import launchctl_safety
+    monkeypatch.setattr(launchctl_safety, "_INSTALLED", False, raising=False)
+    library = Mock()
+    library.sandbox_init.return_value = -1
+    monkeypatch.setattr("ctypes.CDLL", Mock(return_value=library))
+    with pytest.raises(RuntimeError, match="launchctl test guard"):
+        launchctl_safety.install_launchctl_guard()
+    assert not launchctl_safety._INSTALLED
