@@ -255,7 +255,7 @@ try:
 except ImportError:
     from ffmpeg_utils import resolve_ffmpeg_executable
 
-from gateway.config import Platform, PlatformConfig
+from gateway.config import Platform, PlatformConfig, discord_channel_id_from_link
 
 from gateway.platforms.helpers import (
     MessageDeduplicator, ThreadParticipationTracker, convert_table_to_bullets, is_discord_channel_obfuscated,
@@ -272,8 +272,9 @@ from gateway.platforms.base import (
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from tools.url_safety import is_safe_url
 from gateway.platforms._shared import (
-    env_is_connected as _env_is_connected, extra_or_secret as _extra_or_secret,
-    platform_gate_env as _scoped_gate_env, send_error, yaml_env_setter as _yaml_env_setter
+    decode_json_list_literal as _decode_json_list_literal, env_is_connected as _env_is_connected,
+    extra_or_secret as _extra_or_secret, platform_gate_env as _scoped_gate_env, send_error,
+    yaml_env_setter as _yaml_env_setter
 )
 
 # Every refusal (slash command, approval button, picker, prompt) says the same thing.
@@ -460,7 +461,7 @@ class _DiscordNonConversationalMessageTracker:
         if not path.exists():
             return []
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
             if isinstance(data, list):
                 return [str(message_id) for message_id in data if str(message_id).strip()]
         except Exception:
@@ -502,6 +503,11 @@ class _DiscordNonConversationalMessageTracker:
 
     def __contains__(self, message_id: str) -> bool:
         return str(message_id or "") in self._ids
+
+
+def _discord_snowflake_time(snowflake: int) -> dt.datetime:
+    """UTC creation time encoded in a Discord snowflake (ms since 2015-01-01 in the top 42 bits)."""
+    return dt.datetime.fromtimestamp(((snowflake >> 22) + 1420070400000) / 1000, tz=dt.timezone.utc)
 
 
 def _metadata_marks_nonconversational(metadata: Optional[Dict[str, Any]]) -> bool:
@@ -574,14 +580,18 @@ def discord_deps_present() -> bool:
 
 
 def check_discord_requirements() -> bool:
-    """Check Discord deps; lazy-installs discord.py on first call and re-binds
-    module globals so ``DISCORD_AVAILABLE`` becomes True."""
+    """Check if Discord dependencies are available.
+
+    Lazy-installs discord.py via ``pm.ensure_import("discord")``
+    on first call if not present. After successful install, re-binds module
+    globals so ``DISCORD_AVAILABLE`` becomes True.
+    """
     global DISCORD_AVAILABLE, discord, DiscordMessage, Intents, commands
     if DISCORD_AVAILABLE:
         return True
     try:
-        from tools.lazy_deps import ensure as _lazy_ensure
-        _lazy_ensure("platform.discord", prompt=False)
+        from pm import ensure_import as _lazy_ensure
+        _lazy_ensure("discord")
     except Exception:
         return False
     try:
@@ -644,33 +654,68 @@ def _discord_ready_timeout_seconds() -> float:
 
 
 class VoiceReceiver:
-    """Captures voice audio from a Discord voice channel: hooks the VoiceClient socket, decrypts
-    RTP (NaCl + DAVE E2EE), decodes Opus per user; a polling loop delivers utterances on silence."""
+    """Captures and decodes voice audio from a Discord voice channel.
+
+    Attaches to a VoiceClient's socket listener, decrypts RTP packets
+    (NaCl transport + DAVE E2EE), decodes Opus to PCM, and buffers
+    per-user audio.  A polling loop detects silence and delivers
+    completed utterances via a callback.
+    """
 
     SILENCE_THRESHOLD = 1.5    # seconds of silence → end of utterance
     MIN_SPEECH_DURATION = 0.5  # minimum seconds to process (skip noise)
     SAMPLE_RATE = 48000        # Discord native rate
     CHANNELS = 2               # Discord sends stereo
+    PCM_BYTES_PER_SECOND = SAMPLE_RATE * CHANNELS * 2
+    MAX_UTTERANCE_SECONDS = 60.0
+    MAX_UTTERANCE_BYTES = int(PCM_BYTES_PER_SECOND * MAX_UTTERANCE_SECONDS)
+    MAX_STREAM_QUEUE_SECONDS = 5.0
+    MAX_STREAM_QUEUE_BYTES = int(PCM_BYTES_PER_SECOND * MAX_STREAM_QUEUE_SECONDS)
+    MAX_ACTIVE_SSRC_BUFFERS = 4
 
     def __init__(self, voice_client, allowed_user_ids: set = None):
         self._vc = voice_client
         self._allowed_user_ids = allowed_user_ids or set()
         self._running = False
+
+        # Decryption
         self._secret_key: Optional[bytes] = None
         self._dave_session = None
         self._bot_ssrc: int = 0
+
+        # SSRC -> user_id mapping (populated from SPEAKING events)
         self._ssrc_to_user: Dict[int, int] = {}
-        self._lock = threading.Lock()
+        self._ssrc_generation: Dict[int, int] = defaultdict(int)
+        self._capture_generation = 0
+        # Re-entrant because packet-time safe user inference updates the SSRC
+        # map through the same lock used by silence extraction.
+        self._lock = threading.RLock()
+
+        # Per-user audio buffers
         self._buffers: Dict[int, bytearray] = defaultdict(bytearray)
         self._last_packet_time: Dict[int, float] = {}
+        # Decoded chunks awaiting async Realtime STT dispatch. Chunks are
+        # queued only after an SSRC has a safely resolved user id.
+        self._stream_chunks: list[tuple[int, int, int, int, bytes]] = []
+        self._stream_chunk_bytes = 0
+
         # Opus decoder per SSRC (each user needs own decoder state)
-        self._decoders: Dict[int, object] = {}
+        self._decoders: Dict[int, Any] = {}
+        self._hook_connection = None
+        self._original_connection_hook = None
+        self._original_ws_hook = None
+        self._installed_speaking_hook = None
+
         # Pause flag: don't capture while bot is playing TTS
         self._paused = False
+        self.require_explicit_mapping = False
+
         # Debug logging counter (instance-level to avoid cross-instance races)
         self._packet_debug_count = 0
 
-    # --- Lifecycle ---
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     def start(self):
         """Start listening for voice packets."""
@@ -678,40 +723,131 @@ class VoiceReceiver:
         self._secret_key = bytes(conn.secret_key)
         self._dave_session = conn.dave_session
         self._bot_ssrc = conn.ssrc
+
         self._install_speaking_hook(conn)
         conn.add_socket_listener(self._on_packet)
-        self._running = True
+        with self._lock:
+            self._capture_generation += 1
+            self._running = True
         logger.info("VoiceReceiver started (bot_ssrc=%d)", self._bot_ssrc)
 
     def stop(self):
         """Stop listening and clean up."""
-        self._running = False
+        with self._lock:
+            self._capture_generation += 1
+            self._running = False
         try:
             self._vc._connection.remove_socket_listener(self._on_packet)
         except Exception:
             pass
+        self._restore_speaking_hook()
         with self._lock:
             self._buffers.clear()
             self._last_packet_time.clear()
+            self._stream_chunks.clear()
+            self._stream_chunk_bytes = 0
             self._decoders.clear()
             self._ssrc_to_user.clear()
+            self._ssrc_generation.clear()
         logger.info("VoiceReceiver stopped")
 
     def pause(self):
-        self._paused = True
+        with self._lock:
+            self._paused = True
+            self.discard_pending()
 
     def resume(self):
-        self._paused = False
+        with self._lock:
+            self._capture_generation += 1
+            self._paused = False
 
-    # --- SSRC -> user_id mapping via SPEAKING opcode hook ---
+    def discard_pending(self) -> None:
+        """Discard local utterance state without stopping the receiver."""
+        with self._lock:
+            self._capture_generation += 1
+            self._buffers.clear()
+            self._last_packet_time.clear()
+            self._stream_chunks.clear()
+            self._stream_chunk_bytes = 0
+            # Capture invalidation also abandons unmapped in-flight decoders.
+            for ssrc in list(self._decoders):
+                if not self._ssrc_to_user.get(ssrc):
+                    self._decoders.pop(ssrc, None)
+
+    # ------------------------------------------------------------------
+    # SSRC -> user_id mapping via SPEAKING opcode hook
+    # ------------------------------------------------------------------
 
     def map_ssrc(self, ssrc: int, user_id: int):
         with self._lock:
+            previous_user = self._ssrc_to_user.get(ssrc, 0)
+            if previous_user == user_id:
+                return
+
+            self._ssrc_generation[ssrc] += 1
+            generation = self._ssrc_generation[ssrc]
+            self._stream_chunks = [
+                chunk for chunk in self._stream_chunks if chunk[1] != ssrc
+            ]
+            self._stream_chunk_bytes = sum(
+                len(chunk[4]) for chunk in self._stream_chunks
+            )
+
+            if previous_user:
+                self._buffers.pop(ssrc, None)
+                self._last_packet_time.pop(ssrc, None)
+                self._decoders.pop(ssrc, None)
+
             self._ssrc_to_user[ssrc] = user_id
+            if not previous_user:
+                preroll = bytes(self._buffers.get(ssrc, b""))
+                if (
+                    preroll
+                    and self._stream_chunk_bytes + len(preroll)
+                    <= self.MAX_STREAM_QUEUE_BYTES
+                ):
+                    self._stream_chunks.append(
+                        (
+                            self._capture_generation,
+                            ssrc,
+                            generation,
+                            user_id,
+                            preroll,
+                        )
+                    )
+                    self._stream_chunk_bytes += len(preroll)
+
+    def unmap_user(self, user_id: int) -> None:
+        with self._lock:
+            stale_ssrcs = [
+                ssrc
+                for ssrc, mapped_user in self._ssrc_to_user.items()
+                if mapped_user == user_id
+            ]
+            if not stale_ssrcs:
+                return
+            stale = set(stale_ssrcs)
+            for ssrc in stale_ssrcs:
+                self._ssrc_generation[ssrc] += 1
+                self._ssrc_to_user.pop(ssrc, None)
+                self._buffers.pop(ssrc, None)
+                self._last_packet_time.pop(ssrc, None)
+                self._decoders.pop(ssrc, None)
+            self._stream_chunks = [
+                chunk for chunk in self._stream_chunks if chunk[1] not in stale
+            ]
+            self._stream_chunk_bytes = sum(
+                len(chunk[4]) for chunk in self._stream_chunks
+            )
 
     def _install_speaking_hook(self, conn):
-        """Wrap the voice websocket hook to capture SPEAKING events (op 5); ``conn.hook`` is
-        re-passed on each (re)connect, so wrap it on the state AND the live websocket."""
+        """Wrap the voice websocket hook to capture SPEAKING events (op 5).
+
+        VoiceConnectionState stores the hook as ``conn.hook`` (public attr).
+        It is passed to DiscordVoiceWebSocket on each (re)connect, so we
+        must wrap it on the VoiceConnectionState level AND on the current
+        live websocket instance.
+        """
         original_hook = conn.hook
         receiver_self = self
 
@@ -720,55 +856,125 @@ class VoiceReceiver:
                 data = msg.get("d", {})
                 ssrc = data.get("ssrc")
                 user_id = data.get("user_id")
-                if ssrc and user_id:
+                with receiver_self._lock:
+                    receiver_active = receiver_self._running
+                if ssrc and user_id and receiver_active:
                     logger.info("SPEAKING event: ssrc=%d -> user=%s", ssrc, user_id)
                     receiver_self.map_ssrc(int(ssrc), int(user_id))
             if original_hook:
                 await original_hook(ws, msg)
+
+        # Set on connection state (for future reconnects)
+        self._hook_connection = conn
+        self._original_connection_hook = original_hook
+        self._installed_speaking_hook = wrapped_hook
         conn.hook = wrapped_hook
+        # Set on the current live websocket (for immediate effect)
         try:
             from discord.utils import MISSING
             if hasattr(conn, 'ws') and conn.ws is not MISSING:
+                self._original_ws_hook = getattr(conn.ws, "_hook", None)
                 conn.ws._hook = wrapped_hook
                 logger.info("Speaking hook installed on live websocket")
         except Exception as e:
             logger.warning("Could not install hook on live ws: %s", e)
 
-    # --- Packet handler (called from SocketReader thread) ---
+    def _restore_speaking_hook(self) -> None:
+        conn = self._hook_connection
+        installed = self._installed_speaking_hook
+        if conn is None or installed is None:
+            return
+        try:
+            if getattr(conn, "hook", None) is installed:
+                conn.hook = self._original_connection_hook
+            ws = getattr(conn, "ws", None)
+            if ws is not None and getattr(ws, "_hook", None) is installed:
+                ws._hook = self._original_ws_hook
+        except Exception as exc:
+            logger.debug("Could not restore speaking hook: %s", exc)
+        finally:
+            self._hook_connection = None
+            self._installed_speaking_hook = None
+            self._original_connection_hook = None
+            self._original_ws_hook = None
+
+    # ------------------------------------------------------------------
+    # Packet handler (called from SocketReader thread)
+    # ------------------------------------------------------------------
+
+    def _snapshot_packet_generation(
+        self,
+        ssrc: int,
+    ) -> tuple[int, int, int]:
+        with self._lock:
+            return (
+                self._capture_generation,
+                self._ssrc_generation.get(ssrc, 0),
+                int(self._ssrc_to_user.get(ssrc, 0)),
+            )
+
+    def _packet_generation_is_current(
+        self,
+        ssrc: int,
+        capture_generation: int,
+        ssrc_generation: int,
+        user_id: int,
+    ) -> bool:
+        return (
+            self._running
+            and not self._paused
+            and self._capture_generation == capture_generation
+            and self._ssrc_generation.get(ssrc, 0) == ssrc_generation
+            and int(self._ssrc_to_user.get(ssrc, 0)) == user_id
+        )
 
     def _on_packet(self, data: bytes):
         if not self._running or self._paused:
             return
+
+        # Log first few raw packets for debugging
         self._packet_debug_count += 1
         if self._packet_debug_count <= 5:
             logger.debug(
                 "Raw UDP packet: len=%d, first_bytes=%s",
                 len(data), data[:4].hex() if len(data) >= 4 else "short",
             )
+
         if len(data) < 16:
             return
-        # RTP v2: top 2 bits 10 (rest varies); voice payload type (byte 1 & 0x7F) is 0x78.
+
+        # RTP version check: top 2 bits must be 10 (version 2).
+        # Lower bits may vary (padding, extension, CSRC count).
+        # Payload type (byte 1 lower 7 bits) = 0x78 (120) for voice.
         if (data[0] >> 6) != 2 or (data[1] & 0x7F) != 0x78:
             if self._packet_debug_count <= 5:
                 logger.debug("Skipped non-RTP: byte0=0x%02x byte1=0x%02x", data[0], data[1])
             return
+
         first_byte = data[0]
         _, _, seq, timestamp, ssrc = struct.unpack_from(">BBHII", data, 0)
+
+        # Skip bot's own audio
         if ssrc == self._bot_ssrc:
             return
+        packet_generation = self._snapshot_packet_generation(ssrc)
+
         # Calculate dynamic RTP header size (RFC 9335 / rtpsize mode)
         cc = first_byte & 0x0F  # CSRC count
         has_extension = bool(first_byte & 0x10)  # extension bit
         has_padding = bool(first_byte & 0x20)  # padding bit (RFC 3550 §5.1)
         header_size = 12 + (4 * cc) + (4 if has_extension else 0)
+
         if len(data) < header_size + 4:  # need at least header + nonce
             return
+
         # Read extension length from preamble (for skipping after decrypt)
         ext_data_len = 0
         if has_extension:
             ext_preamble_offset = 12 + (4 * cc)
             ext_words = struct.unpack_from(">H", data, ext_preamble_offset + 2)[0]
             ext_data_len = ext_words * 4
+
         if self._packet_debug_count <= 10:
             with self._lock:
                 known_user = self._ssrc_to_user.get(ssrc, "unknown")
@@ -776,14 +982,17 @@ class VoiceReceiver:
                 "RTP packet: ssrc=%d, seq=%d, user=%s, hdr=%d, ext_data=%d",
                 ssrc, seq, known_user, header_size, ext_data_len,
             )
+
         header = bytes(data[:header_size])
         payload_with_nonce = data[header_size:]
+
         # --- NaCl transport decrypt (aead_xchacha20_poly1305_rtpsize) ---
         if len(payload_with_nonce) < 4:
             return
         nonce = bytearray(24)
         nonce[:4] = payload_with_nonce[-4:]
         encrypted = bytes(payload_with_nonce[:-4])
+
         try:
             import nacl.secret  # noqa: E402 — delayed import, only in voice path
             box = nacl.secret.Aead(self._secret_key)
@@ -792,14 +1001,22 @@ class VoiceReceiver:
             if self._packet_debug_count <= 10:
                 logger.warning("NaCl decrypt failed: %s (hdr=%d, enc=%d)", e, header_size, len(encrypted))
             return
+
         # Skip encrypted extension data to get the actual opus payload
         if ext_data_len and len(decrypted) > ext_data_len:
             decrypted = decrypted[ext_data_len:]
-        # Strip RTP padding (RFC 3550 §5.1): last payload byte is the count; leaving it corrupts DAVE/Opus.
+
+        # --- Strip RTP padding (RFC 3550 §5.1) ---
+        # When the P bit is set, the last payload byte holds the count of
+        # trailing padding bytes (including itself) that must be removed
+        # before further processing. Skipping this passes padding-contaminated
+        # bytes into DAVE/Opus and corrupts inbound audio.
         if has_padding:
             if not decrypted:
                 if self._packet_debug_count <= 10:
-                    logger.warning("RTP padding bit set but no payload (ssrc=%d)", ssrc)
+                    logger.warning(
+                        "RTP padding bit set but no payload (ssrc=%d)", ssrc,
+                    )
                 return
             pad_len = decrypted[-1]
             if pad_len == 0 or pad_len > len(decrypted):
@@ -811,11 +1028,12 @@ class VoiceReceiver:
                 return
             decrypted = decrypted[:-pad_len]
             if not decrypted:
+                # Padding consumed entire payload — nothing to decode
                 return
+
         # --- DAVE E2EE decrypt ---
         if self._dave_session:
-            with self._lock:
-                user_id = self._ssrc_to_user.get(ssrc, 0)
+            user_id = packet_generation[2]
             if user_id:
                 try:
                     import davey
@@ -828,21 +1046,133 @@ class VoiceReceiver:
                         if self._packet_debug_count <= 10:
                             logger.warning("DAVE decrypt failed for ssrc=%d: %s", ssrc, e)
                         return
-            # Unknown SSRC (no SPEAKING yet): skip DAVE, try Opus directly; user_id arrives with SPEAKING.
+            # If SSRC unknown (no SPEAKING event yet), skip DAVE and try
+            # Opus decode directly — audio may be in passthrough mode.
+            # Buffer will get a user_id when SPEAKING event arrives later.
+
+        # --- Opus decode -> PCM ---
         try:
-            if ssrc not in self._decoders:
-                self._decoders[ssrc] = discord.opus.Decoder()
-            pcm = self._decoders[ssrc].decode(decrypted)
             with self._lock:
-                self._buffers[ssrc].extend(pcm)
-                self._last_packet_time[ssrc] = time.monotonic()
+                if not self._packet_generation_is_current(
+                    ssrc,
+                    *packet_generation,
+                ):
+                    return
+                decoder = self._decoders.get(ssrc)
+                if decoder is None:
+                    if len(self._decoders) >= self.MAX_ACTIVE_SSRC_BUFFERS:
+                        return
+                    decoder = discord.opus.Decoder()
+                    self._decoders[ssrc] = decoder
+            pcm = decoder.decode(decrypted)
+            self._buffer_decoded_pcm(ssrc, pcm, *packet_generation)
         except Exception as e:
             with self._lock:
                 self._decoders.pop(ssrc, None)
-            logger.debug("Opus decode error for SSRC %s; reset decoder: %s", ssrc, e)
+            logger.debug(
+                "Opus decode error for SSRC %s; reset decoder: %s",
+                ssrc,
+                e,
+            )
             return
 
-    # --- Silence detection ---
+    def _buffer_decoded_pcm(
+        self,
+        ssrc: int,
+        pcm: bytes,
+        capture_generation: Optional[int] = None,
+        ssrc_generation: Optional[int] = None,
+        user_id: Optional[int] = None,
+    ) -> None:
+        """Buffer PCM locally and queue only explicitly mapped frames."""
+        if not pcm:
+            return
+        with self._lock:
+            if capture_generation is None:
+                capture_generation = self._capture_generation
+            if ssrc_generation is None:
+                ssrc_generation = self._ssrc_generation.get(ssrc, 0)
+            if user_id is None:
+                user_id = int(self._ssrc_to_user.get(ssrc, 0))
+            if not self._packet_generation_is_current(
+                ssrc,
+                capture_generation,
+                ssrc_generation,
+                user_id,
+            ):
+                return
+            if (
+                ssrc not in self._buffers
+                and len(self._buffers) >= self.MAX_ACTIVE_SSRC_BUFFERS
+            ):
+                return
+            buf = self._buffers[ssrc]
+            remaining = self.MAX_UTTERANCE_BYTES - len(buf)
+            accepted = bytes(pcm[:remaining]) if remaining > 0 else b""
+            if accepted:
+                buf.extend(accepted)
+            self._last_packet_time[ssrc] = time.monotonic()
+            if (
+                user_id
+                and accepted
+                and self._stream_chunk_bytes + len(accepted)
+                <= self.MAX_STREAM_QUEUE_BYTES
+            ):
+                self._stream_chunks.append(
+                    (
+                        capture_generation,
+                        ssrc,
+                        ssrc_generation,
+                        int(user_id),
+                        accepted,
+                    )
+                )
+                self._stream_chunk_bytes += len(accepted)
+
+    def snapshot_sources(self) -> dict:
+        """Bind utterances to current capture and SSRC generations before extraction."""
+        with self._lock:
+            sources = defaultdict(list)
+            for ssrc, user_id in self._ssrc_to_user.items():
+                if user_id:
+                    sources[user_id].append((self._capture_generation, ssrc,
+                                             self._ssrc_generation.get(ssrc, 0), user_id))
+            return {user_id: tuple(tokens) for user_id, tokens in sources.items()}
+
+    def drain_stream_chunks(self) -> list[tuple[int, int, int, int, bytes]]:
+        """Return current-generation explicitly mapped chunks exactly once."""
+        with self._lock:
+            queued = self._stream_chunks
+            self._stream_chunks = []
+            self._stream_chunk_bytes = 0
+            chunks = [
+                (capture, ssrc, generation, user_id, pcm)
+                for capture, ssrc, generation, user_id, pcm in queued
+                if self._capture_generation == capture
+                and self._ssrc_to_user.get(ssrc) == user_id
+                and self._ssrc_generation.get(ssrc) == generation
+            ]
+        return chunks
+
+    def stream_chunk_is_current(
+        self,
+        capture_generation: int,
+        ssrc: int,
+        generation: int,
+        user_id: int,
+    ) -> bool:
+        with self._lock:
+            return (
+                self._running
+                and not self._paused
+                and self._capture_generation == capture_generation
+                and self._ssrc_to_user.get(ssrc) == user_id
+                and self._ssrc_generation.get(ssrc) == generation
+            )
+
+    # ------------------------------------------------------------------
+    # Silence detection
+    # ------------------------------------------------------------------
 
     def _infer_user_for_ssrc(self, ssrc: int) -> int:
         """Infer user_id for an unmapped SSRC: after a bot rejoin Discord may not resend
@@ -859,7 +1189,7 @@ class VoiceReceiver:
             ]
             if len(candidates) == 1:
                 uid = candidates[0]
-                self._ssrc_to_user[ssrc] = uid
+                self.map_ssrc(ssrc, uid)
                 logger.info("Auto-mapped ssrc=%d -> user=%d (sole allowed member)", ssrc, uid)
                 return uid
         except Exception:
@@ -870,33 +1200,43 @@ class VoiceReceiver:
         """Return list of (user_id, pcm_bytes) for completed utterances."""
         now = time.monotonic()
         completed = []
+
         with self._lock:
             ssrc_user_map = dict(self._ssrc_to_user)
             ssrc_list = list(self._buffers.keys())
+
             for ssrc in ssrc_list:
                 last_time = self._last_packet_time.get(ssrc, now)
                 silence_duration = now - last_time
                 buf = self._buffers[ssrc]
                 # 48kHz, 16-bit, stereo = 192000 bytes/sec
                 buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
-                if silence_duration >= self.SILENCE_THRESHOLD and buf_duration >= self.MIN_SPEECH_DURATION:
+
+                turn_complete = (
+                    silence_duration >= self.SILENCE_THRESHOLD
+                    or len(buf) >= self.MAX_UTTERANCE_BYTES
+                )
+                if turn_complete and buf_duration >= self.MIN_SPEECH_DURATION:
                     user_id = ssrc_user_map.get(ssrc, 0)
-                    if not user_id:
-                        # SSRC unmapped (SPEAKING missing after rejoin) — infer from channel.
+                    if not user_id and not self.require_explicit_mapping:
                         user_id = self._infer_user_for_ssrc(ssrc)
                     if user_id:
                         completed.append((user_id, bytes(buf)))
-                    self._buffers[ssrc] = bytearray()
+                    self._buffers.pop(ssrc, None)
                     self._last_packet_time.pop(ssrc, None)
                 elif silence_duration >= self.SILENCE_THRESHOLD * 2:
                     # Stale buffer with no valid user — discard
                     self._buffers.pop(ssrc, None)
                     self._last_packet_time.pop(ssrc, None)
+                if ssrc not in self._buffers and not self._ssrc_to_user.get(ssrc):
+                    self._decoders.pop(ssrc, None)
+
         return completed
 
     def flush_pending(self) -> list:
         """Return buffered utterances that have not yet reached silence."""
         completed = []
+
         with self._lock:
             ssrc_user_map = dict(self._ssrc_to_user)
             for ssrc, buf in list(self._buffers.items()):
@@ -904,15 +1244,20 @@ class VoiceReceiver:
                 buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
                 if buf_duration >= self.MIN_SPEECH_DURATION:
                     user_id = ssrc_user_map.get(ssrc, 0)
-                    if not user_id:
+                    if not user_id and not self.require_explicit_mapping:
                         user_id = self._infer_user_for_ssrc(ssrc)
                     if user_id:
                         completed.append((user_id, bytes(buf)))
                 self._buffers.pop(ssrc, None)
                 self._last_packet_time.pop(ssrc, None)
+                if not self._ssrc_to_user.get(ssrc):
+                    self._decoders.pop(ssrc, None)
+
         return completed
 
-    # --- PCM -> WAV conversion (for Whisper STT) ---
+    # ------------------------------------------------------------------
+    # PCM -> WAV conversion (for Whisper STT)
+    # ------------------------------------------------------------------
 
     @staticmethod
     def pcm_to_wav(pcm_data: bytes, output_path: str, src_rate: int = 48000, src_channels: int = 2):
@@ -994,6 +1339,41 @@ def _read_discord_prompt_timeout() -> int:
 from plugins.platforms.discord.adapter_media import DiscordMediaMixin
 
 
+def _read_discord_stt_settings() -> tuple[str, dict]:
+    """Return the selected Discord voice STT mode and merged config."""
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config() or {}
+    except Exception:
+        config = {}
+    discord_config = config.get("discord")
+    discord_config = discord_config if isinstance(discord_config, dict) else {}
+    voice_stt = discord_config.get("voice_stt")
+    voice_stt = voice_stt if isinstance(voice_stt, dict) else {}
+    from plugins.platforms.discord.live_transcription import (
+        normalize_discord_stt_mode,
+    )
+
+    mode = normalize_discord_stt_mode(voice_stt.get("mode", "configured"))
+    return mode, config
+
+def _stt_enabled_in_config(config: dict) -> bool:
+    stt_config = config.get("stt")
+    stt_config = stt_config if isinstance(stt_config, dict) else {}
+    from tools.transcription_tools import is_stt_enabled
+    return is_stt_enabled(stt_config)
+
+def _read_runtime_stt_enabled() -> bool:
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config() or {}
+    except Exception:
+        return False
+    return _stt_enabled_in_config(config)
+
+
 class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     """Discord bot adapter: guild/DM messages, threads, slash commands, button approvals, reactions."""
 
@@ -1034,6 +1414,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         # Text batching: merge rapid successive messages (Telegram-style)
         self._text_batch_delay_seconds = env_float("HERMES_DISCORD_TEXT_BATCH_DELAY_SECONDS", 0.6)
         self._text_batch_split_delay_seconds = env_float("HERMES_DISCORD_TEXT_BATCH_SPLIT_DELAY_SECONDS", 2.0)
+        # A tagged bot may emit one logical response as several Discord
+        # messages. Keep its unmentioned continuation chunks eligible for the
+        # existing text batcher during this short, sender-scoped window.
+        self._bot_tag_debounce_until: Dict[str, float] = {}
         self._voice_text_channels: Dict[int, int] = {}  # guild_id -> text_channel_id
         self._voice_sources: Dict[int, Dict[str, Any]] = {}  # guild_id -> linked text channel source metadata
         self._voice_timeout_tasks: Dict[int, asyncio.Task] = {}  # guild_id -> timeout task
@@ -1041,6 +1425,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         self._playback_timeout_seconds = self._load_playback_timeout()
         self._voice_receivers: Dict[int, VoiceReceiver] = {}  # guild_id -> VoiceReceiver
         self._voice_listen_tasks: Dict[int, asyncio.Task] = {}  # guild_id -> listen loop
+        self._voice_stt_modes: Dict[int, str] = {}  # latched on fresh join
+        self._voice_live_transcribers: Dict[int, Any] = {}
         self._voice_input_callback: Optional[Callable] = None  # set by run.py
         self._on_voice_disconnect: Optional[Callable] = None  # set by run.py
         # Voice-reply mode ("off"|"voice_only"|"all") per linked text-channel id (set by run.py) so
@@ -1335,6 +1721,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     and after.channel is not None
                     and before.channel != after.channel
                 )
+                if left or switched:
+                    await adapter_self._revoke_voice_stt_user(guild_id, member.id)
                 if joined or left or switched:
                     logger.info(
                         "Voice state: %s (%d) %s (guild %d)",
@@ -1434,13 +1822,19 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         role_authorized = False
         if getattr(message.author, "bot", False):
             allow_bots = self._get_allow_bots()
+            bot_tag_continuation = self._is_bot_tag_debounce_continuation(message)
             if allow_bots == "none":
                 return False, False
-            if allow_bots == "mentions" and not self._self_is_explicitly_mentioned(message):
+            if (
+                allow_bots == "mentions"
+                and not self._self_is_explicitly_mentioned(message)
+                and not bot_tag_continuation
+            ):
                 return False, False
             if (
                 self._discord_bots_require_inline_mention()
                 and not self._self_is_raw_mentioned(message)
+                and not bot_tag_continuation
             ):
                 return False, False
         else:
@@ -1471,13 +1865,27 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 return False, False
             ignore_no_mention = _scoped_gate_env("DISCORD_IGNORE_NO_MENTION", "true").lower() in {"true", "1", "yes"}
             if ignore_no_mention and not raw_self_mention and not other_bots_mentioned:
-                parent_id = None
-                if hasattr(message.channel, "parent_id") and message.channel.parent_id:
-                    parent_id = str(message.channel.parent_id)
-                free_channels = self._discord_free_response_channels()
-                channel_keys = self._discord_channel_keys(message, parent_id)
-                if "*" not in free_channels and not (channel_keys & free_channels):
-                    return False, False
+                # A thread the bot joined is not someone else's conversation, and the other two
+                # ingress paths already exempt it: _dispatch_recovered_message() and
+                # _handle_message(). Admission runs on both and can veto what they admit, so
+                # without this a third-party mention in a bot thread is dropped here even though
+                # the same message with no mention at all is admitted. ``thread_require_mention``
+                # still gates multi-bot threads, inside _in_bot_thread().
+                if not self._in_bot_thread(message):
+                    parent_id = None
+                    if hasattr(message.channel, "parent_id") and message.channel.parent_id:
+                        parent_id = str(message.channel.parent_id)
+                    free_channels = self._discord_free_response_channels()
+                    channel_keys = self._discord_channel_keys(message, parent_id)
+                    if "*" not in free_channels and not (channel_keys & free_channels):
+                        # Every other silent return in this function is at least guessable from
+                        # the outside; this one is not, and an operator seeing no log line cannot
+                        # tell it apart from the gateway never receiving the event.
+                        logger.debug(
+                            "[%s] admission: dropping message %s — mentions others, not self, "
+                            "not a bot thread, channel not free-response",
+                            self.name, getattr(message, "id", "?"))
+                        return False, False
         return True, role_authorized
 
     async def _dispatch_discord_message(self, message: Any) -> bool:
@@ -1490,6 +1898,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         admitted, role_authorized = self._discord_message_admission(message, claim=True)
         if not admitted:
             return False
+        self._record_bot_tag_debounce(message)
         return await self._handle_message(message, role_authorized=role_authorized)
 
     # --- gateway_platform_event fire-sites ---
@@ -1661,6 +2070,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             return
         self._liveness_task = asyncio.create_task(self._liveness_loop())
 
+    # Reasons from ``_read_websocket_health`` that mean the transport is confirmed dead,
+    # not merely suspect: ``_liveness_loop`` escalates on the first such strike (#118487).
+    _TERMINAL_HEALTH_REASONS = frozenset({"socket_closed", "client_closed"})
+
     def _read_websocket_health(self, client: Any) -> tuple[bool, str]:
         """Return current Discord Gateway health without making a REST request."""
         try:
@@ -1722,6 +2135,12 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 return
             client = self._client
             if not self._running or client is None or self._disconnecting:
+                # The probe must never disappear silently (#118487): an exit here leaves the
+                # gateway with no watchdog, so say why before going away.
+                logger.info(
+                    "[%s] Discord liveness probe exiting (running=%s, client=%s, disconnecting=%s)",
+                    self.name, self._running, client is not None, self._disconnecting,
+                )
                 return
             try:
                 healthy, reason = self._read_websocket_health(client)
@@ -1730,6 +2149,14 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 healthy = False
                 reason = "health_check_error"
             if healthy:
+                if failures:
+                    # discord.py swaps in a fresh socket while resuming, so a transport-side
+                    # sample can read healthy again while events never resumed (#118487) —
+                    # logging the reset keeps that distinguishable from a dead probe task.
+                    logger.info(
+                        "[%s] Discord Gateway WebSocket healthy again after %d unhealthy sample(s)",
+                        self.name, failures,
+                    )
                 failures = 0
                 continue
             failures += 1
@@ -1737,13 +2164,18 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 "[%s] Discord Gateway WebSocket unhealthy (%s, %d/%d)", self.name, reason, failures,
                 threshold,
             )
-            if failures < threshold:
+            # A closed transport is a confirmed death, not a suspicion: escalate on the
+            # first strike; soft signals keep the threshold (#118487).
+            terminal = reason in self._TERMINAL_HEALTH_REASONS
+            if failures < threshold and not terminal:
                 continue
             # Mark recovery before closing: Bot.start()'s done callback must not overwrite this reason.
             self._disconnecting = True
             logger.error(
-                "[%s] Discord Gateway WebSocket remained unhealthy (%s); forcing reconnect",
-                self.name, reason,
+                "[%s] Discord Gateway WebSocket %s (%s, %d/%d); forcing reconnect",
+                self.name,
+                "transport closed" if terminal else "remained unhealthy",
+                reason, failures, threshold,
             )
             self._set_fatal_error(
                 "discord_websocket_health_stale",
@@ -1906,7 +2338,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             path = self._command_sync_state_path()
             if not path.exists():
                 return {}
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
         except Exception:
             return {}
         return data if isinstance(data, dict) else {}
@@ -2131,16 +2563,16 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         configured = self.config.extra.get("missed_message_backfill")
         if isinstance(configured, dict) and "channels" in configured:
             raw = configured.get("channels")
-            if isinstance(raw, list):
-                return {str(item).strip() for item in raw if str(item).strip()}
-            raw = str(raw or "")
-            if raw.strip():
-                return {item.strip() for item in raw.split(",") if item.strip()}
+            channels = self._gate_csv_set(raw)
+            # An explicit list (YAML list or JSON-list string, even empty) is authoritative — the
+            # operator disabled the scan; only the default "" string falls through to the env/default.
+            if channels or isinstance(_decode_json_list_literal(raw), list):
+                return channels
         raw = self._gate_env("DISCORD_MISSED_MESSAGE_BACKFILL_CHANNELS")
         if not raw.strip():
             allowed = self._get_allowed_channels()
             return allowed | self._discord_free_response_channels()
-        return {item.strip() for item in raw.split(",") if item.strip()}
+        return self._gate_csv_set(raw)
 
     def _missed_message_backfill_number(self, key: str, env_key: str, default, cast, lo, hi=None):
         """Numeric ``missed_message_backfill.<key>`` (dict extra wins over env), clamped to [lo, hi]."""
@@ -2162,6 +2594,13 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     def _missed_message_backfill_max_dispatches(self) -> int:
         return self._missed_message_backfill_number(
             "max_dispatches", "DISCORD_MISSED_MESSAGE_BACKFILL_MAX_DISPATCHES", 10, int, 1, 100)
+
+    def _missed_message_backfill_max_attempts(self) -> int:
+        """Lifetime re-dispatch ceiling for ONE message, independent of completion state:
+        ``max_dispatches`` caps a scan, not a row, so without this any message whose completion
+        can never be recorded is re-run on every reconnect (#113631)."""
+        return self._missed_message_backfill_number(
+            "max_attempts", "DISCORD_MISSED_MESSAGE_BACKFILL_MAX_ATTEMPTS", 3, int, 1, 100)
 
     def _ensure_missed_message_backfill_task(self) -> asyncio.Task:
         """Return the active recovery task, or start one when none is running."""
@@ -2327,20 +2766,25 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             iterators = next_round
 
     async def _iter_channel_and_thread_messages(self, channel: Any, *, limit: int, after: Any, seen_channels: set[str]):
-        """Yield history from a channel plus active/recent archived child threads."""
+        """Yield history from a channel plus active/recent archived child threads. ``after`` is the
+        scan-window floor; a stored cursor may only narrow it, never widen it, and it is never
+        inherited by child threads (each thread has its own cursor)."""
         channel_key = str(getattr(channel, "id", ""))
         if not channel_key or channel_key in seen_channels:
             return
         seen_channels.add(channel_key)
+        channel_after = after
         cursor = self._discord_recovery_cursor(channel_key)
         if cursor:
             with suppress(ValueError, TypeError):
-                after = discord.Object(id=int(cursor))
+                cursor_id = int(cursor)
+                if not isinstance(after, dt.datetime) or _discord_snowflake_time(cursor_id) > after:
+                    channel_after = discord.Object(id=cursor_id)
         history = getattr(channel, "history", None)
         if callable(history):
             try:
                 # Fetch the latest N then restore order; oldest_first=True could starve newer work forever.
-                history_iter = history(limit=limit, after=after, oldest_first=False)
+                history_iter = history(limit=limit, after=channel_after, oldest_first=False)
                 messages = []
                 async for message in history_iter:  # type: ignore[attr-defined]
                     messages.append(message)
@@ -2402,6 +2846,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         if self._discord_message_is_persistently_complete(str(getattr(message, "id", ""))):
             return False
         if self._discord_message_has_active_claim(str(getattr(message, "id", ""))):
+            return False
+        if self._discord_message_attempts_exhausted(str(getattr(message, "id", ""))):
             return False
         # A success reaction is only an ack, not evidence the substantive response completed.
         return not await self._message_has_non_down_bot_response(message)
@@ -2477,8 +2923,15 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         now = self._utc_now_iso()
 
         def _op(conn):
-            existing = conn.execute("SELECT status FROM discord_messages WHERE message_id=?", (message_id,)).fetchone()
-            final_status = existing[0] if existing and existing[0] == "responded" else status
+            existing = conn.execute(
+                "SELECT status, updated_at FROM discord_messages WHERE message_id=?", (message_id,),
+            ).fetchone()
+            # "discovered" only says the scan saw the row: it never overwrites a completed row or an
+            # in-flight claim (queued/processing) — the active-claim guard reads that status and its
+            # original updated_at, so a died dispatch still expires after the 10-minute window.
+            keep = bool(existing) and (existing[0] == "responded" or status == "discovered")
+            final_status = existing[0] if keep else status
+            updated_at = (existing[1] or now) if keep else now
             conn.execute(
                 """
                 INSERT INTO discord_messages (message_id, channel_id, thread_id, parent_channel_id, author_id, created_at, status, updated_at)
@@ -2492,7 +2945,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     status=?,
                     updated_at=excluded.updated_at
                 """,
-                (message_id, channel_id, thread_id, parent_id, author_id, created_text, final_status, now, final_status),
+                (message_id, channel_id, thread_id, parent_id, author_id, created_text, final_status, updated_at, final_status),
             )
         self._with_discord_recovery_db(_op)
 
@@ -2504,15 +2957,18 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         if not message_id:
             return
         now = self._utc_now_iso()
+        # ``attempts`` counts dispatches (the "queued" transition) so max_attempts is a ceiling on
+        # how many times one message is re-run, not on how many state transitions it saw.
+        dispatched = 1 if status == "queued" else 0
 
         def _op(conn):
             conn.execute(
                 """
                 UPDATE discord_messages
-                   SET status=?, attempts=attempts+1, last_attempt_at=?, last_error=?, updated_at=?
+                   SET status=?, attempts=attempts+?, last_attempt_at=?, last_error=?, updated_at=?
                  WHERE message_id=?
                 """,
-                (status, now, error, now, message_id),
+                (status, dispatched, now, error, now, message_id),
             )
         self._with_discord_recovery_db(_op)
 
@@ -2539,8 +2995,20 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         message_id = str(getattr(getattr(event, "raw_message", None), "id", "") or getattr(event, "message_id", "") or "")
         if not message_id:
             return
-        status = "processed" if outcome == ProcessingOutcome.SUCCESS else ("cancelled" if outcome == ProcessingOutcome.CANCELLED else "failed")
         now = self._utc_now_iso()
+        if outcome == ProcessingOutcome.SUCCESS:
+            # SUCCESS means the base delivered the final (or the stream already had). Attribute it
+            # to the inbound id here: streamed/edited finals, fresh-final sends and media-only replies
+            # carry no reply anchor (reply_to_mode "off" never does), so the send-path ledger writer
+            # cannot mark the row and backfill would re-dispatch it on every reconnect (#113631).
+            def _complete(conn):
+                conn.execute(
+                    "UPDATE discord_messages SET status='responded', replied=1, updated_at=? WHERE message_id=?",
+                    (now, message_id),
+                )
+            self._with_discord_recovery_db(_complete)
+            return
+        status = "cancelled" if outcome == ProcessingOutcome.CANCELLED else "failed"
 
         def _op(conn):
             conn.execute(
@@ -2551,10 +3019,13 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             )
         self._with_discord_recovery_db(_op)
 
-    async def _record_response_async(self, reply_to, result: SendResult, content: str, final: bool) -> SendResult:
-        """Record a send outcome in the recovery ledger off-loop and hand back ``result``."""
+    async def _record_response_async(
+        self, reply_to, result: SendResult, content: str, final: bool, metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Record a send outcome using its visual or internal reply anchor."""
+        ledger_reply_to = reply_to or (metadata or {}).get("reply_to_message_id")
         await asyncio.to_thread(
-            self._record_discord_response, reply_to=reply_to, result=result, content=content, final=final,
+            self._record_discord_response, reply_to=ledger_reply_to, result=result, content=content, final=final,
         )
         return result
 
@@ -2621,6 +3092,23 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             ).fetchone()
             return bool(row and row[0] in {"queued", "processing"} and row[1] >= cutoff)
         return bool(self._with_discord_recovery_db(_op, default=True))
+
+    def _discord_message_attempts_exhausted(self, message_id: str) -> bool:
+        """True once a row has been dispatched ``max_attempts`` times (any outcome)."""
+        if not message_id:
+            return False
+        cap = self._missed_message_backfill_max_attempts()
+
+        def _op(conn):
+            row = conn.execute("SELECT attempts FROM discord_messages WHERE message_id=?", (message_id,)).fetchone()
+            return bool(row and int(row[0] or 0) >= cap)
+        exhausted = bool(self._with_discord_recovery_db(_op, default=False))
+        if exhausted:
+            logger.debug(
+                "[%s] Not re-dispatching Discord message %s: missed_message_backfill.max_attempts (%d) reached",
+                self.name, message_id, cap,
+            )
+        return exhausted
 
     def _record_recovery_scan_start(self, channels: set[str]) -> str:
         scan_id = f"{int(time.time() * 1000)}-{os.getpid()}"
@@ -2883,7 +3371,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             f"{dropped_chars} characters were not delivered; the full "
             f"response is in the session logs."
         )
-        kept.append(notice)
+        if self.warning_text(notice):
+            kept.append(notice)
         return kept
 
     async def send(
@@ -2906,7 +3395,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             )
             result = SendResult(success=False, error="Refusing to send empty message")
             # Backfill replays from this table: record the dropped final reply as failed or it is lost.
-            return await self._record_response_async(reply_to, result, content, bool(metadata and metadata.get("notify")))
+            return await self._record_response_async(reply_to, result, content, bool(metadata and metadata.get("notify")), metadata)
         try:
             thread_id = None
             if metadata and metadata.get("thread_id"):
@@ -2924,7 +3413,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
                 result = await self._send_to_forum(channel, content)
-                return await self._record_response_async(reply_to, result, content, final_delivery)
+                return await self._record_response_async(reply_to, result, content, final_delivery, metadata)
             formatted = self.format_message(content)
             chunks = self._cap_split_chunks(
                 self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
@@ -2964,7 +3453,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 message_id=message_ids[0] if message_ids else None,
                 raw_response={"message_ids": message_ids}
             )
-            return await self._record_response_async(reply_to, result, content, final_delivery)
+            return await self._record_response_async(reply_to, result, content, final_delivery, metadata)
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
             if _is_discord_transport_error(e):
@@ -2972,7 +3461,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 result = SendResult(success=False, error="send_path_degraded", retryable=True)
             else:
                 result = SendResult(success=False, error=str(e))
-            return await self._record_response_async(reply_to, result, content, bool(metadata and metadata.get("notify")))
+            return await self._record_response_async(reply_to, result, content, bool(metadata and metadata.get("notify")), metadata)
 
     @staticmethod
     def _forum_thread_parts(thread: Any) -> tuple:
@@ -3432,6 +3921,208 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         mixers = getattr(self, "_voice_mixers", None)
         return bool(mixers) and mixers.get(guild_id) is not None
 
+    async def _activate_voice_stt_mode(
+        self,
+        guild_id: int,
+        mode: str,
+        config: dict,
+    ) -> None:
+        """Latch one mode for a voice join and own its Live controller."""
+        modes = getattr(self, "_voice_stt_modes", None)
+        if modes is None:
+            self._voice_stt_modes = modes = {}
+        controllers = getattr(self, "_voice_live_transcribers", None)
+        if controllers is None:
+            self._voice_live_transcribers = controllers = {}
+
+        existing = controllers.get(guild_id)
+        if not _stt_enabled_in_config(config):
+            if existing is not None:
+                controllers.pop(guild_id, None)
+                await existing.close()
+            if mode != "configured":
+                raise ValueError("Discord optional STT modes require stt.enabled")
+            modes[guild_id] = mode
+            logger.info("Discord voice STT disabled for guild %d", guild_id)
+            return
+
+        if mode == "openai_live_high":
+            from plugins.platforms.discord.live_transcription import (
+                DiscordLiveTranscriptionController,
+                LiveTranscriptionConfig,
+                resolve_openai_realtime_api_key,
+            )
+
+            live_config = LiveTranscriptionConfig.from_hermes_config(config)
+            api_key = resolve_openai_realtime_api_key(config)
+            replacement = DiscordLiveTranscriptionController(
+                api_key=api_key,
+                config=live_config,
+            )
+            if existing is not None:
+                await existing.close()
+            controllers[guild_id] = replacement
+        elif existing is not None:
+            controllers.pop(guild_id, None)
+            await existing.close()
+        modes[guild_id] = mode
+        logger.info("Discord voice STT mode for guild %d: %s", guild_id, mode)
+
+    async def _close_voice_stt_mode(self, guild_id: int) -> None:
+        modes = getattr(self, "_voice_stt_modes", {})
+        modes.pop(guild_id, None)
+        controllers = getattr(self, "_voice_live_transcribers", {})
+        controller = controllers.pop(guild_id, None)
+        if controller is not None:
+            await controller.close()
+
+    def _voice_stt_admission(self, guild_id, receiver, controller, user_id, guild, tokens):
+        """Capture operation-local identity; never resolve a replacement as the owner."""
+        def admitted():
+            return (
+                _read_runtime_stt_enabled()
+                and getattr(self, "_voice_receivers", {}).get(guild_id) is receiver
+                and (controller is None or getattr(self, "_voice_live_transcribers", {}).get(guild_id) is controller)
+                and self._is_allowed_user(str(user_id), guild=guild, is_dm=False)
+                and bool(tokens)
+                and all(receiver.stream_chunk_is_current(*token) for token in tokens)
+            )
+        return admitted
+
+    async def _drain_voice_listener_pcm(
+        self, *, guild_id: int, receiver: VoiceReceiver, stt_mode: str, guild, controller,
+    ) -> None:
+        """Drain admitted PCM only; never extract or commit another utterance."""
+        if (getattr(self, "_voice_receivers", {}).get(guild_id) is not receiver
+                or not _read_runtime_stt_enabled()):
+            return
+        chunks = receiver.drain_stream_chunks()
+        if stt_mode == "openai_live_high" and controller is not None:
+            per_user = defaultdict(list)
+            for capture, ssrc, generation, user_id, pcm in chunks:
+                per_user[user_id].append((capture, ssrc, generation, user_id, pcm))
+            for user_id, user_chunks in per_user.items():
+                tokens = tuple(chunk[:4] for chunk in user_chunks)
+                admit = self._voice_stt_admission(
+                    guild_id, receiver, controller, user_id, guild, tokens)
+                if not admit():
+                    await controller.abort_user(user_id)
+                    continue
+                await controller.append_pcm48(
+                    user_id, b"".join(chunk[4] for chunk in user_chunks), admit=admit)
+                if not admit():
+                    await controller.abort_user(user_id)
+
+    async def _deliver_live_voice_batch(self, guild_id: int, batch) -> None:
+        for controller, user_id, admit, prepared, waiter in batch:
+            # The lexical owner cancels waiters exactly once, even during delivery cleanup.
+            result = await asyncio.shield(waiter)
+            await self._dispatch_live_voice_result(guild_id, user_id, result, admit)
+
+    async def _close_live_voice_batch(self, batch, delivery=None) -> None:
+        children = [entry[4] for entry in batch]
+        if delivery is not None:
+            children.append(delivery)
+        for child in children:
+            if not child.done():
+                child.cancel()
+        await asyncio.gather(*children, return_exceptions=True)
+        for controller, user_id, admit, prepared, waiter in batch:
+            if waiter.cancelled():
+                await controller._retire_prepared_utterance(user_id, prepared)
+        batch.clear()
+
+    async def _close_disabled_voice_stt(self, guild_id, receiver, controller) -> None:
+        if not _read_runtime_stt_enabled():
+            receiver.discard_pending()
+            controllers = getattr(self, "_voice_live_transcribers", {})
+            if controllers.get(guild_id) is controller:
+                controllers.pop(guild_id, None)
+            if controller is not None:
+                await controller.close()
+
+    async def _process_voice_listener_tick(
+        self, *, guild_id: int, receiver: VoiceReceiver, stt_mode: str, guild,
+        flush: bool = False, live_batch=None,
+    ) -> None:
+        """Seal the bounded extracted batch before its listener resumes PCM pumping."""
+        controller = getattr(self, "_voice_live_transcribers", {}).get(guild_id)
+        # Direct ticks and final flush own/await their batch here, without an ingress pump.
+        owns_batch = flush or live_batch is None
+        batch = live_batch if live_batch is not None and not flush else []
+        try:
+            await self._drain_voice_listener_pcm(
+                guild_id=guild_id, receiver=receiver, stt_mode=stt_mode,
+                guild=guild, controller=controller)
+            if not _read_runtime_stt_enabled():
+                return
+            if getattr(self, "_voice_receivers", {}).get(guild_id) is not receiver:
+                return
+            sources = receiver.snapshot_sources() if stt_mode != "configured" else {}
+            completed = receiver.flush_pending() if flush else receiver.check_silence()
+            for user_id, pcm_data in completed:
+                if not _read_runtime_stt_enabled():
+                    return
+                if not self._is_allowed_user(str(user_id), guild=guild, is_dm=False):
+                    if controller is not None:
+                        await controller.abort_user(user_id)
+                    continue
+                # Leave-time flushing must not cancel its own inactivity task.
+                if not flush and hasattr(self, "_voice_timeout_tasks"):
+                    self._reset_voice_timeout(guild_id)
+                if stt_mode == "configured":
+                    if getattr(self, "_voice_receivers", {}).get(guild_id) is receiver:
+                        await self._process_completed_voice_utterance(
+                            guild_id, user_id, pcm_data, stt_mode=stt_mode)
+                    continue
+                admit = self._voice_stt_admission(
+                    guild_id, receiver, controller, user_id, guild, sources.get(user_id, ()))
+                if admit():
+                    if stt_mode == "openai_live_high" and controller is not None:
+                        prepared = await controller._prepare_utterance(
+                            user_id, expected_source_bytes=len(pcm_data), admit=admit)
+                        # Start each timeout after its SEND, not after later SENDs/deliveries.
+                        waiter = asyncio.create_task(controller._wait_for_utterance(user_id, prepared))
+                        batch.append((controller, user_id, admit, prepared, waiter))
+                    else:
+                        await self._process_completed_voice_utterance(
+                            guild_id, user_id, pcm_data, stt_mode=stt_mode, admit=admit)
+                elif controller is not None:
+                    await controller.abort_user(user_id)
+            if owns_batch:
+                await self._deliver_live_voice_batch(guild_id, batch)
+        finally:
+            if owns_batch:
+                await self._close_live_voice_batch(batch)
+            await self._close_disabled_voice_stt(guild_id, receiver, controller)
+
+    async def _revoke_voice_stt_user(self, guild_id: int, user_id: int) -> None:
+        receiver = self._voice_receivers.get(guild_id)
+        if receiver is not None:
+            receiver.unmap_user(user_id)
+        controller = self._voice_live_transcribers.get(guild_id)
+        if controller is not None:
+            await controller.abort_user(user_id)
+
+    async def _discard_disconnected_voice_runtime(self, guild_id: int) -> None:
+        listen_task = self._voice_listen_tasks.pop(guild_id, None)
+        if listen_task is not None:
+            listen_task.cancel()
+            if inspect.isawaitable(listen_task):
+                await asyncio.gather(listen_task, return_exceptions=True)
+        receiver = self._voice_receivers.pop(guild_id, None)
+        if receiver is not None:
+            receiver.stop()
+        await self._close_voice_stt_mode(guild_id)
+        if getattr(self, "_voice_mixers", None) is not None:
+            self._voice_mixers.pop(guild_id, None)
+        self._voice_clients.pop(guild_id, None)
+        timeout_task = self._voice_timeout_tasks.pop(guild_id, None)
+        if timeout_task is not None:
+            timeout_task.cancel()
+        self._voice_text_channels.pop(guild_id, None)
+        self._voice_sources.pop(guild_id, None)
+
     async def join_voice_channel(self, channel, *, text_channel_id: int = None, source: dict = None) -> bool:
         """Join a voice channel; returns True on success. ``text_channel_id`` stores the
         transcription-routing binding so programmatic joins work without ``/voice join``."""
@@ -3447,7 +4138,15 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 await existing.move_to(channel)
                 self._reset_voice_timeout(guild_id)
                 return True
-            vc = await channel.connect()
+            if existing is not None:
+                await self._discard_disconnected_voice_runtime(guild_id)
+            stt_mode, stt_config = _read_discord_stt_settings()
+            await self._activate_voice_stt_mode(guild_id, stt_mode, stt_config)
+            try:
+                vc = await channel.connect()
+            except BaseException:
+                await self._close_voice_stt_mode(guild_id)
+                raise
             self._voice_clients[guild_id] = vc
             self._reset_voice_timeout(guild_id)
             if text_channel_id is not None:
@@ -3456,6 +4155,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 self._voice_sources[guild_id] = source
             try:
                 receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids)
+                receiver.require_explicit_mapping = stt_mode != "configured"
                 receiver.start()
                 self._voice_receivers[guild_id] = receiver
                 self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
@@ -3474,21 +4174,49 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     async def leave_voice_channel(self, guild_id: int) -> None:
         """Disconnect from the voice channel in a guild."""
         async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
-            receiver = self._voice_receivers.pop(guild_id, None)
-            pending_inputs = []
-            if receiver:
-                pending_inputs = receiver.flush_pending()
-                receiver.stop()
+            stt_mode = getattr(self, "_voice_stt_modes", {}).get(
+                guild_id,
+                "configured",
+            )
             listen_task = self._voice_listen_tasks.pop(guild_id, None)
             if listen_task:
                 listen_task.cancel()
-            guild = self._client.get_guild(guild_id) if self._client is not None else None
-            for user_id, pcm_data in pending_inputs:
-                if self._is_allowed_user(str(user_id), guild=guild, is_dm=False):
-                    await self._process_voice_input(guild_id, user_id, pcm_data)
+                if inspect.isawaitable(listen_task):
+                    await asyncio.gather(listen_task, return_exceptions=True)
+            receiver = self._voice_receivers.get(guild_id)
+            controller = getattr(self, "_voice_live_transcribers", {}).get(guild_id)
+            receiver_stopped = False
+            try:
+                if receiver is not None:
+                    guild = self._client.get_guild(guild_id) if self._client is not None else None
+                    if stt_mode == "configured":
+                        pending_inputs = receiver.flush_pending()
+                        receiver.stop()
+                        receiver_stopped = True
+                        if self._voice_receivers.get(guild_id) is receiver:
+                            self._voice_receivers.pop(guild_id, None)
+                        for user_id, pcm_data in pending_inputs:
+                            if self._is_allowed_user(str(user_id), guild=guild, is_dm=False):
+                                await self._process_voice_input(guild_id, user_id, pcm_data)
+                    else:
+                        await self._process_voice_listener_tick(
+                            guild_id=guild_id, receiver=receiver, stt_mode=stt_mode, guild=guild, flush=True)
+            finally:
+                if receiver is not None:
+                    if not receiver_stopped:
+                        receiver.stop()
+                    if self._voice_receivers.get(guild_id) is receiver:
+                        self._voice_receivers.pop(guild_id, None)
+                current = getattr(self, "_voice_live_transcribers", {}).get(guild_id)
+                if current is controller or current is None:
+                    await self._close_voice_stt_mode(guild_id)
+                elif controller is not None:
+                    await controller.close()
+
             # Tear down the mixer (stops the continuous outgoing stream).
             if getattr(self, "_voice_mixers", None) is not None:
                 self._voice_mixers.pop(guild_id, None)
+
             vc = self._voice_clients.pop(guild_id, None)
             if vc and vc.is_connected():
                 try:
@@ -3533,6 +4261,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 logger.warning("Mixer decode failed for %s; falling back to legacy playback", audio_path)
             # Legacy one-shot path: pause receiver while playing (echo prevention).
             receiver = self._voice_receivers.get(guild_id)
+            controller = getattr(self, "_voice_live_transcribers", {}).get(guild_id)
             if receiver:
                 receiver.pause()
             try:
@@ -3572,6 +4301,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 return True
             finally:
                 if receiver:
+                    if controller is not None:
+                        await controller.abort_pending()
                     receiver.resume()
         finally:
             self._reset_voice_timeout(guild_id)
@@ -3695,10 +4426,20 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         receiver = self._voice_receivers.get(guild_id)
         if not receiver:
             return
+        stt_mode = getattr(self, "_voice_stt_modes", {}).get(
+            guild_id,
+            "configured",
+        )
         last_keepalive = time.monotonic()
+        batch = []
+        delivery = None
+        controller = None
         try:
             while receiver._running:
                 await asyncio.sleep(0.2)
+
+                # Send periodic UDP keepalive to prevent Discord from
+                # dropping the UDP session after ~60s of silence.
                 now = time.monotonic()
                 if now - last_keepalive >= self._KEEPALIVE_INTERVAL:
                     last_keepalive = now
@@ -3708,40 +4449,168 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                             vc._connection.send_packet(b'\xf8\xff\xfe')
                     except Exception:
                         pass
-                completed = receiver.check_silence()
-                # Pass guild so role checks stay guild-scoped.
+
                 _vc_guild = self._client.get_guild(guild_id) if self._client is not None else None
-                for user_id, pcm_data in completed:
-                    if not self._is_allowed_user(str(user_id), guild=_vc_guild, is_dm=False):
+                if delivery is not None:
+                    if not delivery.done():
+                        if (not _read_runtime_stt_enabled()
+                                or self._voice_receivers.get(guild_id) is not receiver
+                                or self._voice_live_transcribers.get(guild_id) is not controller):
+                            break
+                        # Existing receiver caps still apply. Later phrases can coalesce
+                        # until this batch is delivered; there is no independent turn queue.
+                        await self._drain_voice_listener_pcm(
+                            guild_id=guild_id, receiver=receiver, stt_mode=stt_mode,
+                            guild=_vc_guild, controller=controller)
                         continue
-                    # User speech is activity too; keeps active listeners connected.
-                    self._reset_voice_timeout(guild_id)
-                    await self._process_voice_input(guild_id, user_id, pcm_data)
+                    await delivery
+                    await self._close_live_voice_batch(batch, delivery)
+                    delivery = None
+                controller = getattr(self, "_voice_live_transcribers", {}).get(guild_id)
+                tick_kwargs: Dict[str, Any] = {}
+                if stt_mode == "openai_live_high":
+                    tick_kwargs["live_batch"] = batch
+                await self._process_voice_listener_tick(
+                    guild_id=guild_id,
+                    receiver=receiver,
+                    stt_mode=stt_mode,
+                    guild=_vc_guild,
+                    **tick_kwargs,
+                )
+                if batch:
+                    # At most four waiters, from the receiver's existing four-buffer cap.
+                    # Every admitted record is already sealed before this task can pump PCM.
+                    delivery = asyncio.create_task(self._deliver_live_voice_batch(guild_id, batch))
         except asyncio.CancelledError:
             pass
         except Exception as e:
             logger.error("Voice listen loop error: %s", e, exc_info=True)
+        finally:
+            await self._close_live_voice_batch(batch, delivery)
+            await self._close_disabled_voice_stt(guild_id, receiver, controller)
 
-    async def _process_voice_input(self, guild_id: int, user_id: int, pcm_data: bytes):
+    async def _dispatch_voice_transcript(
+        self,
+        guild_id: int,
+        user_id: int,
+        transcript: str,
+    ) -> None:
+        """Filter and dispatch one completed voice transcript."""
+        from tools.voice_mode_transcript import is_whisper_hallucination
+
+        transcript = str(transcript or "").strip()
+        if not transcript or is_whisper_hallucination(transcript):
+            return
+        logger.info(
+            "Voice transcript received (guild=%d user=%d chars=%d)",
+            guild_id,
+            user_id,
+            len(transcript),
+        )
+        if self._voice_input_callback:
+            await self._voice_input_callback(
+                guild_id=guild_id,
+                user_id=user_id,
+                transcript=transcript,
+            )
+
+    async def _process_completed_voice_utterance(
+        self,
+        guild_id: int,
+        user_id: int,
+        pcm_data: bytes,
+        *,
+        stt_mode: str,
+        admit: Optional[Callable[[], bool]] = None,
+    ) -> None:
+        """Finalize a Live turn or delegate to the existing file pipeline."""
+        if not _read_runtime_stt_enabled() or (admit is not None and not admit()):
+            return
+        if stt_mode != "openai_live_high":
+            if stt_mode == "configured":
+                # Preserve the historical three-argument hook contract for
+                # existing tests/plugins that monkeypatch this internal seam.
+                await self._process_voice_input(guild_id, user_id, pcm_data)
+            else:
+                await self._process_voice_input(
+                    guild_id,
+                    user_id,
+                    pcm_data,
+                    stt_mode=stt_mode,
+                    **({"admit": admit} if admit is not None else {}),
+                )
+            return
+
+        controller = getattr(self, "_voice_live_transcribers", {}).get(guild_id)
+        if controller is None:
+            logger.warning(
+                "Discord Live STT controller missing for guild %d; dropping turn",
+                guild_id,
+            )
+            return
+        if admit is None:
+            receiver = getattr(self, "_voice_receivers", {}).get(guild_id)
+            if receiver is None:
+                return
+            guild = self._client.get_guild(guild_id) if self._client is not None else None
+            admit = self._voice_stt_admission(
+                guild_id, receiver, controller, user_id, guild,
+                receiver.snapshot_sources().get(user_id, ()))
+        if not admit():
+            await controller.abort_user(user_id)
+            return
+        result = await controller.finish_utterance(
+            user_id,
+            expected_source_bytes=len(pcm_data),
+            admit=admit,
+        )
+        await self._dispatch_live_voice_result(guild_id, user_id, result, admit)
+
+    async def _dispatch_live_voice_result(self, guild_id, user_id, result, admit) -> None:
+        """Keep both direct and batched results on the authorized gateway callback path."""
+        if not result.get("success"):
+            # Fail closed. A paid fallback is never selected implicitly.
+            logger.warning(
+                "Discord Live STT turn failed for guild %d user %d: %s",
+                guild_id,
+                user_id,
+                result.get("error", "unknown_live_error"),
+            )
+            return
+        if not admit():
+            return
+        await self._dispatch_voice_transcript(
+            guild_id,
+            user_id,
+            result.get("transcript", ""),
+        )
+
+    async def _process_voice_input(
+        self, guild_id: int, user_id: int, pcm_data: bytes, *, stt_mode: str = "configured",
+        admit: Optional[Callable[[], bool]] = None,
+    ):
         """Convert PCM -> WAV -> STT -> callback."""
-        from tools.voice_mode import is_whisper_hallucination
         tmp_f = tempfile.NamedTemporaryFile(suffix=".wav", prefix="vc_listen_", delete=False)
         wav_path = tmp_f.name
         tmp_f.close()
         try:
             await asyncio.to_thread(VoiceReceiver.pcm_to_wav, pcm_data, wav_path)
-            from tools.transcription_tools import transcribe_audio
-            result = await asyncio.to_thread(transcribe_audio, wav_path)
+            if stt_mode == "openai_contextual":
+                if not _read_runtime_stt_enabled() or (admit is not None and not admit()):
+                    return
+                from tools.transcription_tools import _transcribe_audio_with_provider
+                result = await asyncio.to_thread(
+                    _transcribe_audio_with_provider, wav_path,
+                    model="gpt-transcribe", provider="openai", source="discord",
+                )
+            else:
+                from tools.transcription_tools import transcribe_audio
+                result = await asyncio.to_thread(transcribe_audio, wav_path)
             if not result.get("success"):
                 return
-            transcript = result.get("transcript", "").strip()
-            if not transcript or is_whisper_hallucination(transcript):
+            if admit is not None and not admit():
                 return
-            logger.info("Voice input from user %d: %s", user_id, transcript[:100])
-            if self._voice_input_callback:
-                await self._voice_input_callback(
-                    guild_id=guild_id, user_id=user_id, transcript=transcript,
-                )
+            await self._dispatch_voice_transcript(guild_id, user_id, result.get("transcript", ""))
         except Exception as e:
             # Surface ffmpeg's captured stderr from CalledProcessError, else log just says "exit status N".
             _ff_err = getattr(e, "stderr", None)
@@ -4019,6 +4888,23 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             return
         profile = getattr(self, "_owner_profile", None)
         try:
+            if profile:
+                from gateway.run import _async_profile_runtime_scope
+                from hermes_cli.profiles import get_profile_dir
+                async with _async_profile_runtime_scope(get_profile_dir(profile)):
+                    await self._deliver_unauthorized_slash_alert(
+                        runner, profile, user_name, user_id, chan_id, guild_id, command_text, reason)
+            else:
+                await self._deliver_unauthorized_slash_alert(
+                    runner, profile, user_name, user_id, chan_id, guild_id, command_text, reason)
+        except Exception as e:
+            logger.debug("[Discord] Admin notify: profile %r scope failed: %s", profile, e)
+
+    async def _deliver_unauthorized_slash_alert(
+        self, runner, profile, user_name, user_id, chan_id, guild_id, command_text, reason,
+    ) -> None:
+        # Discovery, policy, and transport must share the same owning profile scope.
+        try:
             adapters, config = await self._alert_adapters_and_config(runner, profile)
         except Exception as e:
             logger.debug("[Discord] Admin notify: profile %r resolution failed: %s", profile, e)
@@ -4038,7 +4924,16 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     f"Command: {command_text}\n"
                     f"Reason: {reason}"
                 )
-                result = await adapter.send(str(home.chat_id), msg)
+                # Policy is the DISCORD owner's (self) evaluated for the foreign target lane; a veto
+                # is not transport failure or permission to reroute to the next target.
+                from gateway.warning_notifications import present_notification
+                result = None
+                async def send_alert():
+                    nonlocal result
+                    result = await adapter.send(str(home.chat_id), msg)
+                if not await present_notification(send_alert, platform=target,
+                                                  diagnostic=True):
+                    return
                 # Only return on confirmed delivery.
                 if getattr(result, "success", None) is False:
                     logger.debug(
@@ -4577,7 +5472,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             await interaction.followup.send(f"Created thread {link}", ephemeral=True)
         # Track thread participation so follow-ups don't require @mention
         if thread_id:
-            self._threads.mark(thread_id)
+            await self._threads.mark_async(thread_id)
         starter = (message or "").strip()
         if starter and thread_id:
             await self._dispatch_thread_session(interaction, thread_id, thread_name, starter)
@@ -4641,6 +5536,12 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     def _discord_require_mention(self) -> bool:
         """Return whether Discord channel messages require a bot mention."""
         return self._extra_or_env_flag("require_mention", "DISCORD_REQUIRE_MENTION", "true", truthy=False)
+
+    def _discord_free_response_auto_thread(self) -> bool:
+        """Free-response channels also auto-thread when opted in; default replies inline."""
+        return self._extra_or_env_flag(
+            "free_response_auto_thread", "DISCORD_FREE_RESPONSE_AUTO_THREAD", "false", truthy=True,
+        )
 
     def _discord_max_attachment_bytes(self) -> int:
         """Per-attachment byte cap; 0 = unlimited (whole attachment is held in memory). Default 32 MiB."""
@@ -4713,6 +5614,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     def _gate_csv_set(raw) -> set:
         if raw is None:
             return set()
+        raw = _decode_json_list_literal(raw)
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
@@ -4771,18 +5673,51 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         raw = self._gate_raw("allow_bots", "DISCORD_ALLOW_BOTS")
         return str(raw or "none").lower().strip() or "none"
 
+    @staticmethod
+    def _bot_tag_debounce_key(message: Any) -> str:
+        return (
+            f"{getattr(getattr(message, 'channel', None), 'id', '')}:"
+            f"{getattr(getattr(message, 'author', None), 'id', '')}"
+        )
+
+    def _bot_tag_window_seconds(self) -> float:
+        return max(self._text_batch_delay_seconds, self._text_batch_split_delay_seconds)
+
+    def _record_bot_tag_debounce(self, message: Any) -> None:
+        """Open a short continuation window after a bot-authored tag."""
+        if (
+            self._text_batch_delay_seconds <= 0
+            or not getattr(message.author, "bot", False)
+            or not self._self_is_explicitly_mentioned(message)
+        ):
+            return
+        self._bot_tag_debounce_until[self._bot_tag_debounce_key(message)] = (
+            time.monotonic() + self._bot_tag_window_seconds()
+        )
+
+    def _is_bot_tag_debounce_continuation(self, message: Any) -> bool:
+        """Return whether an unmentioned chunk belongs to a recent bot tag.
+
+        A hit re-arms the window: Discord paces a bot's sends at roughly one per
+        second, so chunk N of a long handoff lands well after the tag itself; each
+        admitted chunk therefore vouches for the next one. The gateway bot loop
+        guard bounds a bot that never stops talking."""
+        if self._text_batch_delay_seconds <= 0 or not getattr(message.author, "bot", False):
+            return False
+        key = self._bot_tag_debounce_key(message)
+        now = time.monotonic()
+        if self._bot_tag_debounce_until.get(key, 0.0) <= now:
+            self._bot_tag_debounce_until.pop(key, None)
+            return False
+        self._bot_tag_debounce_until[key] = now + self._bot_tag_window_seconds()
+        return True
+
     def _discord_free_response_channels(self) -> set:
         """Channel IDs/names needing no mention; a lone "*" is preserved for wildcard short-circuit."""
         raw = self.config.extra.get("free_response_channels")
         if raw is None:
             raw = self._gate_env("DISCORD_FREE_RESPONSE_CHANNELS")
-        if isinstance(raw, list):
-            return {str(part).strip() for part in raw if str(part).strip()}
-        # YAML parses a bare numeric value as int; str() any scalar before splitting.
-        s = str(raw).strip() if raw is not None else ""
-        if s:
-            return {part.strip() for part in s.split(",") if part.strip()}
-        return set()
+        return self._gate_csv_set(raw)
 
     def _raw_mentioned_user_ids(self, message: Any) -> set:
         """Extract user-mention IDs (``<@ID>`` and legacy ``<@!ID>``) from raw content,
@@ -4806,14 +5741,27 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         return str(self._client.user.id) in self._raw_mentioned_user_ids(message)
 
     def _discord_bots_require_inline_mention(self) -> bool:
-        """Whether a bot author must type a literal ``<@thisbot>`` to wake us (off by default).
-        A reply-ping adds us to ``message.mentions`` silently, letting two bots ping-pong forever.
-        Config: ``discord.bots_require_inline_mention`` / ``DISCORD_BOTS_REQUIRE_INLINE_MENTION``."""
+        """Whether another bot must type an inline @mention to trigger us.
+
+        On by default. A bot-authored message only wakes this bot if its
+        content contains a literal ``<@thisbot>`` token. A Discord reply/quote
+        to one of our messages is NOT enough on its own, because Discord's
+        reply-ping silently adds us to ``message.mentions`` even though the
+        author never typed our handle — which otherwise lets two bots ping-pong
+        replies at each other indefinitely. Humans are never affected by this
+        gate; it only applies to bot authors. Set the option to false only for
+        trusted relay integrations that intentionally depend on reply pings or
+        unmentioned bot messages.
+
+        Config: ``discord.bots_require_inline_mention`` (or env
+        ``DISCORD_BOTS_REQUIRE_INLINE_MENTION``).
+        """
         configured = self.config.extra.get("bots_require_inline_mention")
         if isinstance(configured, str):
             return configured.lower() in {"true", "1", "yes", "on"}
         return self._extra_or_env_flag(
-            "bots_require_inline_mention", "DISCORD_BOTS_REQUIRE_INLINE_MENTION", "false", truthy=True)
+            "bots_require_inline_mention", "DISCORD_BOTS_REQUIRE_INLINE_MENTION", "true", truthy=True
+        )
 
     def _discord_channel_keys(self, message: Any, parent_channel_id: Optional[str] = None) -> set[str]:
         """Channel keys (ID, bare name, ``#name``, plus parent for threads) accepted by channel gates."""
@@ -5009,7 +5957,13 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             return ""
 
     async def _resolve_channel(self, channel_id: Any) -> Any:
-        """Cached ``get_channel`` first, REST ``fetch_channel`` on miss (raises on API error)."""
+        """Cached ``get_channel`` first, REST ``fetch_channel`` on miss (raises on API error).
+
+        Every outbound target funnels through here (home channel, cron ``discord:<target>``,
+        thread metadata), so a pasted channel link is accepted at this one boundary instead of
+        dying in ``int()`` as a generic send failure."""
+        if isinstance(channel_id, str):
+            channel_id = discord_channel_id_from_link(channel_id.strip()) or channel_id
         channel = self._client.get_channel(int(channel_id))
         if not channel:
             channel = await self._client.fetch_channel(int(channel_id))
@@ -5301,11 +6255,6 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 logger.warning("[%s] %s failed: %s", self.name, fail_log, e)
             return SendResult(success=False, error=str(e))
 
-    @staticmethod
-    def _embed_body(text: str, limit: int = 4088) -> str:
-        """Trim to Discord's 4096-char embed description limit (conservatively)."""
-        return text if len(text) <= limit else text[: limit - 3] + "..."
-
     # Payload lives in plain content: embeds can be invisible/detached on web/mobile.
     _EA_HEADER = (f"⚠️ **{EA_HEADER_TEXT}**\n\n"
                   "Do you want Hermes to run this command?\n\n"
@@ -5314,6 +6263,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     _EA_CODE_CLOSE = "\n```\n"
     _EA_REASON_LABEL = f"**{EA_REASON_LABEL_TEXT}:** "
     _EA_SMART_DENY_LINE = "\n\n**Smart DENY:** owner override applies to this one operation only."
+    # The reason shares the 2000-char content cap with the command; unbounded it would starve
+    # the command preview to zero and push the content past the cap.
     _EA_REASON_BUDGET = 300
 
     def _exec_approval_cmd_budget(self, description: str, smart_denied: bool) -> int:
@@ -5325,7 +6276,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         return max(0, self.MAX_MESSAGE_LENGTH - fixed)
 
     async def _send_exec_approval_prompt(self, prompt: ExecApprovalPrompt) -> SendResult:
-        """Button view + embed mirror; buttons call ``resolve_gateway_approval()`` (not /approve)."""
+        """Send an approval with content as its canonical payload and an embed for state."""
         def _build(_channel):
             content = prompt.text
             mention_content = self._approval_mention_content()
@@ -5333,10 +6284,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 content = f"{mention_content}\n{content}"
             embed = discord.Embed(
                 title=f"⚠️ {EA_HEADER_TEXT}",
-                description=f"```\n{self._embed_body(prompt.command)}\n```",
                 color=discord.Color.orange(),
             )
-            embed.add_field(name=EA_REASON_LABEL_TEXT, value=self._truncate_preview(prompt.description, self._EA_REASON_BUDGET), inline=False)
             require_admin, admin_user_ids = _resolve_exec_approval_admin_gate(getattr(self.config, "extra", None))
             choices = set(prompt.choices)
             view = ExecApprovalView(
@@ -5361,9 +6310,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     ) -> SendResult:
         """Send a three-button slash-command confirmation prompt."""
         def _build(_channel):
-            embed = discord.Embed(
-                title=title or "Confirm", description=self._embed_body(message), color=discord.Color.orange(),
-            )
+            # Header-only card (same rule as the exec approval prompt): the message lives in
+            # content only, so embed-rendering clients don't see it twice (#114693).
+            embed = discord.Embed(title=title or "Confirm", color=discord.Color.orange())
             content = self._self_contained_prompt_content(f"**{title or 'Confirm'}**", message)
             view = SlashConfirmView(
                 session_key=session_key, confirm_id=confirm_id,
@@ -5396,16 +6345,13 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             return str(c).strip()
 
         def _build(_channel):
-            embed = discord.Embed(
-                title="❓ Hermes needs your input",
-                description=self._embed_body(str(question or "").strip()),
-                color=discord.Color.orange(),
-            )
+            # Header-only card (same rule as the exec approval prompt): the question and hint live
+            # in content only, so embed-rendering clients don't see them twice (#114693).
+            embed = discord.Embed(title="❓ Hermes needs your input", color=discord.Color.orange())
             # 5 buttons × 5 rows = 25; one slot is reserved for "Other".
             clean_choices = [s for s in (_flatten_choice(c) for c in (choices or [])) if s][:24]
             if clean_choices:
                 hint = "Pick one below, or click ✏️ Other to type a custom answer."
-                embed.add_field(name="Choices", value=hint, inline=False)
                 view = ClarifyChoiceView(
                     choices=clean_choices, clarify_id=clarify_id,
                     allowed_user_ids=self._allowed_user_ids,
@@ -5413,7 +6359,6 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 )
             else:
                 hint = "Reply in this channel with your answer."
-                embed.add_field(name="Reply", value=hint, inline=False)
                 view = None
             content = self._self_contained_prompt_content(
                 "❓ **Hermes needs your input**", str(question or "").strip(), tail=f"\n\n{hint}",
@@ -5630,9 +6575,12 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             return att.url
 
     async def _collect_attachment_media(self, all_attachments: list) -> tuple:
-        """Cache every attachment and return ``(media_urls, media_types, pending_text_injection)``."""
+        """Cache every attachment and return ``(media_urls, media_types, media_text_inlined,
+        pending_text_injection)``; ``media_text_inlined[i]`` is True only when attachment ``i``'s
+        text was injected."""
         media_urls = []
         media_types = []
+        media_text_inlined: list = []
         pending_text_injection: Optional[str] = None
         for att in all_attachments:
             content_type = att.content_type or "unknown"
@@ -5640,10 +6588,12 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 media_urls.append(await self._cache_simple_media(
                     att, content_type, "image", {".jpg", ".jpeg", ".png", ".gif", ".webp"}, ".jpg"))
                 media_types.append(content_type)
+                media_text_inlined.append(False)
             elif content_type.startswith("audio/"):
                 media_urls.append(await self._cache_simple_media(
                     att, content_type, "audio", {".ogg", ".mp3", ".wav", ".webm", ".m4a"}, ".ogg"))
                 media_types.append(content_type)
+                media_text_inlined.append(False)
             else:
                 ext = ""
                 if att.filename:
@@ -5673,6 +6623,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                         )
                     media_urls.append(cached_path)
                     media_types.append(doc_mime)
+                    media_text_inlined.append(False)
                     logger.info(
                         "[Discord] Cached user %s: %s", "document" if in_allowlist else "attachment", cached_path,
                     )
@@ -5691,11 +6642,12 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                                 pending_text_injection = f"{pending_text_injection}\n\n{injection}"
                             else:
                                 pending_text_injection = injection
+                            media_text_inlined[-1] = True
                         except UnicodeDecodeError:
                             pass
                 except Exception as e:
                     logger.warning("[Discord] Failed to cache document %s: %s", att.filename, e, exc_info=True)
-        return media_urls, media_types, pending_text_injection
+        return media_urls, media_types, media_text_inlined, pending_text_injection
 
     def _attachment_message_type(self, att: Any) -> MessageType:
         """MessageType from the first attachment's MIME. Any non-media (or untyped) attachment
@@ -5735,6 +6687,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         #   discord.allowed_channels: If set, bot ONLY responds in these channels (whitelist)
         #   discord.no_thread_channels: Channel IDs where bot responds directly without creating thread
         #   discord.auto_thread: Auto-create thread on @mention in channels (default: true)
+        #   discord.free_response_auto_thread: Free-response channels also auto-thread (default: false)
         thread_id = None
         parent_channel_id = None
         is_thread = isinstance(message.channel, discord.Thread)
@@ -5789,13 +6742,20 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             )
             in_bot_thread = self._in_bot_thread(message)
             if require_mention and not is_free_channel and not in_bot_thread:
-                if not self._self_is_explicitly_mentioned(message) and not mention_prefix:
+                if (
+                    not self._self_is_explicitly_mentioned(message)
+                    and not mention_prefix
+                    and not self._is_bot_tag_debounce_continuation(message)
+                ):
                     return False
         # Auto-thread: isolate each @mention in a text channel into its own thread (Slack-style).
         auto_threaded_channel = None
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels = self._get_no_thread_channels()
-            skip_thread = bool(channel_keys & no_thread_channels) or is_free_channel
+            # Voice-linked and reply exclusions live in the auto-thread gate below, not in skip_thread.
+            skip_thread = bool(channel_keys & no_thread_channels) or (
+                is_free_channel and not self._discord_free_response_auto_thread()
+            )
             auto_thread = self._extra_or_env_flag("auto_thread", "DISCORD_AUTO_THREAD", "true", truthy=True)
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
             if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
@@ -5804,11 +6764,13 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     parent_channel_id = str(message.channel.id)
                     is_thread = True
                     thread_id = str(thread.id)
-                    auto_threaded_channel = thread
-                    self._threads.mark(thread_id)
                     # Pre-seed dedup: message.create_thread() fires a second MESSAGE_CREATE for the
                     # starter (id == thread.id, maybe type=default); mark it so it can't trigger a rerun.
+                    # Must run before the first await below: mark_async yields to the loop, and the
+                    # echo's _discord_message_admission would otherwise claim the id first.
                     self._dedup.is_duplicate(str(thread.id))
+                    auto_threaded_channel = thread
+                    await self._threads.mark_async(thread_id)
                 else:
                     # Auto-threading is the routing target; do NOT fall back to an inline parent-channel
                     # reply (dumps the task into a shared channel). Surface an error and skip the run.
@@ -5817,8 +6779,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                         # channel. Surface a short visible error so the user can retry once Discord
                         # recovers, and skip agent invocation for this message. See #20243.
                         await message.channel.send(
-                            "⚠️ Hermes could not create a Discord thread for "
-                            "this message, so the request was not processed. Please retry."
+                            self.warning_text(
+                                "⚠️ Hermes could not create a Discord thread for "
+                                "this message, so the request was not processed. Please retry.",
+                                "The request was not processed. Please retry.")
                         )
                     except Exception as notify_error:
                         logger.warning(
@@ -5872,7 +6836,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 or self._derive_auto_thread_name(message.content or "")
             ) if auto_threaded_channel is not None else None,
         )
-        media_urls, media_types, pending_text_injection = await self._collect_attachment_media(all_attachments)
+        media_urls, media_types, media_text_inlined, pending_text_injection = await self._collect_attachment_media(
+            all_attachments)
         event_text = normalized_content
         if pending_text_injection:
             event_text = f"{pending_text_injection}\n\n{event_text}" if event_text else pending_text_injection
@@ -5919,19 +6884,33 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         event = MessageEvent(
             text=event_text, message_type=msg_type, source=source, raw_message=message,
             message_id=str(message.id), media_urls=media_urls, media_types=media_types,
+            media_text_inlined=media_text_inlined,
             reply_to_message_id=reply_to_id, reply_to_text=reply_to_text,
             timestamp=message.created_at, auto_skill=_skills, channel_prompt=_channel_prompt,
             channel_context=_channel_context,
         )
+        if (
+            getattr(getattr(message, "author", None), "bot", False)
+            and self._is_bot_tag_debounce_continuation(message)
+        ):
+            event._bot_tag_debounce = True  # type: ignore[attr-defined]
+
         # Track participation so follow-ups in this thread don't need @mention.
         if thread_id:
-            self._threads.mark(thread_id)
+            await self._threads.mark_async(thread_id)
         # Only live plain text is batched: recovery candidates are complete; coalescing would replay IDs.
         if (not recovered and msg_type == MessageType.TEXT and self._text_batch_delay_seconds > 0):
             self._enqueue_text_event(event)
         else:
             await self.handle_message(event)
         return True
+
+    def _text_batch_delay_for(self, pending: Optional[MessageEvent]) -> float:
+        """A bot handoff's continuation chunks arrive at Discord's send rate (~1/s), so a
+        batch opened by a bot tag waits the split delay regardless of chunk length."""
+        if getattr(pending, "_bot_tag_debounce", False):
+            return self._text_batch_split_delay_seconds
+        return super()._text_batch_delay_for(pending)
 
 
 # ---------------------------------------------------------------------------
@@ -6401,6 +7380,8 @@ def _define_discord_view_classes() -> None:
             )
 
         async def _on_cancel(self, interaction: discord.Interaction):
+            if not await self._gate(interaction, resolved_msg=None, unauth_msg=_UNAUTHORIZED):
+                return
             self.resolved = True
             self.clear_items()
             await self._edit(interaction, "Model selection cancelled.", color=discord.Color.greyple())
@@ -7058,7 +8039,11 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         seeded_extra["approval_mentions"] = approval_mentions_cfg
         _env_default("DISCORD_APPROVAL_MENTIONS", str(approval_mentions_cfg).lower())
     _gate("free_response_channels", "DISCORD_FREE_RESPONSE_CHANNELS", from_platform_extra=False)
-    for key, env_key in (("auto_thread", "DISCORD_AUTO_THREAD"), ("reactions", "DISCORD_REACTIONS")):
+    for key, env_key in (
+        ("auto_thread", "DISCORD_AUTO_THREAD"),
+        ("free_response_auto_thread", "DISCORD_FREE_RESPONSE_AUTO_THREAD"),
+        ("reactions", "DISCORD_REACTIONS"),
+    ):
         if key in discord_cfg:
             seeded_extra[key] = discord_cfg[key]
             _env_default(env_key, str(discord_cfg[key]).lower())
@@ -7120,8 +8105,9 @@ def register(ctx) -> None:
         setup_fn=interactive_setup,
         # YAML→env bridge: ``discord:`` config keys → ``DISCORD_*`` env vars read via os.getenv().
         # YAML→env config bridge — owns the translation of ``config.yaml`` ``discord:`` keys
-        # (require_mention, free_response_channels, auto_thread, reactions, ignored_channels,
-        # allowed_channels, no_thread_channels, allow_mentions.*, reply_to_mode, thread_require_mention)
+        # (require_mention, free_response_channels, auto_thread, free_response_auto_thread,
+        # reactions, ignored_channels, allowed_channels, no_thread_channels, allow_mentions.*,
+        # reply_to_mode, thread_require_mention)
         # into ``DISCORD_*`` env vars that the adapter reads via ``os.getenv()``. Replaces the hardcoded
         # block that used to live in ``gateway/config.py``. Hook contract: #24836.
         apply_yaml_config_fn=_apply_yaml_config,

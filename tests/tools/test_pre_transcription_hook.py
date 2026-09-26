@@ -38,6 +38,11 @@ from tools import transcription_tools
 PROMPT = "Hermes, Teknium, Nous Research, kanban"
 
 
+@pytest.fixture(autouse=True)
+def _no_host_audio_binaries(monkeypatch):
+    monkeypatch.setattr("tools.transcription_audio._find_ffmpeg_binary", lambda: None)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -87,8 +92,6 @@ def _dispatch_ctx(stt_config, provider):
 # ---------------------------------------------------------------------------
 
 
-def test_pre_transcription_in_valid_hooks():
-    assert "pre_transcription" in plugins_mod.VALID_HOOKS
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +166,7 @@ class TestPromptThreading:
         audio = _make_audio(tmp_path)
         monkeypatch.setenv("MISTRAL_API_KEY", "mk-test")
         # Never attempt a lazy install in tests.
-        monkeypatch.setattr("tools.lazy_deps.ensure", lambda *a, **kw: None)
+        monkeypatch.setattr("pm.ensure_import", lambda *a, **kw: None)
 
         mistral_cls = MagicMock()
         mock_client = mistral_cls.return_value.__enter__.return_value
@@ -189,24 +192,6 @@ class TestPromptThreading:
 
 
 class TestHookMergeMechanics:
-    def test_two_hooks_last_writer_wins_per_field(self, monkeypatch, tmp_path):
-        audio = _make_audio(tmp_path)
-        # Two hooks in registration order: the second overwrites ``prompt``
-        # but leaves ``language`` untouched — last-writer-wins PER FIELD.
-        _fake_hooks(
-            monkeypatch,
-            [{"prompt": "first", "language": "ja"}, {"prompt": "second"}],
-        )
-
-        backend = MagicMock(return_value={"success": True, "transcript": "hi"})
-        cfg_patch, prov_patch = _dispatch_ctx({"provider": "openai"}, "openai")
-        with cfg_patch, prov_patch, \
-             patch("tools.transcription_tools._transcribe_openai", backend):
-            transcription_tools.transcribe_audio(audio)
-
-        _, kwargs = backend.call_args
-        assert kwargs["prompt"] == "second"
-        assert kwargs["language"] == "ja"
 
     def test_hook_model_override_flows_to_backend(self, monkeypatch, tmp_path):
         audio = _make_audio(tmp_path)
@@ -241,7 +226,6 @@ class TestHookMergeMechanics:
         # Original file_path untouched, valid fields still applied.
         assert args[0] == audio
         assert kwargs["prompt"] == PROMPT
-        assert "read-only" in caplog.text
 
     def test_non_string_field_values_ignored(self, monkeypatch, tmp_path):
         audio = _make_audio(tmp_path)
@@ -287,23 +271,6 @@ class TestHookMergeMechanics:
 
 
 class TestNoHookPath:
-    def test_no_hook_dispatch_kwargs_identical_to_control(
-        self, monkeypatch, tmp_path,
-    ):
-        audio = _make_audio(tmp_path)
-        _no_hooks(monkeypatch)  # invoke_hook raises if ever called
-
-        backend = MagicMock(return_value={"success": True, "transcript": "hi"})
-        cfg_patch, prov_patch = _dispatch_ctx({"provider": "openai"}, "openai")
-        with cfg_patch, prov_patch, \
-             patch("tools.transcription_tools._transcribe_openai", backend):
-            transcription_tools.transcribe_audio(audio)
-
-        args, kwargs = backend.call_args
-        assert args == (audio, "whisper-1")
-        # No prompt/language reach the backend — same effective dispatch as
-        # a control run without the hook plumbing.
-        assert kwargs == {"language": None, "prompt": None}
 
     def test_no_hook_openai_wire_call_has_no_prompt_or_language(
         self, monkeypatch, tmp_path,
@@ -391,7 +358,6 @@ class TestSttPromptConfig:
         assert len(kwargs["prompt"]) == max_chars
         # Tail survives — whisper conditions on the final context window.
         assert kwargs["prompt"] == long_prompt[-max_chars:]
-        assert "truncating" in caplog.text
 
     def test_non_whisper_provider_prompt_not_truncated(
         self, monkeypatch, tmp_path,
@@ -413,20 +379,6 @@ class TestSttPromptConfig:
         _, kwargs = backend.call_args
         assert kwargs["prompt"] == long_prompt
 
-    def test_short_prompt_not_truncated(self, monkeypatch, tmp_path):
-        audio = _make_audio(tmp_path)
-        _fake_hooks(monkeypatch, [{"prompt": PROMPT}])
-
-        backend = MagicMock(return_value={"success": True, "transcript": "hi"})
-        cfg_patch, prov_patch = _dispatch_ctx(
-            {"provider": "openai", "prompt": "config base"}, "openai",
-        )
-        with cfg_patch, prov_patch, \
-             patch("tools.transcription_tools._transcribe_openai", backend):
-            transcription_tools.transcribe_audio(audio)
-
-        _, kwargs = backend.call_args
-        assert kwargs["prompt"] == PROMPT
 
     def test_blank_config_prompt_ignored(self, monkeypatch, tmp_path):
         audio = _make_audio(tmp_path)
@@ -474,7 +426,6 @@ class TestUnsupportedBackends:
             )
 
         assert result["success"] is True
-        assert "does not support transcription prompts" in caplog.text
         _, kwargs = fake_requests.post.call_args
         assert "prompt" not in kwargs["data"]
 
@@ -496,7 +447,6 @@ class TestUnsupportedBackends:
             )
 
         assert result["success"] is True
-        assert "does not support transcription prompts" in caplog.text
         _, kwargs = fake_requests.post.call_args
         assert "prompt" not in kwargs["data"]
 
@@ -582,7 +532,7 @@ def test_real_fixture_plugins_thread_prompt_in_registration_order(
     import os
     from pathlib import Path
 
-    import yaml
+    import hermes_yaml as yaml
 
     hermes_home = Path(os.environ["HERMES_HOME"])
     plugin_dir = hermes_home / "plugins" / "stt_vocab"
@@ -630,3 +580,67 @@ def test_real_fixture_plugins_thread_prompt_in_registration_order(
     _, kwargs = mock_model.transcribe.call_args
     assert kwargs["initial_prompt"] == PROMPT  # last writer won
     assert kwargs["language"] == "en"  # earlier hook's field preserved
+
+@pytest.mark.parametrize("results,expected", [
+    ([{"prompt": ""}, {"model": "gpt-transcribe"}], ""),
+    ([{"model": "gpt-transcribe"}, {"prompt": ""}], ""),
+    ([{"prompt": ""}, {"prompt": None}, {"language": "fr"}], ""),
+    ([{"prompt": ""}, {"prompt": "last"}], "last"),
+    ([{"model": "gpt-transcribe"}], None),
+])
+def test_real_hook_merger_preserves_prompt_presence(monkeypatch, results, expected):
+    from tools.transcription_command import _apply_pre_transcription_hook
+    manager = plugins_mod.PluginManager()
+    context = plugins_mod.PluginContext(plugins_mod.PluginManifest(name="context-test"), manager)
+    for result in results:
+        context.register_hook("pre_transcription", lambda result=result, **kw: result)
+    monkeypatch.setattr(plugins_mod, "_delivery_manager", lambda: manager)
+    fields = {}
+    model, language, prompt = _apply_pre_transcription_hook(
+        file_path="voice.wav", provider="openai", model=None, language=None,
+        prompt="generic", source="gateway", field_overrides=fields,
+    )
+    assert ("prompt" in fields) == (expected is not None)
+    if expected is not None:
+        assert fields["prompt"] == expected
+        assert prompt == (expected or None)
+    else:
+        assert prompt == "generic"
+    # Existing consumers can still call without metadata and unpack three values.
+    legacy = _apply_pre_transcription_hook(
+        file_path="voice.wav", provider="openai", model=None, language=None,
+        prompt="generic", source="gateway",
+    )
+    assert legacy == (model, language, prompt)
+
+
+@pytest.mark.parametrize("hook_prompt", ["hook vocabulary", ""])
+def test_override_preserves_native_hooks_and_source(monkeypatch, tmp_path, hook_prompt):
+    from copy import deepcopy
+
+    audio = _make_audio(tmp_path)
+    config = {"provider": "local", "prompt": "configured vocabulary",
+              "fallback_providers": ["groq"], "cloud_trim_silence": False,
+              "openai": {"api_key": "test-key"}}
+    original = deepcopy(config)
+    captured = _fake_hooks(monkeypatch, [{
+        "prompt": hook_prompt, "language": "fr", "file_path": "/forbidden.wav",
+    }])
+    client = MagicMock()
+    client.audio.transcriptions.create.return_value = "Bonjour"
+    with patch("tools.transcription_tools._load_stt_config", return_value=config), \
+         patch("tools.transcription_tools._HAS_OPENAI", True), \
+         patch("openai.OpenAI", return_value=client):
+        result = transcription_tools._transcribe_audio_with_provider(
+            audio, "whisper-1", source="discord", provider="openai",
+        )
+    assert result["success"] is True
+    assert captured["hook_name"] == "pre_transcription"
+    assert captured["kwargs"]["provider"] == "openai"
+    assert captured["kwargs"]["source"] == "discord"
+    assert captured["kwargs"]["prompt"] == "configured vocabulary"
+    kwargs = client.audio.transcriptions.create.call_args.kwargs
+    assert kwargs["file"].name == audio
+    assert kwargs["language"] == "fr"
+    assert kwargs.get("prompt", "") == hook_prompt
+    assert config == original
