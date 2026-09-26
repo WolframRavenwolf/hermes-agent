@@ -8,7 +8,7 @@ create and chmod the file existed at the process umask (typically ``0o644``),
 briefly exposing OAuth tokens to other local users on multi-user hosts. The
 writers now go through ``utils.atomic_json_write(mode=0o600)`` whose mkstemp temp
 file is ``O_EXCL`` at 0600 on creation (the cross-writer invariant lives in
-``tests/test_private_credential_writers.py``).
+``tests/agent/test_private_credential_writers.py``).
 
 These tests stay green only while the token file and its parent directory
 end up at ``0o600`` / ``0o700`` after every write. POSIX-only — the mode-bit
@@ -25,10 +25,7 @@ import sys
 import pytest
 
 
-pytestmark = pytest.mark.skipif(
-    sys.platform.startswith("win"),
-    reason="POSIX mode bits not enforced on Windows",
-)
+pytestmark = pytest.mark.platforms("posix")  # POSIX mode bits not enforced on Windows
 
 
 # ---------------------------------------------------------------------------

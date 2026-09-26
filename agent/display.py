@@ -9,7 +9,8 @@ import re
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+import unicodedata
+from dataclasses import dataclass, field, replace
 from difflib import unified_diff
 from pathlib import Path
 from typing import Any, Iterator
@@ -17,7 +18,7 @@ from urllib.parse import urlsplit
 
 from utils import safe_json_loads
 from agent.redact import redact_sensitive_text
-from agent.tool_result_classification import file_mutation_result_landed
+from agent.tool_result_classification import file_mutation_result_landed, is_guardrail_refusal
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +180,156 @@ class ToolPreview:
     text: str
     truncated: bool = False
     url: str | None = None
+
+
+_TOOL_PROGRESS_COMMENT_ARG_KEYS = {"terminal": "command", "execute_code": "code"}
+
+
+def extract_tool_progress_comment_description(
+    tool_name: str,
+    args: dict | None,
+) -> str | None:
+    """Return a human label from a supported tool's first physical line.
+
+    The accepted line is an ordinary ``#`` comment after optional indentation.
+    Shebangs are excluded. Exactly one opening marker and its following
+    whitespace are removed; a single whitespace-separated closing marker is
+    removed as well. Missing, malformed, or empty labels return ``None``.
+    """
+    arg_key = _TOOL_PROGRESS_COMMENT_ARG_KEYS.get(tool_name)
+    if arg_key is None or not isinstance(args, dict):
+        return None
+
+    source = args.get(arg_key)
+    if not isinstance(source, str):
+        return None
+
+    first_line = re.split(r"\r\n|\n|\r", source, maxsplit=1)[0].lstrip(" \t")
+    if not first_line.startswith("#") or first_line.startswith("#!"):
+        return None
+
+    remainder = first_line[1:]
+    opening_whitespace = bool(remainder and remainder[0].isspace())
+    description = remainder.lstrip().rstrip()
+    if (
+        description.endswith("#")
+        and (
+            (len(description) >= 2 and description[-2].isspace())
+            or (description == "#" and opening_whitespace)
+        )
+    ):
+        description = description[:-1].rstrip()
+    return description or None
+
+
+_INERT_PROGRESS_CHAR_TRANSLATION = str.maketrans(
+    {
+        "\\": "＼",
+        "`": "｀",
+        "*": "＊",
+        "_": "＿",
+        "{": "｛",
+        "}": "｝",
+        "[": "［",
+        "]": "］",
+        "(": "（",
+        ")": "）",
+        "<": "＜",
+        ">": "＞",
+        "#": "＃",
+        "+": "＋",
+        "-": "－",
+        "=": "＝",
+        ".": "．",
+        "!": "！",
+        "|": "｜",
+        "~": "～",
+        "@": "＠",
+        "&": "＆",
+        ":": "：",
+        "/": "／",
+    }
+)
+
+# Unicode DerivedCoreProperties.txt: Default_Ignorable_Code_Point.
+_DEFAULT_IGNORABLE_RANGES = (
+    (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
+    (0x061C, 0x061C),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x206F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFF8),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+)
+
+
+def _is_default_ignorable(char: str) -> bool:
+    codepoint = ord(char)
+    for start, end in _DEFAULT_IGNORABLE_RANGES:
+        if codepoint < start:
+            return False
+        if codepoint <= end:
+            return True
+    return False
+
+
+def _normalize_tool_progress_description(text: str) -> str:
+    """Strip controls/default-ignorables and collapse visible whitespace."""
+    clean_chars = []
+    for char in text:
+        if unicodedata.category(char).startswith("C") or _is_default_ignorable(char):
+            if char.isspace():
+                clean_chars.append(" ")
+            continue
+        clean_chars.append(char)
+    return " ".join("".join(clean_chars).split())
+
+
+def _neutralize_tool_progress_description(text: str) -> str:
+    """Make a normalized one-line label inert across chat markup dialects."""
+    return text.translate(_INERT_PROGRESS_CHAR_TRANSLATION)
+
+
+def prepare_tool_progress_comment_description(
+    tool_name: str,
+    args: dict | None,
+    *,
+    max_len: int,
+) -> ToolPreview | None:
+    """Build a capped, non-linkable, inert comment-label preview."""
+    description = extract_tool_progress_comment_description(tool_name, args)
+    if description is None:
+        return None
+
+    description = _normalize_tool_progress_description(description)
+    if not description:
+        return None
+    description = _normalize_tool_progress_description(
+        redact_sensitive_text(
+            description,
+            force=True,
+            redact_url_credentials=True,
+        )
+    )
+    if not description:
+        return None
+    text = _tail_trunc(description, max_len)
+    safe_text = _neutralize_tool_progress_description(text)
+    return ToolPreview(
+        text=safe_text,
+        truncated=text != description,
+        url=None,
+    )
 
 
 # ── Shell command summarisation ──────────────────────────────────────────
@@ -436,6 +587,16 @@ def _preview_skill_view(args: dict, max_len: int) -> str | None:
     return _tail_trunc(label, max_len) or None
 
 
+def _preview_bridge_call(tool_name: str):
+    def _build(args: dict, max_len: int) -> str | None:
+        labels = bridge_tool_labels(tool_name, args)
+        if not labels:
+            return _primary_arg_preview(tool_name, args, max_len)
+        extra = f" +{len(labels) - 1}" if len(labels) > 1 else ""
+        return _tail_trunc(f"{labels[0].text}{extra}", max_len) or None
+    return _build
+
+
 # Tool-specific preview builders: f(args, max_len) -> preview. Tools not listed
 # fall through to the primary-argument lookup in build_tool_preview.
 _PREVIEW_BUILDERS = {
@@ -445,6 +606,9 @@ _PREVIEW_BUILDERS = {
     "read_file": _preview_read_file, "memory": _preview_memory, "send_message": _preview_send_message,
     "skill_view": _preview_skill_view,
     "session_search": lambda args, _m: f"recall: \"{_clip(_oneline(args.get('query', '')), 25)}\"",
+    "tool_call": _preview_bridge_call("tool_call"),
+    "tool_search": _preview_bridge_call("tool_search"),
+    "tool_describe": _preview_bridge_call("tool_describe"),
 }
 
 
@@ -461,6 +625,10 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
     builder = _PREVIEW_BUILDERS.get(tool_name)
     if builder is not None:
         return builder(args, max_len)
+    return _primary_arg_preview(tool_name, args, max_len)
+
+
+def _primary_arg_preview(tool_name: str, args: dict, max_len: int) -> str | None:
     key = _PRIMARY_ARGS.get(tool_name) or next((k for k in _FALLBACK_PREVIEW_KEYS if k in args), None)
     if not key or key not in args:
         return None
@@ -500,10 +668,46 @@ _TOOL_VERBS_NO_PREVIEW: frozenset[str] = frozenset({"skills_list", "session_sear
 # Verbs joined to the preview with " for " (search-style phrasing).
 _TOOL_VERBS_FOR_CONNECTOR: frozenset[str] = frozenset({"web_search", "search_files"})
 
-def get_tool_verb(tool_name: str) -> str | None:
-    """Friendly verb for a built-in tool, or None (labels disabled / no curated verb);
-    callers compose ``f"{verb}{tool_verb_connector(tool)}{preview}"`` themselves."""
-    return _TOOL_VERBS.get(tool_name) if _friendly_tool_labels else None
+_BRIDGE_GENERATING = {
+    "tool_call": "a tool call", "tool_search": "a tool search", "tool_describe": "tool details",
+}
+
+
+def bridge_generating_phrase(tool_name: str) -> str | None:
+    return _BRIDGE_GENERATING.get(tool_name) if _friendly_tool_labels else None
+
+
+def tool_labels_for_call(tool_name: str, args: dict | None) -> list:
+    try:
+        from tools.tool_labels import labels_for_call
+        labels = labels_for_call(tool_name, args or {})
+    except Exception as exc:  # noqa: BLE001 — display must never abort a turn
+        logger.debug("bridge labels failed for %s: %s", tool_name, exc)
+        return []
+    skin = _get_skin()
+    overrides = (skin.tool_emojis if skin and skin.tool_emojis else None) or {}
+    return [replace(label, emoji=overrides[label.name]) if label.name in overrides else label
+            for label in labels]
+
+
+def bridge_tool_labels(tool_name: str, args: dict | None) -> list:
+    return tool_labels_for_call(tool_name, args) if _friendly_tool_labels else []
+
+
+def tool_row_emoji(tool_name: str, args: dict | None = None, default: str = "⚡") -> str:
+    labels = bridge_tool_labels(tool_name, args) if args else []
+    return labels[0].emoji if labels else get_tool_emoji(tool_name, default)
+
+
+def get_tool_verb(tool_name: str, *, friendly_labels: bool | None = None) -> str | None:
+    """Friendly verb for a built-in tool, or None (labels disabled / no curated verb).
+
+    An explicit flag uses the turn snapshot; omitted keeps the legacy global.
+    Callers compose ``f"{verb}{tool_verb_connector(tool)}{preview}"`` themselves.
+    """
+    if friendly_labels is None:
+        friendly_labels = _friendly_tool_labels
+    return _TOOL_VERBS.get(tool_name) if friendly_labels else None
 
 
 def tool_verb_connector(tool_name: str) -> str:
@@ -535,8 +739,12 @@ def build_status_phrase(tool_name: str, args: dict | None, max_len: int = 49) ->
 
 
 def build_tool_label(tool_name: str, args: dict, max_len: int | None = None) -> str | None:
-    """Human-phrased label ("Searching the web for ...") for curated built-ins; other
-    tools (or labels disabled) get the raw preview, so it is a drop-in for build_tool_preview."""
+    labels = bridge_tool_labels(tool_name, args)
+    if labels:
+        label = labels[0]
+        preview = _tail_trunc(label.preview, max_len if max_len is not None else _tool_preview_max_len)
+        extra = f" +{len(labels) - 1}" if len(labels) > 1 else ""
+        return f"{label.text}{f' {preview}' if preview else ''}{extra}"
     verb = get_tool_verb(tool_name)
     if verb and tool_name in _TOOL_VERBS_NO_PREVIEW:
         return verb
@@ -556,8 +764,8 @@ def _resolved_path(path: str) -> Path:
 def _snapshot_text(path: Path) -> str | None:
     """Return UTF-8 file content, or None for missing/unreadable files."""
     try:
-        return path.read_text(encoding="utf-8")
-    except (UnicodeDecodeError, OSError):  # FileNotFoundError/IsADirectoryError are OSErrors
+        return path.read_text(encoding="utf-8-sig")
+    except (FileNotFoundError, IsADirectoryError, UnicodeDecodeError, OSError):
         return None
 
 
@@ -591,19 +799,29 @@ def _resolve_skill_manage_paths(args: dict) -> list[Path]:
     return [skill_dir / "SKILL.md"] if action in {"edit", "patch"} else []
 
 
-def _resolve_local_edit_paths(tool_name: str, function_args: dict | None) -> list[Path]:
+def _resolve_local_edit_paths(tool_name: str, function_args: dict | None, task_id: str | None = None) -> list[Path]:
     """Resolve local filesystem targets for write-capable tools."""
     if not isinstance(function_args, dict):
         return []
     if tool_name == "skill_manage":
         return _resolve_skill_manage_paths(function_args)
     path = function_args.get("path") if tool_name in {"write_file", "patch"} else None
+    if path and task_id is not None:
+        from tools.file_tools_paths import _resolve_path_for_task, _terminal_env_type_for_task
+
+        # A remote target may happen to exist on this host too. Never persist a
+        # preview of that unrelated file; patch can still supply its own diff.
+        if _terminal_env_type_for_task(task_id) != "local":
+            return []
+        return [Path(_resolve_path_for_task(path, task_id))]
     return [_resolved_path(path)] if path else []
 
 
-def capture_local_edit_snapshot(tool_name: str, function_args: dict | None) -> LocalEditSnapshot | None:
+def capture_local_edit_snapshot(
+    tool_name: str, function_args: dict | None, *, task_id: str | None = None,
+) -> LocalEditSnapshot | None:
     """Capture before-state for local write previews."""
-    paths = _resolve_local_edit_paths(tool_name, function_args)
+    paths = _resolve_local_edit_paths(tool_name, function_args, task_id)
     if not paths:
         return None
     return LocalEditSnapshot(paths=paths, before={str(path): _snapshot_text(path) for path in paths})
@@ -888,6 +1106,8 @@ class KawaiiSpinner:
 # ── Cute tool message (completion line that replaces the spinner) ─────────
 
 _ERROR_SUFFIX_MAX_LEN = 48
+# A degraded backend (Docker down, SSH host unreachable) needs the whole reason plus the fix hint.
+_DEGRADED_SUFFIX_MAX_LEN = 200
 
 
 def _trim_error(msg: str) -> str:
@@ -900,17 +1120,37 @@ def _trim_error(msg: str) -> str:
     return _tail_trunc(msg, _ERROR_SUFFIX_MAX_LEN)
 
 
-def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]:
+def _degraded_suffix(data: dict) -> str:
+    """`` [<reason> — <retry_hint>]`` for a ``status: degraded`` terminal result (hint omitted when empty)."""
+    reason = str(data.get("reason") or data.get("error") or "terminal backend unavailable").strip()
+    hint = str(data.get("retry_hint") or "").strip()
+    text = f"{reason} — {hint}" if hint else reason
+    return f" [{_tail_trunc(text, _DEGRADED_SUFFIX_MAX_LEN)}]"
+
+
+def _detect_tool_failure(tool_name: str, result: Any) -> tuple[bool, str]:
     """Return ``(is_failure, suffix)`` for a tool result, e.g. ``(True, " [exit 1]")``."""
     if result is None or file_mutation_result_landed(tool_name, result):
         return False, ""
-    data = safe_json_loads(result)
+    data = result if isinstance(result, dict) else safe_json_loads(result)
+    # A harness REFUSAL of a redundant call (repeated identical read/search) is not a
+    # failed call. This is the ``failed`` the executor hands the loop guardrail, so
+    # counting it would escalate refusals into ``repeated_exact_failure_block``.
+    if is_guardrail_refusal(data):
+        return False, ""
+
+    # A denied/timed-out approval carries one human sentence; show it instead of the model-facing
+    # "BLOCKED: ... Do NOT retry" text (which stays in the JSON for the model).
+    if isinstance(data, dict) and data.get("user_summary"):
+        return True, f" [{_tail_trunc(str(data['user_summary']), _DEGRADED_SUFFIX_MAX_LEN)}]"
 
     # Terminal: non-zero exit code is the canonical failure signal.
     if tool_name == "terminal":
         exit_code = data.get("exit_code") if isinstance(data, dict) else None
         if exit_code is None or exit_code == 0:
             return False, ""
+        if data.get("status") == "degraded":
+            return True, _degraded_suffix(data)
         err_msg = data.get("error")
         return True, f" [{_trim_error(str(err_msg))}]" if err_msg else f" [exit {exit_code}]"
 
@@ -1063,15 +1303,59 @@ _CUTE_LINES = {
 }
 
 
+def _cute_bridge_rows(tool_name: str, args: dict) -> list[str] | None:
+    labels = bridge_tool_labels(tool_name, args)
+    if not labels:
+        return None
+    return [f"┊ {label.emoji} {_cute_trunc(label.text)}"
+            f"{f'  {_cute_trunc(label.preview)}' if label.preview else ''}" for label in labels]
+
+
+_BRIDGE_CALL_INDEX_RE = re.compile(r"calls\[(\d+)\]")
+
+
+def _entry_failure_suffix(entry: Any) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    error = entry.get("error")
+    if isinstance(error, dict):
+        return f" [{_trim_error(str(error.get('message') or error.get('code') or 'error'))}]"
+    if not (error or entry.get("success") is False):
+        return ""
+    return _detect_tool_failure(str(entry.get("name") or ""), entry)[1]
+
+
+def _bridge_row_suffixes(rows: int, result: Any, call_suffix: str) -> list[str]:
+    suffixes = [""] * rows
+    data = result if isinstance(result, dict) else safe_json_loads(result)
+    entries = data.get("results") if isinstance(data, dict) else None
+    if isinstance(entries, list):
+        for position, entry in enumerate(entries[:rows]):
+            suffix = _entry_failure_suffix(entry)
+            if not suffix:
+                continue
+            index = entry.get("index")
+            suffixes[index if isinstance(index, int) and 0 <= index < rows else position] = suffix
+    if call_suffix and not any(suffixes):
+        match = _BRIDGE_CALL_INDEX_RE.search(call_suffix)
+        named = int(match.group(1)) if match else rows - 1
+        suffixes[named if 0 <= named < rows else rows - 1] = call_suffix
+    return suffixes
+
+
 def _get_cute_tool_message(tool_name: str, args: dict, duration: float, result: str | None = None) -> str:
-    """Tool completion line for CLI quiet mode: ``| {emoji} {verb:9} {detail}  {duration}``, plus a
-    failure suffix from :func:`_detect_tool_failure`; the leading ``┊`` becomes the skin's tool prefix."""
     args = redact_tool_args_for_display(tool_name, args) or args
     is_failure, failure_suffix = _detect_tool_failure(tool_name, result)
     render = _CUTE_LINES.get(tool_name)
-    body = render(args, result) if render else f"┊ ⚡ {tool_name[:9]:9} {_cute_trunc(build_tool_preview(tool_name, args) or '')}"
-    line = f"{body}  {duration:.1f}s".replace("┊", get_skin_tool_prefix(), 1)
-    return f"{line}{failure_suffix}" if is_failure else line
+    rows = _cute_bridge_rows(tool_name, args)
+    if rows is None:
+        body = render(args, result) if render else f"┊ ⚡ {tool_name[:9]:9} {_cute_trunc(build_tool_preview(tool_name, args) or '')}"
+        rows, suffixes = [body], [failure_suffix if is_failure else ""]
+    else:
+        suffixes = _bridge_row_suffixes(len(rows), result, failure_suffix if is_failure else "")
+    rows = [*rows[:-1], f"{rows[-1]}  {duration:.1f}s"]
+    prefix = get_skin_tool_prefix()
+    return "\n  ".join(f"{row}{suffix}".replace("┊", prefix, 1) for row, suffix in zip(rows, suffixes))
 
 
 def get_cute_tool_message(tool_name: str, args: dict, duration: float, result: str | None = None) -> str:
