@@ -15,6 +15,10 @@ from typing import Any, Callable, List, Optional
 class TurnContext:
     # read-only turn identity / wiring
     source: Any = None
+    reply_expected: Optional[bool] = None
+    # Scheduled heartbeats are proactive work, not replies to the source message that
+    # registered the watch.  Their routine delivery surfaces stay quiet.
+    scheduled_heartbeat: bool = False
     _run_still_current: Callable[[], bool] = None  # type: ignore[assignment]
     _live_status_adapter: Any = None
     _live_status_mode: str = "off"
@@ -34,6 +38,7 @@ class TurnContext:
     _LONG_TOOL_THRESHOLD_S: float = 30.0
     _cleanup_progress: bool = False
     _cleanup_msg_ids: List[str] = field(default_factory=list)
+    _terminal_progress_msg_ids: set[str] = field(default_factory=set)
     _progress_metadata: Optional[dict] = None
     _progress_reply_to: Optional[Any] = None
     message: Optional[str] = None  # the only rebindable field
@@ -58,11 +63,19 @@ class TurnContext:
     persist_user_display_kind: Optional[str] = None
     persist_user_display_metadata: Optional[dict] = None
     user_config: Any = None
+    mute_notification_reply: bool = False
     enabled_toolsets: Any = None
     disabled_toolsets: Any = None
     log_mode_enabled: bool = False
     interim_assistant_messages_enabled: bool = False
     needs_progress_queue: bool = False
+    defer_terminal_lifecycle_progress: bool = False
+    _defer_progress_completion: bool = False
+    _close_progress_ingress: Optional[Callable] = None
+    _complete_lifecycle_progress: Optional[Callable] = None
+    # Own the queued descendant until the ancestor has finished every await.
+    _descendant_progress_completion: Optional[Callable] = None
+    _enqueue_lifecycle_progress: Optional[Callable] = None
     AIAgent: Any = None
     resolve_display_setting: Any = None
     result_holder: list = field(default_factory=lambda: [None])

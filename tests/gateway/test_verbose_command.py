@@ -3,7 +3,7 @@
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-import yaml
+import hermes_yaml as yaml
 
 import gateway.run as gateway_run
 from gateway.config import Platform
@@ -104,3 +104,20 @@ class TestVerboseCommand:
         assert "tool_progress_command" in result
 
 
+
+
+@pytest.mark.asyncio
+async def test_verbose_cycle_includes_full_and_retains_other_modes(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"display": {
+        "tool_progress_command": True, "tool_progress": "verbose",
+        "platforms": {"slack": {"tool_progress": "off"}},
+    }}))
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    runner = _make_runner()
+    for expected in ("full", "log", "off", "new", "all", "verbose"):
+        reply = await runner._handle_verbose_command(_make_event())
+        saved = yaml.safe_load(config_path.read_text())
+        assert saved["display"]["platforms"]["telegram"]["tool_progress"] == expected
+        assert expected.upper() in reply
+        assert saved["display"]["platforms"]["slack"]["tool_progress"] == "off"

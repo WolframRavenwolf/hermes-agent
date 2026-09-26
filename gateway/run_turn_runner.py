@@ -22,8 +22,13 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from agent.interrupt_compat import _accepts_keyword
 from agent.replay_cleanup import canonicalize_replay_history
 from gateway.config import Platform
+from gateway.full_progress_redaction import (
+    _redact_full_progress_args,
+    _redact_full_progress_string,
+)
 from gateway.media_repair import repair_explicit_computer_use_media_paths
-from gateway.platforms.base import BasePlatformAdapter
+from gateway.platforms.base import BasePlatformAdapter, SendResult
+from gateway.relay.egress import declined_send
 from gateway.turn_context import TurnContext
 from hermes_cli.config import cfg_get
 from utils import is_truthy_value
@@ -33,6 +38,10 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+
+# Consecutive turns a session's persisted transcript may lag its live cached history before
+# _load_turn_history escalates the lag line from WARNING to ERROR (#114266: 11 days of WARNING).
+_TRANSCRIPT_LAG_ESCALATION_TURNS = 3
 
 # Exact refusals retained for older adapters/connectors without destination preflight.
 # Substring matching would also silence transient thread-resolution errors.
@@ -58,6 +67,28 @@ def _renders_exec_approval_buttons(adapter_cls: type) -> bool:
 _CLARIFY_EXPIRED_NOTICE = "⏳ This prompt expired — please send a new request."
 
 
+async def _await_exact_task_through_cancellation(
+    task: asyncio.Task,
+) -> tuple[Any, bool]:
+    """Await one child despite repeated cancellation of its parent waiter.
+
+    Returns the child's result and whether parent cancellation was observed.
+    Every wait is shielded, so another cancellation cannot reach the exact
+    once-created child. A cancellation originating from the child itself is
+    propagated immediately rather than mistaken for a parent cancellation.
+    """
+    parent_cancelled = False
+    while True:
+        try:
+            return await asyncio.shield(task), parent_cancelled
+        except asyncio.CancelledError:
+            if task.cancelled():
+                raise
+            parent_cancelled = True
+            if task.done():
+                return task.result(), parent_cancelled
+
+
 class _ExecApprovalDeclined(RuntimeError):
     """The connector refused the approval card's destination.
 
@@ -74,6 +105,60 @@ class TurnRunner:
     def __init__(self, runner: "GatewayRunner", ctx: TurnContext) -> None:
         self._runner = runner
         self._ctx = ctx
+        self._progress_ingress_lock = threading.RLock()
+        self._progress_ingress_open = True
+        self._progress_started = asyncio.Event()
+        self._progress_task = None
+        self._progress_close_task = None
+
+    @staticmethod
+    def lifecycle_progress_enabled(adapter, source, grouping, native_cards=False) -> bool:
+        from gateway.run import _gateway_surface_passes_raw_text
+        return bool(
+            adapter is not None and grouping != "separate" and not native_cards
+            and not _gateway_surface_passes_raw_text(source.platform)
+            and getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True)
+            and getattr(type(adapter), "edit_message", None) not in (None, BasePlatformAdapter.edit_message)
+        )
+
+    def close_progress_ingress(self) -> None:
+        with self._progress_ingress_lock:
+            self._progress_ingress_open = False
+
+    def enqueue_lifecycle_progress(self, raw) -> None:
+        with self._progress_ingress_lock:
+            if self._progress_ingress_open and self._ctx.progress_queue is not None:
+                self._ctx.progress_queue.put(raw)
+
+    async def complete_lifecycle_progress(self, terminal_text=None) -> bool | SendResult:
+        if self._progress_close_task is None:
+            self._progress_close_task = asyncio.create_task(self._close_lifecycle_progress(terminal_text))
+        result, cancelled = await _await_exact_task_through_cancellation(self._progress_close_task)
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
+
+    async def _close_lifecycle_progress(self, terminal_text) -> bool | SendResult:
+        task = self._progress_task
+        ack = None
+        try:
+            if task is not None and not task.done():
+                await self._progress_started.wait()
+                if terminal_text and not task.done():
+                    ack = asyncio.get_running_loop().create_future()
+                    self._ctx.progress_queue.put(("__terminal__", terminal_text, ack))
+                    with suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(asyncio.shield(ack), 5.0)
+        finally:
+            if task is not None:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await _await_exact_task_through_cancellation(task)
+            self._drain_progress_queue()
+            if ack is not None and not ack.done():
+                ack.set_result(False)
+        result = ack.result() if ack is not None and not ack.cancelled() else False
+        return result if declined_send(result) else result is True
 
     # ── shared thread→loop plumbing ─────────────────────────────────────────────────────────
 
@@ -100,7 +185,22 @@ class TurnRunner:
         q = self._ctx.progress_queue
         with suppress(Exception):
             while not q.empty():
-                q.get_nowait()
+                self._resolve_raw_progress_ack(q.get_nowait(), False)
+
+    @staticmethod
+    def _is_lifecycle_marker(raw) -> bool:
+        return isinstance(raw, tuple) and bool(raw) and raw[0] in {
+            "__append__", "__upsert__", "__terminal__", "__flush__",
+        }
+
+    @staticmethod
+    def _resolve_raw_progress_ack(raw, delivered) -> None:
+        if isinstance(raw, tuple) and raw and raw[0] in {"__terminal__", "__flush__"}:
+            ack = raw[-1]
+            if isinstance(ack, asyncio.Future) and not ack.done():
+                # Preserve the adapter's refusal through the cached completion:
+                # a missing acknowledgement alone permits the ordinary final.
+                ack.set_result(delivered if declined_send(delivered) else delivered is True)
 
     def _track_progress_result(self, result) -> None:
         """Remember a delivered progress/status message id for end-of-turn cleanup."""
@@ -119,6 +219,11 @@ class TurnRunner:
 
     def progress_callback(self, event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
         """Callback invoked by agent on tool lifecycle events."""
+        with self._progress_ingress_lock:
+            if self._progress_ingress_open:
+                return self._progress_callback_open(event_type, tool_name, preview, args, **kwargs)
+
+    def _progress_callback_open(self, event_type, tool_name=None, preview=None, args=None, **kwargs):
         ctx = self._ctx
         # Failed subagent → one clean user-facing notice, handled FIRST, before every progress-queue
         # gate: platforms with tool_progress off must still hear about a dead delegation.
@@ -175,6 +280,7 @@ class TurnRunner:
     def _progress_subagent_notice(self, preview, kwargs: dict) -> None:
         """Only terminal failure statuses render (same notice rail as credit warnings)."""
         ctx = self._ctx
+        from gateway.warning_notifications import render_notification
         status = kwargs.get("status")
         try:
             from tools.delegate_tool import SUBAGENT_FAILURE_STATUSES, format_subagent_failure_line
@@ -183,7 +289,9 @@ class TurnRunner:
                     kwargs.get("goal"), status, error=kwargs.get("summary") or preview,
                     duration_seconds=kwargs.get("duration_seconds"), failure_reason=kwargs.get("failure_reason"),
                 )
-                self._schedule(self._runner._deliver_platform_notice(ctx.source, line), "subagent failure notice scheduling error")
+                render_notification(
+                    lambda: self._schedule(self._runner._deliver_platform_notice(ctx.source, line), "subagent failure notice scheduling error"),
+                    platform=ctx.source.platform, user_config=ctx.user_config)
         except Exception:
             logger.debug("subagent failure notice failed", exc_info=True)
 
@@ -257,9 +365,21 @@ class TurnRunner:
         from agent.display import get_tool_emoji
         emoji = get_tool_emoji(tool_name, default="⚙️")
         try:
-            adapter = self._runner._adapter_for_source(ctx.source)
+            adapter = self._runner._delivery_adapter_for(ctx.source)
         except Exception:
             adapter = None
+        if ctx.progress_mode == "full":
+            safe_args = _redact_full_progress_args(args if isinstance(args, dict) else {})
+            args_str = json.dumps(safe_args, ensure_ascii=False, default=str)
+            # Keep image Markdown inert even when an adapter rewrites it inside
+            # JSON strings. Escaping after serialization preserves literal
+            # backslashes and decoded keys/values; splitting measures these bytes.
+            if not callable(getattr(adapter, "format_literal_message", None)):
+                args_str = args_str.replace("![", r"\u0021[")
+            safe_name = _redact_full_progress_string(str(tool_name))
+            ctx.last_was_terminal_block[0] = False
+            ctx.progress_queue.put(("__full__", f"{emoji} {safe_name}\n{args_str}"))
+            return None
         code_full, code_short = self._progress_terminal_blocks(adapter, tool_name, args, emoji)
         verbose = ctx.progress_mode == "verbose"
         code = code_full if verbose else code_short
@@ -521,6 +641,16 @@ class TurnRunner:
 
     # ── editable progress bubbles (progress-queue drain) ────────────────────────────────────
 
+    class _LifecycleLine(str):
+        key: Optional[str]
+        terminal: bool
+
+        def __new__(cls, text, key=None, terminal=False):
+            line = super().__new__(cls, text)
+            line.key = key
+            line.terminal = terminal
+            return line
+
     @dataclasses.dataclass
     class _ProgressEditState:
         """Mutable editable-bubble state shared by ``send_progress_messages`` and its helpers."""
@@ -545,6 +675,12 @@ class TurnRunner:
             with suppress(Exception):
                 raw_limit = int(adapter.max_message_length_for_chat(ctx.source.chat_id) or 4000)
                 len_fn = adapter.message_len_fn_for_chat(ctx.source.chat_id)
+            if ctx.progress_mode == "full":
+                # Native sends may format before splitting (MarkdownV2 escaping
+                # expands JSON). Fit both the raw edit and the formatted send.
+                raw_len_fn = len_fn
+                format_text = getattr(adapter, "format_literal_message", adapter.format_message)
+                len_fn = lambda text: max(raw_len_fn(text), raw_len_fn(format_text(text)))
         return self._ProgressEditState(
             adapter=adapter, progress_lines=[], progress_msg_id=None,
             # "separate" = one message per tool (pre-v0.9 behavior)
@@ -553,8 +689,18 @@ class TurnRunner:
             # Leave room for platform quirks / formatting; tiny test adapters keep a usable limit.
             _PROGRESS_TEXT_LIMIT=max(1, raw_limit - (64 if raw_limit > 128 else 0)),
             # Overflow edits pass metadata (Telegram topic/thread routing) only when edit_message takes it.
-            _edit_accepts_metadata=bool(ctx._progress_metadata) and _accepts_keyword(adapter.edit_message, "metadata"),
+            _edit_accepts_metadata=(bool(ctx._progress_metadata) or (
+                ctx.progress_mode == "full" and callable(getattr(adapter, "format_literal_message", None))
+            )) and _accepts_keyword(adapter.edit_message, "metadata"),
         )
+
+    def _progress_egress_metadata(self, adapter):
+        metadata = self._ctx._progress_metadata
+        if self._ctx.progress_mode == "full":
+            metadata = {**(metadata or {}), "_interim_send": True}
+            if callable(getattr(adapter, "format_literal_message", None)):
+                metadata["_literal_text"] = True
+        return metadata
 
     async def _edit_progress_message(self, st, message_id: str, content: str):
         ctx = self._ctx
@@ -562,7 +708,9 @@ class TurnRunner:
         if getattr(st.adapter, "REQUIRES_EDIT_FINALIZE", False):
             kwargs["finalize"] = True
         if st._edit_accepts_metadata:
-            kwargs["metadata"] = ctx._progress_metadata
+            kwargs["metadata"] = (self._progress_egress_metadata(st.adapter)
+                                  if callable(getattr(st.adapter, "format_literal_message", None))
+                                  else ctx._progress_metadata)
         return await st.adapter.edit_message(**kwargs)
 
     @staticmethod
@@ -573,7 +721,16 @@ class TurnRunner:
         """Partition progress lines into platform-sized editable bubbles."""
         groups: list[list] = []
         current: list = []
+        ordered, segment = [], []
         for line in lines:
+            if getattr(line, "terminal", False):
+                ordered.extend(sorted(segment, key=lambda item: getattr(item, "key", None) is not None))
+                segment = []
+                ordered.append(line)
+            else:
+                segment.append(line)
+        ordered.extend(sorted(segment, key=lambda item: getattr(item, "key", None) is not None))
+        for line in ordered:
             candidate = current + [line]
             if current and st._progress_len_fn(self._progress_text(candidate)) > st._PROGRESS_TEXT_LIMIT:
                 groups.append(current)
@@ -583,8 +740,9 @@ class TurnRunner:
 
     async def _send_progress_text(self, st, text: str):
         ctx = self._ctx
+        metadata = self._progress_egress_metadata(st.adapter)
         result = await st.adapter.send(
-            chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
+            chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to, metadata=metadata,
         )
         self._track_progress_result(result)
         return result
@@ -620,6 +778,202 @@ class TurnRunner:
         return True
 
     @staticmethod
+    def _is_full_marker(raw) -> bool:
+        return isinstance(raw, tuple) and len(raw) == 2 and raw[0] == "__full__"
+
+    @staticmethod
+    def _full_progress_result_ids(result) -> tuple[str, ...]:
+        # Telegram send receipts name the FIRST id and carry the complete ordered
+        # list in raw_response; other native adapters name the LAST id.
+        raw = getattr(result, "raw_response", None)
+        native_ids = raw.get("message_ids", ()) if isinstance(raw, dict) else ()
+        ids = (*native_ids, *getattr(result, "continuation_message_ids", ()), getattr(result, "message_id", None))
+        return tuple(dict.fromkeys(str(mid) for mid in ids if mid is not None))
+
+    def _track_full_progress_result(self, result, *, terminal=False) -> None:
+        """Own every proven native ID, including IDs returned on partial failure."""
+        ctx = self._ctx
+        ids = self._full_progress_result_ids(result)
+        if terminal:
+            raw = getattr(result, "raw_response", None)
+            raw = raw if isinstance(raw, dict) else {}
+            # A failed edit's primary ID can be only its attempted target.
+            # Explicit multipart receipts still prove delivery on failure;
+            # native partial_overflow also acknowledges its primary ID.
+            proven_ids = ids if (getattr(result, "success", False) or raw.get("partial_overflow")) else (
+                *raw.get("message_ids", ()), *getattr(result, "continuation_message_ids", ()),
+            )
+            ctx._terminal_progress_msg_ids.update(str(mid) for mid in proven_ids if mid is not None)
+        if not ctx._cleanup_progress:
+            return
+        for message_id in ids:
+            if message_id not in ctx._cleanup_msg_ids:
+                ctx._cleanup_msg_ids.append(message_id)
+
+    def _split_full_entry(self, st, entry: str) -> list[str]:
+        """Split even a single entry without dropping whitespace or Unicode."""
+        chunks = []
+        while entry:
+            if st._progress_len_fn(entry) <= st._PROGRESS_TEXT_LIMIT:
+                chunks.append(entry)
+                break
+            low, high, best = 1, len(entry), 0
+            while low <= high:
+                mid = (low + high) // 2
+                if st._progress_len_fn(entry[:mid]) <= st._PROGRESS_TEXT_LIMIT:
+                    best, low = mid, mid + 1
+                else:
+                    high = mid - 1
+            # No valid non-empty chunk exists for a pathological length function.
+            # Preserve master's terminating, lossless best effort in that case.
+            best = max(1, best)
+            chunks.append(entry[:best])
+            entry = entry[best:]
+        return chunks
+
+    async def _send_full_progress_text(self, st, text, *, terminal=False):
+        ctx = self._ctx
+        result = await st.adapter.send(
+            chat_id=ctx.source.chat_id, content=text,
+            reply_to=ctx._progress_reply_to,
+            metadata={**(self._progress_egress_metadata(st.adapter) or {}), "_interim_send": True},
+        )
+        self._track_full_progress_result(result, terminal=terminal)
+        return result
+
+    async def _finalize_full_progress(self, st):
+        """Close an acknowledged editable buffer before immutable continuations."""
+        try:
+            if st.can_edit and st.progress_msg_id is not None and st.progress_lines:
+                result = await self._edit_progress_message(
+                    st, st.progress_msg_id, self._progress_text(st.progress_lines),
+                )
+                self._track_full_progress_result(
+                    result, terminal=any(getattr(line, "terminal", False) for line in st.progress_lines),
+                )
+                if not result.success:
+                    st.can_edit = False
+        finally:
+            # The buffer was already acknowledged. Even a failed final edit is
+            # never evidence that a duplicate send would be safe.
+            self._reset_progress_bubble(st)
+
+    async def _deliver_keyed_progress_overflow(self, st, groups) -> bool | SendResult:
+        for index, group in enumerate(groups):
+            if not self._ctx._run_still_current() or self._agent_interrupted():
+                self._reset_progress_bubble(st)
+                return False
+            text = self._progress_text(group)
+            terminal = any(getattr(line, "terminal", False) for line in group)
+            if index == 0 and st.progress_msg_id is not None:
+                result = await self._edit_progress_message(st, st.progress_msg_id, text)
+                self._track_full_progress_result(result, terminal=terminal)
+            else:
+                result = await self._send_full_progress_text(st, text, terminal=terminal)
+            if not getattr(result, "success", False):
+                self._reset_progress_bubble(st)
+                return result if declined_send(result) else False
+            ids = self._full_progress_result_ids(result)
+            st.progress_msg_id = result.message_id if len(ids) == 1 else None
+            st.progress_lines = group if st.progress_msg_id else []
+        return True
+
+    async def _deliver_full_progress_entry(self, st, entry):
+        """Deliver one full entry once, confined to the native progress owner."""
+        if not self._ctx._run_still_current() or self._agent_interrupted():
+            return False
+        terminal = getattr(entry, "terminal", False)
+        chunks = self._split_full_entry(st, entry)
+        if len(chunks) > 1:
+            await self._finalize_full_progress(st)
+            delivered = True
+            for chunk in chunks:
+                if not self._ctx._run_still_current() or self._agent_interrupted():
+                    delivered = False
+                    break
+                result = await self._send_full_progress_text(st, chunk, terminal=terminal)
+                if not result.success:
+                    # Native partial receipts have IDs but no exact delivered
+                    # source range. Own those IDs and stop; never replay guesses.
+                    delivered = result if declined_send(result) else False
+                    break
+            self._reset_progress_bubble(st)
+            return delivered
+
+        groups = self._split_progress_groups(st, st.progress_lines + [entry])
+        if len(groups) > 1 and any(getattr(line, "key", None) is not None for line in st.progress_lines):
+            return await self._deliver_keyed_progress_overflow(st, groups)
+        combined = self._progress_text(st.progress_lines + [entry])
+        if st.progress_lines and st._progress_len_fn(combined) > st._PROGRESS_TEXT_LIMIT:
+            await self._finalize_full_progress(st)
+            combined = entry
+        if st.can_edit and st.progress_msg_id is not None:
+            result = await self._edit_progress_message(st, st.progress_msg_id, combined)
+            self._track_full_progress_result(
+                result, terminal=terminal or any(getattr(line, "terminal", False) for line in st.progress_lines),
+            )
+            multipart = (bool(getattr(result, "continuation_message_ids", ()))
+                         or len(self._full_progress_result_ids(result)) > 1)
+            if result.success and not multipart:
+                st.progress_lines.append(entry)
+                return True
+            self._reset_progress_bubble(st)
+            if declined_send(result):
+                return result
+            if result.success or multipart:
+                # A split result's primary ID never represents the whole entry.
+                return bool(result.success)
+            st.can_edit = False
+            if getattr(result, "retryable", False):
+                return False
+            # Only the new entry needs a fallback, never the acknowledged prefix.
+        # Either awaited edit above may have outlived this run.
+        if not self._ctx._run_still_current() or self._agent_interrupted():
+            return False
+        result = await self._send_full_progress_text(st, entry, terminal=terminal)
+        if (st.can_edit and result.success and result.message_id
+                and not getattr(result, "continuation_message_ids", ())
+                and len(self._full_progress_result_ids(result)) == 1):
+            st.progress_msg_id, st.progress_lines = result.message_id, [entry]
+        else:
+            self._reset_progress_bubble(st)
+        return result if declined_send(result) else bool(getattr(result, "success", False))
+
+    async def _deliver_lifecycle_progress(self, st, raw) -> bool | SendResult:
+        delivered = False
+        try:
+            if not self._ctx._run_still_current() or self._agent_interrupted():
+                return False
+            if raw[0] == "__flush__":
+                if self._ctx.progress_mode == "full" or not st.progress_lines:
+                    delivered = True
+                elif st.can_edit and st.progress_msg_id:
+                    result = await self._edit_progress_message(st, st.progress_msg_id, self._progress_text(st.progress_lines))
+                    self._track_full_progress_result(
+                        result, terminal=any(getattr(line, "terminal", False) for line in st.progress_lines),
+                    )
+                    delivered = result if declined_send(result) else bool(getattr(result, "success", False))
+            else:
+                entry = self._progress_absorb(st, raw)
+                st.progress_lines.pop()
+                delivered = await self._deliver_full_progress_entry(st, entry)
+            if not declined_send(delivered):
+                delivered = delivered and self._ctx._run_still_current() and not self._agent_interrupted()
+            return delivered
+        finally:
+            self._resolve_raw_progress_ack(raw, delivered)
+
+    async def _send_full_progress_entry(self, st, entry):
+        # One child owns the whole delivery operation. Repeated cancellation of
+        # the queue consumer cannot orphan or recreate its in-flight sends.
+        operation = (self._deliver_lifecycle_progress(st, entry) if self._is_lifecycle_marker(entry)
+                     else self._deliver_full_progress_entry(st, entry))
+        child = asyncio.create_task(operation)
+        _, cancelled = await _await_exact_task_through_cancellation(child)
+        if cancelled:
+            raise asyncio.CancelledError
+
+    @staticmethod
     def _is_reset_marker(raw) -> bool:
         return isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__"
 
@@ -631,26 +985,47 @@ class TurnRunner:
 
     def _progress_absorb(self, st, raw) -> Any:
         """Fold a queue item into the bubble buffer; returns the line to render this tick."""
-        if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
+        if self._is_lifecycle_marker(raw):
+            key = str(raw[1]) if raw[0] == "__upsert__" else None
+            if key is not None:
+                st.progress_lines = [line for line in st.progress_lines if getattr(line, "key", None) != key]
+            text = raw[2] if key is not None else raw[1]
+            raw = self._LifecycleLine(str(text), key, raw[0] == "__terminal__")
+        elif isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
             _, base_msg, count = raw
-            if not st.progress_lines:
+            index = next((i for i in range(len(st.progress_lines) - 1, -1, -1)
+                          if not isinstance(st.progress_lines[i], self._LifecycleLine)), None)
+            if index is None:
                 return base_msg
-            st.progress_lines[-1] = f"{base_msg} (×{count + 1})"
-            return st.progress_lines[-1]
+            st.progress_lines[index] = f"{base_msg} (×{count + 1})"
+            return st.progress_lines[index]
         st.progress_lines.append(raw)
         return raw
 
     async def _flush_progress_edit(self, st) -> None:
+        if self._ctx.progress_mode == "full":
+            return  # Full entries are acknowledged before their buffer is retained.
         if st.can_edit and st.progress_lines and st.progress_msg_id:
             with suppress(Exception):
-                await self._edit_progress_message(st, st.progress_msg_id, self._progress_text(st.progress_lines))
+                result = await self._edit_progress_message(st, st.progress_msg_id, self._progress_text(st.progress_lines))
+                self._track_full_progress_result(
+                    result, terminal=any(getattr(line, "terminal", False) for line in st.progress_lines),
+                )
 
     async def _drain_progress_on_cancel(self, st) -> None:
         ctx = self._ctx
         with suppress(Exception):
             while not ctx.progress_queue.empty():
                 raw = ctx.progress_queue.get_nowait()
-                if self._is_reset_marker(raw):
+                if not ctx._run_still_current() or self._agent_interrupted():
+                    self._resolve_raw_progress_ack(raw, False)
+                    continue
+                if self._is_lifecycle_marker(raw) or self._is_full_marker(raw):
+                    operation = (self._deliver_lifecycle_progress(st, raw) if self._is_lifecycle_marker(raw)
+                                 else self._deliver_full_progress_entry(st, raw[1]))
+                    child = asyncio.create_task(operation)
+                    await _await_exact_task_through_cancellation(child)
+                elif self._is_reset_marker(raw):
                     # Content-bubble marker during drain: close the current progress bubble
                     # and start a fresh one for tool lines that arrived after.
                     await self._roll_progress_overflow_if_needed(st)
@@ -662,7 +1037,9 @@ class TurnRunner:
         # Final edit with all remaining tools (only if editing works)
         if st.can_edit and st.progress_lines and st.progress_msg_id:
             await self._roll_progress_overflow_if_needed(st)
-        await self._flush_progress_edit(st)
+        if ctx._run_still_current() and not self._agent_interrupted():
+            await self._flush_progress_edit(st)
+        self._drain_progress_queue()
 
     async def _progress_restore_typing(self, st) -> None:
         ctx = self._ctx
@@ -696,9 +1073,11 @@ class TurnRunner:
         return True
 
     async def send_progress_messages(self):
+        self._progress_started.set()
         ctx = self._ctx
-        adapter = self._runner._adapter_for_source(ctx.source) if ctx.progress_queue else None
+        adapter = self._runner._delivery_adapter_for(ctx.source) if ctx.progress_queue else None
         if not adapter:
+            self._drain_progress_queue()
             return
         if ctx._native_slack_task_cards and hasattr(adapter, "send_native_task_card_progress"):
             await self._send_native_task_card_progress(adapter)
@@ -722,10 +1101,17 @@ class TurnRunner:
                 # Drain silently when interrupted: events queued in the window between tool parse
                 # and interrupt processing should not render as bubbles.
                 if self._agent_interrupted():
+                    self._resolve_raw_progress_ack(raw, False)
                     await asyncio.sleep(0)
+                    continue
+                if self._is_lifecycle_marker(raw):
+                    await self._send_full_progress_entry(st, raw)
                     continue
                 if self._is_reset_marker(raw):
                     self._reset_progress_bubble(st)
+                    continue
+                if self._is_full_marker(raw):
+                    await self._send_full_progress_entry(st, raw[1])
                     continue
                 msg = self._progress_absorb(st, raw)
                 if not await self._roll_progress_overflow_if_needed(st):
@@ -743,7 +1129,11 @@ class TurnRunner:
                 last_edit_ts = time.monotonic()
                 await self._progress_restore_typing(st)
             except queue.Empty:
-                await asyncio.sleep(0.3)
+                try:
+                    await asyncio.sleep(0.3)
+                except asyncio.CancelledError:
+                    await self._drain_progress_on_cancel(st)
+                    return
             except asyncio.CancelledError:
                 await self._drain_progress_on_cancel(st)
                 return
@@ -783,6 +1173,11 @@ class TurnRunner:
     # mispair concurrent calls to the same tool.
     def native_tool_start_callback(self, call_id, tool_name, args):
         """Queue an ID-correlated native progress start from the agent thread."""
+        with self._progress_ingress_lock:
+            if self._progress_ingress_open:
+                return self._native_tool_start_open(call_id, tool_name, args)
+
+    def _native_tool_start_open(self, call_id, tool_name, args):
         if not self._native_card_gate():
             return
         from agent.display import build_tool_preview
@@ -794,6 +1189,11 @@ class TurnRunner:
 
     def native_tool_complete_callback(self, call_id, tool_name, args, result):
         """Queue the matching native completion using the real tool-call ID."""
+        with self._progress_ingress_lock:
+            if self._progress_ingress_open:
+                return self._native_tool_complete_open(call_id, tool_name, args, result)
+
+    def _native_tool_complete_open(self, call_id, tool_name, args, result):
         if not self._native_card_gate():
             return
         from agent.display import _detect_tool_failure
@@ -875,9 +1275,15 @@ class TurnRunner:
             logger.debug("Failed to attach session title callback", exc_info=True)
 
     def _status_callback_sync(self, event_type: str, message: str) -> None:
+        with self._progress_ingress_lock:
+            if self._progress_ingress_open:
+                return self._status_callback_open(event_type, message)
+
+    def _status_callback_open(self, event_type: str, message: str) -> None:
         from gateway.run import _prepare_gateway_status_message, _redact_gateway_user_facing_secrets, _send_or_update_status_coro
+        from gateway.warning_notifications import is_warning_status, render_notification
         ctx = self._ctx
-        if not self._status_live():
+        if ctx.mute_notification_reply or not self._status_live():
             return
         prepared = _prepare_gateway_status_message(ctx.source.platform, event_type, message)
         if prepared is None:
@@ -887,17 +1293,28 @@ class TurnRunner:
                 _redact_gateway_user_facing_secrets(str(message or ""))[:160],
             )
             return
-        fut = self._schedule(
-            _send_or_update_status_coro(ctx._status_adapter, ctx._status_chat_id, event_type, prepared, ctx._status_thread_metadata),
-            f"status_callback ({event_type}) scheduling error",
-        )
-        if fut is not None and ctx._cleanup_progress:
-            fut.add_done_callback(self._track_future_cleanup_id)
+        def present():
+            from gateway.run import _COMPRESSION_PROGRESS_STATUS_RE
+            if (ctx.progress_queue is not None
+                    and self.lifecycle_progress_enabled(ctx._status_adapter, ctx.source, ctx.progress_grouping, ctx._native_slack_task_cards)
+                    and _COMPRESSION_PROGRESS_STATUS_RE.search(prepared)):
+                ctx.progress_queue.put(("__append__", prepared))
+                return
+            fut = self._schedule(
+                _send_or_update_status_coro(ctx._status_adapter, ctx._status_chat_id, event_type, prepared, ctx._status_thread_metadata),
+                f"status_callback ({event_type}) scheduling error",
+            )
+            if fut is not None and ctx._cleanup_progress:
+                fut.add_done_callback(self._track_future_cleanup_id)
+        render_notification(present, platform=ctx.source.platform, user_config=ctx.user_config,
+                            diagnostic=is_warning_status(event_type, message))
 
     # ── stream consumer / interim commentary wiring ─────────────────────────────────────────
 
     def _setup_stream_consumer(self, platform_key):
         ctx = self._ctx
+        if ctx.mute_notification_reply:
+            return None, None, None, False
         stream_consumer = None
         # The streaming-TTS consumer is created on the outer loop thread before run_sync launches;
         # run_sync only reads it via the holder for delta-callback wiring.
@@ -908,17 +1325,24 @@ class TurnRunner:
             scfg = StreamingConfig()
         # display.platforms.<plat>.streaming may disable streaming per platform; None = follow global.
         plat_streaming = ctx.resolve_display_setting(ctx.user_config, platform_key, "streaming")
-        want_stream_deltas = (
-            scfg.enabled and scfg.transport != "off" if plat_streaming is None else bool(plat_streaming)
-        )
-        want_interim_messages = ctx.interim_assistant_messages_enabled
+        want_stream_deltas = not ctx.scheduled_heartbeat and scfg.enabled_for(plat_streaming)
+        want_interim_messages = bool(ctx.interim_assistant_messages_enabled) and not ctx.scheduled_heartbeat
         if want_stream_deltas or want_interim_messages:
             try:
                 from gateway.stream_consumer import GatewayStreamConsumer
-                adapter = self._runner._adapter_for_source(ctx.source)
+                adapter = self._runner._delivery_adapter_for(ctx.source)
                 if adapter:
+                    supports_incremental_stream = (
+                        getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True)
+                        or bool(getattr(adapter, "SUPPORTS_NATIVE_STREAMING", False))
+                    )
+                    consumer_stream_deltas = want_stream_deltas and supports_incremental_stream
                     consumer_cfg, pause_typing_before_finalize = self._runner._build_stream_consumer_config(
-                        ctx.source, scfg, adapter, on_missing_cursor="raise",
+                        ctx.source, scfg, adapter,
+                        # A complete commentary message needs no edit cursor.  Keeping it on the
+                        # consumer records what reached non-editable platforms, so an interim
+                        # callback carrying the final answer participates in final-send dedup.
+                        on_missing_cursor="fallback" if want_interim_messages else "raise",
                     )
                     stream_consumer = GatewayStreamConsumer(
                         adapter=adapter, chat_id=ctx.source.chat_id, config=consumer_cfg,
@@ -933,11 +1357,16 @@ class TurnRunner:
                     # #105341: a consumer created only for interim commentary (text streaming off)
                     # is never fed the final reply's deltas — mark it so the duplicate-risk
                     # diagnostic in ``_run_agent_mark_streamed_delivery`` stays silent.
-                    stream_consumer.stream_deltas_enabled = want_stream_deltas
+                    stream_consumer.stream_deltas_enabled = consumer_stream_deltas
             except Exception as err:
                 logger.debug("Could not set up stream consumer: %s", err)
         # Deltas tee to the stream consumer (when text streaming is on) and to streaming TTS.
-        delta_sinks = [sc for sc in ((stream_consumer if want_stream_deltas else None), stts) if sc is not None]
+        delta_sinks = [
+            sc for sc in (
+                stream_consumer if stream_consumer and stream_consumer.stream_deltas_enabled else None,
+                stts,
+            ) if sc is not None
+        ]
         stream_delta_cb = None
         if delta_sinks:
             def stream_delta_cb(text: Optional[str]) -> None:
@@ -1147,15 +1576,20 @@ class TurnRunner:
         """Credits / out-of-band notices (usage bands, depletion, restored) fire from the agent's
         sync worker thread; hop onto the gateway loop. Fired-once latch lives on the cached agent."""
         from gateway.run import render_notice_line
-        if not self._status_live():
+        from gateway.warning_notifications import is_diagnostic_notice, render_notification
+        if self._ctx.mute_notification_reply or not self._status_live():
             return
-        try:
-            line = render_notice_line(notice)
-        except Exception:
-            logger.debug("render_notice_line failed", exc_info=True)
-            return
-        if line:
-            self._schedule(self._runner._deliver_platform_notice(self._ctx.source, line), "notice_callback delivery scheduling error")
+        diagnostic = is_diagnostic_notice(notice)
+        def present():
+            try:
+                line = render_notice_line(notice)
+            except Exception:
+                logger.debug("render_notice_line failed", exc_info=True)
+                return
+            if line:
+                self._schedule(self._runner._deliver_platform_notice(self._ctx.source, line), "notice_callback delivery scheduling error")
+        render_notification(present, platform=self._ctx.source.platform,
+                            user_config=self._ctx.user_config, diagnostic=diagnostic)
 
     def _make_bg_review_callbacks(self):
         """(send, release): background-review messages ("💾 Memory updated") are held until the
@@ -1214,6 +1648,8 @@ class TurnRunner:
         baked into the cached agent."""
         ctx = self._ctx
         runner = self._runner
+        agent._notification_config = ctx.user_config
+        agent._notification_platform = ctx.source.platform
         # ALWAYS attached (never gated to None): its body gates each event class, and subagent-
         # failure notices must fire even with tool_progress/thinking off.
         agent.tool_progress_callback = ctx.progress_callback
@@ -1256,6 +1692,16 @@ class TurnRunner:
         # Thinking between tool calls is independent of tool_progress mode (Mattermost opts in
         # per platform so global scratch-text doesn't leak into threads).
         agent.thinking_progress = ctx._thinking_enabled
+        if ctx.mute_notification_reply:
+            # Controls and operational event/step callbacks remain wired. These
+            # presentation callbacks are rebound on every next turn.
+            agent.tool_progress_callback = None
+            agent.tool_start_callback = None
+            agent.tool_complete_callback = None
+            # Keep diagnostic observers installed; concrete sinks veto display.
+            agent.stream_delta_callback = None
+            agent.interim_assistant_callback = None
+            agent.thinking_progress = False
         ctx.agent_holder[0] = agent  # interrupt support
         # The titler fires from the turn prologue, so attach the rename lane before the run.
         self._attach_session_title_callback(agent, ctx)
@@ -1294,19 +1740,67 @@ class TurnRunner:
             logger.warning("%s boundary timed out or failed: %s", reason, err)
             return False
 
-    def _clarify_callback_sync(self, question: str, choices, multi_select: bool = False) -> str:
+    def _clarify_callback_sync(self, question: str, choices, multi_select: bool = False,
+                               questions=None) -> str:
         """Present a clarify prompt and block on a response (clarify_tool's synchronous contract):
         schedule send_clarify on the gateway loop, block on the primitive's threading.Event with a
-        timeout. Returns the response string, or a sentinel when none arrived."""
-        from gateway.run import _clarify_send_then_wait
+        timeout. Returns the response string, or a sentinel when none arrived.
+
+        ``questions`` (clarify_tool's batch form) is answered here, one card per question, because
+        this surface knows whether an answer arrived: the loop that would otherwise call this
+        callback once per question can only recognize "no answer" from the returned sentinel text,
+        and treated that text as the question's answer.
+        """
+        if questions:
+            return self._clarify_batch_sync(questions)
+        response, _answered = self._ask_clarify_question(question, choices, multi_select)
+        return response
+
+    def _clarify_batch_sync(self, questions) -> str:
+        """Answer a batch: one card per question, stop at the first the user never answers.
+        Returns the JSON shape clarify_tool's batch path reads. The stream/typing re-arm waits for
+        the last question — between two cards it only opens a bubble the next boundary closes."""
+        answers: Dict[str, Any] = {}
+        payload: Dict[str, Any] = {"answers": answers, "timed_out": False}
+        last = len(questions) - 1
+        for index, entry in enumerate(questions):
+            raw, answered = self._ask_clarify_question(
+                entry.get("question", ""), entry.get("choices"), bool(entry.get("multi_select")),
+                rearm=index == last)
+            if not answered:
+                # The surface's own no-answer text ("could not be delivered", "did not respond
+                # within Nm") rides along as ``notice``: blank answers alone read as user
+                # inactivity, which is the misreport #112684 describes for an undelivered card.
+                payload.update(timed_out=True, notice=raw)
+                break
+            answers[entry.get("qid") or f"q{index}"] = raw
+        return json.dumps(payload, ensure_ascii=False)
+
+    def _ask_clarify_question(self, question, choices, multi_select, rearm: bool = True) -> tuple[str, bool]:
+        """One card: register, send, wait, then retire it (no answer) or re-arm (answer).
+        Returns ``(response, answered)``; the caller decides what "no answer" means — a sentinel
+        for a single question, the batch's ``timed_out`` flag."""
+        from gateway.run_turn_runner_clarify_delivery import (
+            UNDELIVERED_NO_SURFACE, _clarify_send_then_wait, text_fallback_coro)
         from tools import clarify_gateway as clarify_mod
         import uuid
         ctx = self._ctx
         if not ctx._status_adapter:
-            return ""
+            # Nothing can render the question: say so, or the batch's blank answers read as
+            # user inactivity (#112684).
+            return UNDELIVERED_NO_SURFACE, False
         session_key = ctx.session_key or ""
         clarify_id = uuid.uuid4().hex[:10]
         choices = list(choices) if choices else None
+        send_kwargs = dict(
+            chat_id=ctx._status_chat_id, question=question, choices=choices, clarify_id=clarify_id,
+            session_key=session_key, metadata=ctx._status_thread_metadata,
+        )
+
+        def _text_fallback():
+            """Schedule the plain-text prompt when the native card cannot render; None = no such path."""
+            coro = text_fallback_coro(ctx._status_adapter, **send_kwargs)
+            return None if coro is None else self._schedule(coro, "Clarify text fallback failed to schedule")
         clarify_mod.register(
             clarify_id=clarify_id, session_key=session_key, question=question, choices=choices,
             multi_select=bool(multi_select),
@@ -1328,17 +1822,16 @@ class TurnRunner:
         except Exception:
             logger.debug("Stream-consumer flush before clarify prompt failed", exc_info=True)
         fut = self._schedule(
-            ctx._status_adapter.send_clarify(
-                chat_id=ctx._status_chat_id, question=question, choices=choices, clarify_id=clarify_id,
-                session_key=session_key, metadata=ctx._status_thread_metadata,
-            ),
+            ctx._status_adapter.send_clarify(**send_kwargs),
             "Clarify send failed to schedule",
         )
         # Boundary rule (see _approval_send_outcome): a send timeout is AMBIGUOUS — the card may
         # have posted with a late ack. Only a definitive failure tears down the registration;
-        # ambiguous falls through to the bounded wait so a late reply resolves.
+        # ambiguous falls through to the bounded wait so a late reply resolves. A definitive
+        # failure — immediate or late — retries once as plain text before giving up.
         response, answered = _clarify_send_then_wait(
-            fut, clarify_id=clarify_id, session_key=session_key, clarify_mod=clarify_mod)
+            fut, clarify_id=clarify_id, session_key=session_key, clarify_mod=clarify_mod,
+            fallback=_text_fallback)
         # Branch on the explicit flag, never on the text: a real answer can start with '[' (a
         # "[A] staging" label, "[urgent] ..." free text) and must not be mistaken for a sentinel.
         if not answered:
@@ -1349,7 +1842,7 @@ class TurnRunner:
                 self._schedule(
                     retire(ctx._status_adapter, clarify_id, _CLARIFY_EXPIRED_NOTICE),
                     "Clarify card retire failed to schedule")
-        else:
+        elif rearm:
             # Reopen typing IMMEDIATELY, not on the LLM's first post-answer token (native streaming
             # otherwise re-seeds lazily on the first delta: ~48s of dead air). request_reopen_seed is
             # a no-op outside the reopen-pending native state.
@@ -1363,7 +1856,7 @@ class TurnRunner:
                 ctx._status_adapter.resume_typing_for_chat(ctx._status_chat_id)
             except Exception:
                 logger.debug("resume_typing_for_chat after clarify answer failed", exc_info=True)
-        return response
+        return response, answered
 
     def _approval_notify_sync(self, approval_data: dict) -> None:
         """Send the approval request from the agent thread: the adapter's interactive button
@@ -1484,16 +1977,27 @@ class TurnRunner:
         # #50502.
         if reused_cached_agent and getattr(agent, "session_id", None) == ctx.session_id:
             selected = _select_cached_agent_history(agent_history, getattr(agent, "_session_messages", None))
+            # Consecutive lagging turns per session (cleared on /new): one lag is a blip, a streak
+            # is the #114266 write outage and must escalate past a repeating WARNING.
+            streaks = getattr(self._runner, "_transcript_lag_streaks", None)
+            if streaks is None:  # tests may build bare runners
+                streaks = self._runner._transcript_lag_streaks = {}
             if selected is not agent_history:
-                logger.warning(
+                streak = streaks[ctx.session_key] = streaks.get(ctx.session_key, 0) + 1
+                log = logger.error if streak >= _TRANSCRIPT_LAG_ESCALATION_TURNS else logger.warning
+                log(
                     "Persisted transcript lagged live cached history for "
-                    "session %s (disk=%d, memory=%d); preserving live "
-                    "conversation context (possible FTS write corruption)",
-                    ctx.session_key, len(agent_history), len(selected),
+                    "session %s (disk=%d, memory=%d, consecutive_turns=%d); preserving live "
+                    "conversation context (possible FTS write corruption)%s",
+                    ctx.session_key, len(agent_history), len(selected), streak,
+                    "; state.db is not receiving this session's writes and needs operator attention"
+                    if streak >= _TRANSCRIPT_LAG_ESCALATION_TURNS else "",
                 )
                 # The live history bypassed _build_gateway_agent_history's cleanup — re-apply
                 # the full canonicalization so no replay transform can slip through.
                 agent_history = canonicalize_replay_history(selected)
+            else:
+                streaks.pop(ctx.session_key, None)
         # MEDIA paths already in history are excluded from this turn's extraction (compression-safe).
         return agent_history, observed_group_context, _collect_history_media_paths(agent_history)
 
@@ -1509,7 +2013,7 @@ class TurnRunner:
     def _resume_note_interactive(self) -> bool:
         """Interactive platforms report the restore and ask what next; event platforms (webhook,
         API server) continue the work — nobody is present to answer."""
-        return bool(getattr(self._runner._adapter_for_source(self._ctx.source), "interactive_resume", True))
+        return bool(getattr(self._runner._delivery_adapter_for(self._ctx.source), "interactive_resume", True))
 
     def _prepare_turn_message(self, agent_history):
         """Prepend recovery/notice guidance to ``ctx.message``.
@@ -1619,7 +2123,9 @@ class TurnRunner:
             # turn so a restart-interrupted turn is recorded WITH its id for drain-window dedup.
             if ctx.inbound_message_id is not None:
                 kwargs["persist_user_platform_id"] = str(ctx.inbound_message_id)
-            return agent.run_conversation(api_message, **kwargs)
+            from agent.notification_presentation import notification_turn
+            with notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""):
+                return agent.run_conversation(api_message, **kwargs)
         finally:
             unregister_gateway_notify(session_key)
             # Cancel pending clarify entries so blocked agent threads don't hang past the end of the
@@ -1807,6 +2313,10 @@ class TurnRunner:
             model, runtime_kwargs = runner._resolve_session_agent_runtime(
                 source=ctx.source, session_key=ctx.session_key, user_config=ctx.user_config,
             )
+            # Stashed by _resolve_session_agent_runtime when the primary's credentials failed and a
+            # fallback was resolved before any agent exists (#74349); one-shot per turn.
+            pending_fallback_notice = getattr(runner, "_pre_agent_fallback_notice", None)
+            runner._pre_agent_fallback_notice = None
             logger.debug(
                 "run_agent resolved: model=%s provider=%s session=%s",
                 model, runtime_kwargs.get("provider"), ctx.session_key or "",
@@ -1815,6 +2325,12 @@ class TurnRunner:
             # Model/credential resolution failed before the turn began; the raw text (URLs, status
             # codes) belongs in the log, and the chat gets the commands that fix it.
             logger.warning("Model resolution failed for session %s: %s", ctx.session_key or "", exc)
+            from hermes_cli.auth import is_rate_limited_auth_error
+            if is_rate_limited_auth_error(exc.__cause__):
+                # Quota cap with valid credentials: /login cannot help; name the reset window (#89401).
+                from gateway.run import _gateway_provider_error_reply
+                return {"final_response": _gateway_provider_error_reply(str(exc)),
+                        "messages": [], "api_calls": 0, "tools": []}
             return {
                 "final_response": (
                     "⚠️ I couldn't connect to the AI model service, so this message wasn't processed. "
@@ -1831,6 +2347,9 @@ class TurnRunner:
         agent, reused_cached_agent = self._resolve_turn_agent(
             turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr,
         )
+        if pending_fallback_notice:
+            # Reuse the in-agent one-shot notice so the pre-agent provider switch is user-visible too.
+            agent._pending_fallback_notice = pending_fallback_notice
         self._wire_turn_agent_callbacks(agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim)
         agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
         persist_msg, persist_ts = self._prepare_turn_message(agent_history)

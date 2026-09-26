@@ -16,14 +16,45 @@ Behaviour contract:
   * startStream feature-gate error: caches _native_stream_unsupported so
     future supports_draft_streaming() returns False.
   * disconnect(): dangling streams sealed.
+
+Duplicate-reply invariant:
+  * A successfully streamed answer is NEVER posted a second time as a fresh
+    message — not when the agent's final differs from the streamed frames
+    only by surrounding whitespace (``final_response.strip()`` /
+    ``rstrip() + footer``), and not when chat.stopStream fails after the
+    whole answer is already visible (the final is then committed in place
+    via chat.update).
+  * A genuinely uncommittable stream (stopStream AND chat.update fail) still
+    falls back to a fresh post so the answer is not lost.
+  * Interim sends (``_interim_send`` / ``expect_edits``) never seal a stream.
+  * Streams are keyed per (team, channel, thread): two threads in one channel
+    never seal each other's stream.
 """
 
+import asyncio
+import copy
+import json
+import queue
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.config import PlatformConfig
+from gateway.config import Platform, PlatformConfig
+from gateway.run_turn_runner import TurnRunner
+from gateway.session import SessionSource
+from gateway.turn_context import TurnContext
+from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
 from plugins.platforms.slack.adapter import SlackAdapter
+from tests.gateway.test_run_progress_topics import _make_runner
+
+
+class _StreamExpiredError(Exception):
+    """slack_sdk.SlackApiError's shape (``exc.response["error"]``) without importing the SDK,
+    which CI stubs as a bare module. The adapter only reads the response mapping."""
+
+    def __init__(self, message, response):
+        super().__init__(message)
+        self.response = response
 
 
 def _make_adapter(extra=None):
@@ -42,7 +73,13 @@ def _make_adapter(extra=None):
     return a, client
 
 
+def _open_streams(adapter, chat_id="D1"):
+    """Stream entries currently open for ``chat_id`` (any thread/team)."""
+    return [s for k, s in adapter._active_streams.items() if k[1] == chat_id]
+
+
 META = {"thread_id": "111.000", "user_id": "U123"}
+META_B = {"thread_id": "222.000", "user_id": "U123"}
 
 
 class TestSupportsDraftStreaming:
@@ -69,11 +106,6 @@ class TestSupportsDraftStreaming:
     def test_unsupported_when_disconnected(self):
         adapter, _ = _make_adapter()
         adapter._app = None
-        assert adapter.supports_draft_streaming() is False
-
-    def test_unsupported_after_feature_gate_failure(self):
-        adapter, _ = _make_adapter()
-        adapter._native_stream_unsupported = True
         assert adapter.supports_draft_streaming() is False
 
 
@@ -124,7 +156,7 @@ class TestSendDraft:
         result = await adapter.send_draft("D1", 7, "Rewritten text", metadata=META)
         assert not result.success
         client.chat_stopStream.assert_awaited()
-        assert "D1" not in adapter._active_streams
+        assert not _open_streams(adapter)
 
     @pytest.mark.asyncio
     async def test_no_thread_ts_fails_cleanly(self):
@@ -141,7 +173,46 @@ class TestSendDraft:
         result = await adapter.send_draft("D1", 8, "Segment two", metadata=META)
         assert result.success
         client.chat_stopStream.assert_awaited()  # sealed segment one
-        assert adapter._active_streams["D1"]["ts"] == "124.000"
+        (stream,) = _open_streams(adapter)
+        assert stream["ts"] == "124.000"
+
+
+    @pytest.mark.asyncio
+    async def test_expired_stream_reopens_seeded_with_only_the_unsent_tail(self):
+        """Slack seals a native draft stream server-side after a few minutes of a
+        long turn — the same seal the native task-card stream hits (see
+        _slack_error_is's other caller). The next chat.appendStream fails with
+        message_not_in_streaming_state; the lane must not permanently disable
+        draft streaming for the run (#_send_draft_frame's "any failure
+        permanently disables drafts"): drop the dead ts and start a fresh stream
+        in the same thread seeded with ONLY the text past the sealed message (the
+        prefix is already visible there), while later deltas still resume correctly."""
+        adapter, client = _make_adapter()
+        await adapter.send_draft("D1", 7, "Hello wo", metadata=META)
+
+        client.chat_appendStream = AsyncMock(
+            side_effect=_StreamExpiredError("expired", {"ok": False, "error": "message_not_in_streaming_state"})
+        )
+        client.chat_startStream = AsyncMock(return_value={"ok": True, "ts": "124.000"})
+
+        result = await adapter.send_draft("D1", 7, "Hello world!", metadata=META)
+
+        assert result.success
+        assert result.message_id == "124.000"
+        kwargs = client.chat_startStream.await_args.kwargs
+        assert kwargs["markdown_text"] == "rld!"  # sealed message already shows "Hello wo"
+        (reopened,) = _open_streams(adapter)  # same per-thread key, dead ts replaced
+        assert reopened["ts"] == "124.000"
+        assert reopened["sent"] == "Hello world!"  # full segment: deltas diff against it
+        assert reopened["base"] == len("Hello wo")
+        assert kwargs["thread_ts"] == META["thread_id"]
+        assert adapter._native_stream_unsupported is False  # not the feature-gate path
+
+        # A later frame resumes as a normal delta against the reopened stream.
+        client.chat_appendStream = AsyncMock(return_value={"ok": True})
+        result2 = await adapter.send_draft("D1", 7, "Hello world! More.", metadata=META)
+        assert result2.success
+        assert client.chat_appendStream.await_args.kwargs["markdown_text"] == " More."
 
 
 class TestFeatureGateFallback:
@@ -156,16 +227,79 @@ class TestFeatureGateFallback:
         assert adapter._native_stream_unsupported is True
         assert adapter.supports_draft_streaming() is False
 
-    @pytest.mark.asyncio
-    async def test_transient_error_does_not_cache(self):
-        adapter, client = _make_adapter()
-        client.chat_startStream = AsyncMock(side_effect=Exception("timeout"))
-        result = await adapter.send_draft("D1", 7, "Hello", metadata=META)
-        assert not result.success
-        assert adapter._native_stream_unsupported is False
-
 
 class TestSendFinalization:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("oversized", [False, True], ids=["small", "oversized"])
+    async def test_full_progress_leaves_answer_stream_open(self, oversized):
+        adapter, client = _make_adapter()
+        metadata = {**META, "slack_team_id": "T123", "caller_value": {"keep": True}}
+        original_metadata = copy.deepcopy(metadata)
+        progress_attempted = asyncio.Event()
+        post_ids = []
+
+        def post_message(**kwargs):
+            post_ids.append(f"999.{len(post_ids) + 1:03d}")
+            progress_attempted.set()
+            return {"ok": True, "ts": post_ids[-1]}
+
+        def stop_stream(**kwargs):
+            progress_attempted.set()  # Wake RED on the erroneous early seal too.
+            return {"ok": True}
+
+        client.chat_postMessage.side_effect = post_message
+        client.chat_stopStream.side_effect = stop_stream
+        ctx = TurnContext(
+            source=SessionSource(platform=Platform.SLACK, chat_id="D1", chat_type="dm"),
+            _run_still_current=lambda: True,
+            progress_mode="full", tool_progress_enabled=True,
+            progress_queue=queue.Queue(), _progress_metadata=metadata,
+            _cleanup_progress=True,
+        )
+        runner = TurnRunner(_make_runner(adapter), ctx)
+        # An acknowledged, nonempty prefix also matches the unknown tool's emoji.
+        draft = await adapter.send_draft("D1", 7, "⚙️", metadata=metadata)
+        assert draft.success and draft.message_id == "123.456"
+        client.chat_startStream.assert_awaited_once()
+        arguments = {"value": "x" * (adapter.MAX_MESSAGE_LENGTH + 1000 if oversized else 10)}
+        runner.progress_callback("tool.started", "full_native_slack", args=arguments)
+        sender = asyncio.create_task(runner.send_progress_messages())
+        try:
+            await asyncio.wait_for(progress_attempted.wait(), timeout=2)
+        finally:
+            sender.cancel()
+            await asyncio.wait_for(sender, timeout=2)
+
+        client.chat_stopStream.assert_not_awaited()
+        posts = [call.kwargs for call in client.chat_postMessage.await_args_list]
+        assert len(posts) > 1 if oversized else len(posts) == 1
+        header, _, body = "".join(post["text"] for post in posts).partition("\n")
+        assert header == "⚙️ full_native_slack"
+        assert json.loads(body) == arguments
+        assert all(post["channel"] == "D1" and post["thread_ts"] == META["thread_id"] for post in posts)
+        assert ctx._cleanup_msg_ids == post_ids
+        assert draft.message_id not in ctx._cleanup_msg_ids
+        assert ctx._progress_metadata is metadata
+        assert metadata == original_metadata
+        client.chat_update.assert_not_awaited()
+
+        extended = await adapter.send_draft("D1", 7, "⚙️ Answer continues", metadata=metadata)
+        assert extended.success and extended.message_id == draft.message_id
+        client.chat_startStream.assert_awaited_once()
+        client.chat_appendStream.assert_awaited_once_with(
+            channel="D1", ts=draft.message_id, markdown_text=" Answer continues",
+        )
+        client.chat_stopStream.assert_not_awaited()
+        final = await adapter.send("D1", "⚙️ Answer continues. Done.", metadata=metadata)
+        assert final.success and final.message_id == draft.message_id
+        client.chat_stopStream.assert_awaited_once_with(
+            channel="D1", ts=draft.message_id, markdown_text=". Done.",
+        )
+        assert client.chat_postMessage.await_count == len(posts)
+        assert not _open_streams(adapter)
+        assert metadata == original_metadata
+        assert all("_interim_send" not in call.kwargs for call in client.mock_calls)
+
     @pytest.mark.asyncio
     async def test_final_send_seals_stream_no_duplicate_post(self):
         adapter, client = _make_adapter()
@@ -176,10 +310,11 @@ class TestSendFinalization:
         kwargs = client.chat_stopStream.await_args.kwargs
         assert kwargs["markdown_text"] == "rld, done."
         client.chat_postMessage.assert_not_awaited()
-        assert "D1" not in adapter._active_streams
+        assert not _open_streams(adapter)
 
     @pytest.mark.asyncio
     async def test_final_send_equal_content_seals_without_delta(self):
+        """A: streamed == final → one Slack message only."""
         adapter, client = _make_adapter()
         await adapter.send_draft("D1", 7, "Hello world", metadata=META)
         result = await adapter.send("D1", "Hello world", metadata=META)
@@ -187,25 +322,118 @@ class TestSendFinalization:
         kwargs = client.chat_stopStream.await_args.kwargs
         assert "markdown_text" not in kwargs
         client.chat_postMessage.assert_not_awaited()
+        client.chat_update.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_unrelated_send_passes_through(self):
+    async def test_whitespace_only_difference_does_not_duplicate(self):
+        """B: the agent strips final_response; the streamed frames were not."""
         adapter, client = _make_adapter()
+        await adapter.send_draft("D1", 7, "\n\nHello world\n", metadata=META)
+        result = await adapter.send("D1", "Hello world", metadata=META)
+        assert result.success
+        assert result.message_id == "123.456"
+        assert client.chat_stopStream.await_count == 1
+        assert "markdown_text" not in client.chat_stopStream.await_args.kwargs
+        client.chat_postMessage.assert_not_awaited()
+        assert not _open_streams(adapter)
+
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "metadata",
+        [None, {}, META, {**META, "_interim_send": True}, {**META, "_interim_send": False}],
+    )
+    async def test_unrelated_send_passes_through(self, metadata):
+        adapter, client = _make_adapter()
+        original_metadata = copy.deepcopy(metadata)
         await adapter.send_draft("D1", 7, "Streaming text here", metadata=META)
-        result = await adapter.send("D1", "Unrelated notice", metadata=META)
+        result = await adapter.send("D1", "Unrelated notice", metadata=metadata)
         assert result.success
         client.chat_postMessage.assert_awaited()
+        assert metadata == original_metadata
+        assert "_interim_send" not in client.chat_postMessage.await_args.kwargs
         # Stream stays open for its own finalization.
-        assert "D1" in adapter._active_streams
+        assert _open_streams(adapter)
 
     @pytest.mark.asyncio
-    async def test_stop_stream_failure_falls_back_to_post(self):
+    async def test_mid_turn_notify_reply_leaves_stream_open_and_posts_fresh(self):
+        """/status, /approve and clarify answers are notify sends in the SAME thread; they
+        must not overwrite the half-streamed answer in place."""
+        adapter, client = _make_adapter()
+        await adapter.send_draft("D1", 7, "Partial answer being streamed", metadata=META)
+        result = await adapter.send("D1", "Status: running, 3 tools", metadata={**META, "notify": True})
+        assert result.message_id == "999.111"
+        client.chat_postMessage.assert_awaited_once()
+        client.chat_stopStream.assert_not_awaited()
+        client.chat_update.assert_not_awaited()
+        (stream,) = _open_streams(adapter)
+        assert stream["sent"] == "Partial answer being streamed"
+
+
+    @pytest.mark.asyncio
+    async def test_stop_and_update_both_fail_falls_back_to_fresh_post(self):
+        """C2/D: an uncommittable stream still delivers the answer (loss-safe)."""
         adapter, client = _make_adapter()
         await adapter.send_draft("D1", 7, "Hello", metadata=META)
         client.chat_stopStream = AsyncMock(side_effect=Exception("boom"))
+        client.chat_update = AsyncMock(side_effect=Exception("update boom"))
         result = await adapter.send("D1", "Hello world", metadata=META)
         assert result.success
-        client.chat_postMessage.assert_awaited()
+        client.chat_postMessage.assert_awaited_once()
+        assert client.chat_postMessage.await_args.kwargs["text"] == "Hello world"
+        # A stop that carries a tail is never retried: ``markdown_text`` APPENDS.
+        assert client.chat_stopStream.await_count == 1
+        assert client.chat_update.await_count == 1
+        assert not _open_streams(adapter)
+
+
+    @pytest.mark.asyncio
+    async def test_two_threads_finalize_their_own_streams(self):
+        adapter, client = _make_adapter()
+        await adapter.send_draft("C1", 7, "Thread A answer", metadata=META)
+        client.chat_startStream.return_value = {"ok": True, "ts": "456.000"}
+        await adapter.send_draft("C1", 8, "Thread B answer", metadata=META_B)
+        rb = await adapter.send("C1", "Thread B answer", metadata=META_B)
+        assert rb.message_id == "456.000"
+        assert client.chat_stopStream.await_args.kwargs["ts"] == "456.000"
+        assert [s["ts"] for s in _open_streams(adapter, "C1")] == ["123.456"]
+        ra = await adapter.send("C1", "Thread A answer", metadata=META)
+        assert ra.message_id == "123.456"
+        assert client.chat_stopStream.await_count == 2
+        client.chat_postMessage.assert_not_awaited()
+        assert not _open_streams(adapter, "C1")
+
+
+    @pytest.mark.asyncio
+    async def test_rewritten_turn_final_replaces_stream_in_place(self):
+        """A mrkdwn-rewritten turn-final (notify=True) replaces the sealed stream; no 2nd post."""
+        adapter, client = _make_adapter()
+        await adapter.send_draft("D1", 7, "*Done:* all good", metadata=META)
+        result = await adapter.send("D1", "_Done:_ all good", metadata=dict(META, notify=True))
+        assert result.success
+        client.chat_stopStream.assert_awaited_once()
+        client.chat_update.assert_awaited()
+        assert client.chat_update.await_args.kwargs["ts"] == result.message_id
+        client.chat_postMessage.assert_not_awaited()
+        assert not _open_streams(adapter)
+
+    @pytest.mark.asyncio
+    async def test_rewritten_turn_final_posts_when_update_fails(self):
+        adapter, client = _make_adapter()
+        await adapter.send_draft("D1", 7, "*Draft:* answer that got restyled", metadata=META)
+        client.chat_update = AsyncMock(side_effect=Exception("update failed"))
+        result = await adapter.send("D1", "_Draft:_ answer that got restyled", metadata=dict(META, notify=True))
+        assert result.success
+        client.chat_postMessage.assert_awaited_once()
+        assert not _open_streams(adapter)
+
+
+RICH_MD = "# Title\n\nbody text with **bold**\n\n| a | b |\n|---|---|\n| 1 | 2 |"
+
+
+class TestRichBlocksAfterSeal:
+    """G: with ``rich_blocks`` the sealed stream gets its layout via chat.update, once."""
+
 
     @pytest.mark.asyncio
     async def test_rich_blocks_applied_after_seal(self):
@@ -218,6 +446,240 @@ class TestSendFinalization:
         assert client.chat_update.await_args.kwargs["blocks"]
 
 
+class TestFullProgressLiteral:
+    """Real callback, queue, Slack adapter and SDK; only HTTP transport is mocked."""
+
+    @staticmethod
+    def make_native(extra=None, metadata=None):
+        from types import SimpleNamespace
+        from slack_sdk.web.async_client import AsyncWebClient
+
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake", extra=extra or {}))
+        client = AsyncWebClient(token="xoxb-fake")
+        adapter._app = SimpleNamespace(client=client)
+        adapter._team_clients["T123"] = client
+        adapter._running = True
+        calls = []
+        changed = asyncio.Event()
+
+        async def transport(method, **kwargs):
+            payload = copy.deepcopy(kwargs.get("json") or kwargs.get("params") or {})
+            calls.append((method, payload))
+            changed.set()
+            posts = sum(name == "chat.postMessage" for name, _ in calls)
+            return {"ok": True, "ts": "123.456" if method == "chat.startStream" else f"999.{110 + posts}"}
+
+        client.api_call = AsyncMock(side_effect=transport)
+        ctx = TurnContext(
+            source=SessionSource(platform=Platform.SLACK, chat_id="D1", chat_type="dm"),
+            _run_still_current=lambda: True,
+            progress_mode="full", tool_progress_enabled=True,
+            progress_queue=queue.Queue(), _progress_metadata=metadata,
+            _progress_reply_to=META["thread_id"], _cleanup_progress=True,
+        )
+        return adapter, TurnRunner(_make_runner(adapter), ctx), ctx, calls, changed
+
+    @staticmethod
+    async def wait_for_call(calls, changed, method, count=1):
+        async def wait():
+            while len([item for item in calls if item[0] == method]) < count:
+                changed.clear()
+                await changed.wait()
+        await asyncio.wait_for(wait(), timeout=4)
+
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("delta", [-1, 0, 1, 42000])
+    @pytest.mark.parametrize("seed", [False, True], ids=["send", "edit-rollover"])
+    async def test_literal_payload_size_and_lossless_split(self, delta, seed):
+        from html import escape, unescape
+
+        adapter, runner, ctx, calls, changed = self.make_native(metadata=None)
+        limit = adapter.MAX_MESSAGE_LENGTH - 64  # Preserve the native message cap and gateway reserve.
+        arguments = {"body": "[Guide](https://example.test/guide) **b** _u_ `x` ``` & <@U123> 😀", "pad": ""}
+        prefix = "⚙️ boundary\n"
+        seed_text = "⚙️ seed\n{}\n" if seed else ""
+        overhead = len(escape(seed_text + prefix + json.dumps(arguments, ensure_ascii=False), quote=False))
+        budget = limit + delta - overhead
+        arguments["pad"] = "&" * (budget // 5) + "x" * (budget % 5)
+        original = copy.deepcopy(arguments)
+        entry = prefix + json.dumps(arguments, ensure_ascii=False)
+        runner.progress_callback("tool.started", "seed" if seed else "boundary", args={} if seed else arguments)
+        sender = asyncio.create_task(runner.send_progress_messages())
+        try:
+            await self.wait_for_call(calls, changed, "chat.postMessage")
+            if seed:
+                runner.progress_callback("tool.started", "boundary", args=arguments)
+                # Let the existing queue completion drain handle the final entry.
+        finally:
+            sender.cancel()
+            await asyncio.wait_for(sender, timeout=4)
+
+        latest = {}
+        order = []
+        for method, payload in calls:
+            if method not in {"chat.postMessage", "chat.update"}:
+                continue
+            self.assert_plain_payload(payload)
+            assert len(payload["text"]) <= limit
+            mid = payload["ts"] if method == "chat.update" else f"999.{111 + len(order)}"
+            if method == "chat.postMessage":
+                order.append(mid)
+            latest[mid] = unescape(payload["text"])
+        delivered = [latest[mid] for mid in order]
+        if seed and delta <= 0:
+            assert delivered == [seed_text + entry]
+            assert any(method == "chat.update" for method, _ in calls)
+        else:
+            if seed:
+                assert delivered.pop(0) == seed_text.rstrip("\n")
+            # Independent per-character oracle: no trimming, labels or fence repair.
+            expected = []
+            current = []
+            size = 0
+            for char in entry:
+                width = len(escape(char, quote=False))
+                if size + width > limit:
+                    expected.append("".join(current))
+                    current, size = [], 0
+                current.append(char)
+                size += width
+            expected.append("".join(current))
+            assert delivered == expected
+        assert arguments == original
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", ["send", "edit"])
+    async def test_literal_block_rejection_never_falls_back_to_markdown(self, operation):
+        adapter, _, _, calls, _ = self.make_native({"rich_blocks": True})
+        assert adapter._app is not None
+        client = adapter._app.client
+        client.api_call.side_effect = Exception("invalid_blocks")
+        metadata = {**META, "_literal_text": True, "_interim_send": True}
+        if operation == "send":
+            result = await adapter.send("D1", "**data** <@U123>", metadata=metadata)
+        else:
+            result = await adapter.edit_message("D1", "999.111", "**data** <@U123>", finalize=True, metadata=metadata)
+        assert not result.success
+        attempts = [call for call in client.api_call.await_args_list if call.args[0] in {"chat.postMessage", "chat.update"}]
+        assert len(attempts) == 1
+        assert attempts[0].kwargs["json"]["blocks"][0]["text"]["type"] == "plain_text"
+
+    @staticmethod
+    def arguments():
+        return {
+            "[key](https://example.test/key) **bold** _under_ `code` <tag>":
+                "[Guide](https://example.test/guide) **Important** _italic_ `inline` ```fence```",
+            "angles": "<@U123> <!channel> <!here> <!everyone> <#C123> <https://example.test|label>",
+            "entities": "<tag> & &lt; &amp;lt; \\\\literal\\n 😀",
+            "image": "![photo](https://example.test/photo.png)",
+            "api_key": "full-literal-secret-sentinel",
+            "nested": [{"password": "nested-secret-sentinel", "keep": "**readable**"}],
+        }
+
+    @staticmethod
+    def assert_plain_payload(payload):
+        # Slack documents plain_text for both postMessage and chat.update.
+        # Its top-level mrkdwn flag is documented only for postMessage.
+        assert payload["parse"] == "none"
+        assert payload["link_names"] in (False, 0)
+        from html import unescape
+
+        blocks = payload["blocks"]
+        assert 1 <= len(blocks) <= 50
+        assert "".join(unescape(block["text"]["text"]) for block in blocks) == unescape(payload["text"])
+        assert "".join(block["text"]["text"] for block in blocks) == payload["text"]
+        for block in blocks:
+            assert block["type"] == "section"
+            assert block["text"]["type"] == "plain_text"
+            assert block["text"]["emoji"] is False
+            assert len(block["text"]["text"]) <= 3000
+        assert "<" not in payload["text"] and ">" not in payload["text"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", ["send", "edit"])
+    @pytest.mark.parametrize("extra", [{}, {"rich_blocks": True, "unfurl_links": True, "unfurl_media": True}])
+    async def test_markdown_json_round_trips(self, operation, extra):
+        from html import unescape
+
+        metadata = {**META, "slack_team_id": "T123", "caller_value": {"keep": True}}
+        original_metadata = copy.deepcopy(metadata)
+        adapter, runner, ctx, calls, changed = self.make_native(extra, metadata)
+        arguments = self.arguments()
+        original = copy.deepcopy(arguments)
+        expected = copy.deepcopy(arguments)
+        expected["api_key"] = "***"
+        expected["nested"][0]["password"] = "***"
+        if operation == "edit":
+            runner.progress_callback("tool.started", "seed", args={})
+        else:
+            runner.progress_callback("tool.started", "literal_probe", args=arguments)
+        sender = asyncio.create_task(runner.send_progress_messages())
+        try:
+            await self.wait_for_call(calls, changed, "chat.postMessage")
+            if operation == "edit":
+                runner.progress_callback("tool.started", "literal_probe", args=arguments)
+                await self.wait_for_call(calls, changed, "chat.update")
+        finally:
+            sender.cancel()
+            await asyncio.wait_for(sender, timeout=4)
+
+        method = "chat.postMessage" if operation == "send" else "chat.update"
+        payload = [payload for name, payload in calls if name == method][-1]
+        body = unescape(payload["text"]).split("⚙️ literal_probe\n", 1)[1]
+        assert json.loads(body) == expected
+        self.assert_plain_payload(payload)
+        assert "full-literal-secret-sentinel" not in str(calls)
+        assert "nested-secret-sentinel" not in str(calls)
+        assert arguments == original
+        assert ctx._progress_metadata is metadata and metadata == original_metadata
+        assert ctx._cleanup_msg_ids == ["999.111"]
+        for name, posted in calls:
+            assert "_literal_text" not in posted and "_interim_send" not in posted
+            if name == "chat.postMessage":
+                assert posted["mrkdwn"] is False
+                assert posted["unfurl_links"] is False and posted["unfurl_media"] is False
+                assert posted["thread_ts"] == META["thread_id"]
+
+    @pytest.mark.asyncio
+    async def test_full_progress_preserves_answer_stream(self):
+        adapter, runner, ctx, calls, changed = self.make_native(metadata=META)
+        draft = await adapter.send_draft("D1", 7, "⚙️", metadata=META)
+        assert draft.success
+        runner.progress_callback("tool.started", "literal_probe", args={"body": "**literal**"})
+        sender = asyncio.create_task(runner.send_progress_messages())
+        try:
+            # Wait for either native outcome, so an erroneous seal is a behavioral failure.
+            async def wait():
+                while not any(name in {"chat.postMessage", "chat.stopStream"} for name, _ in calls):
+                    changed.clear()
+                    await changed.wait()
+            await asyncio.wait_for(wait(), timeout=4)
+        finally:
+            sender.cancel()
+            await asyncio.wait_for(sender, timeout=4)
+        assert not any(name == "chat.stopStream" for name, _ in calls)
+        assert draft.message_id not in ctx._cleanup_msg_ids
+        assert (await adapter.send_draft("D1", 7, "⚙️ Answer", metadata=META)).success
+        assert (await adapter.send("D1", "⚙️ Answer done", metadata=META)).success
+        assert [p["markdown_text"] for n, p in calls if n == "chat.appendStream"] == [" Answer"]
+        assert [p["markdown_text"] for n, p in calls if n == "chat.stopStream"] == [" done"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("metadata", [None, META, {**META, "_interim_send": True}])
+    async def test_ordinary_send_edit_keep_markdown(self, metadata):
+        adapter, _, _, calls, _ = self.make_native()
+        original = copy.deepcopy(metadata)
+        content = "[Guide](https://example.test/guide) **Important**"
+        assert (await adapter.send("D1", content, metadata=metadata)).success
+        assert (await adapter.edit_message("D1", "999.111", content, metadata=metadata)).success
+        post, update = [p for n, p in calls if n in {"chat.postMessage", "chat.update"}]
+        assert post["text"] == update["text"] == "<https://example.test/guide|Guide> *Important*"
+        assert post["mrkdwn"] is True
+        assert not post.get("blocks") and not update.get("blocks")
+        assert metadata == original
+
+
 class TestDisconnectCleanup:
     @pytest.mark.asyncio
     async def test_disconnect_seals_dangling_streams(self):
@@ -227,4 +689,5 @@ class TestDisconnectCleanup:
         adapter._release_platform_lock = MagicMock()
         await adapter.disconnect()
         client.chat_stopStream.assert_awaited()
+        assert client.chat_stopStream.await_args.kwargs["channel"] == "D1"
         assert not adapter._active_streams
