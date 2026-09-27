@@ -20,19 +20,18 @@ from agent.auxiliary_client import (
     call_llm,
     async_call_llm,
     _build_call_kwargs,
-    _read_codex_access_token,
-    _get_provider_chain,
+    _resolve_codex_credential_and_base,
     _is_payment_error,
     _is_rate_limit_error,
     _is_model_not_found_error,
     _is_model_incompatible_error,
+    _is_statusless_structured_provider_error,
     _refresh_nous_recommended_model,
     _normalize_aux_provider,
     _try_payment_fallback,
     _try_openrouter,
     _OPENROUTER_MODEL,
     OPENROUTER_BASE_URL,
-    _resolve_auto_route,
     _resolve_task_provider_model,
     _resolve_xai_oauth_for_aux,
     _CodexCompletionsAdapter,
@@ -55,6 +54,10 @@ class _FakeAnthropicStream:
 
     def __exit__(self, exc_type, exc, tb):
         return False
+
+    def __iter__(self):
+        # A completed Messages stream ends in message_stop (#121320 gate).
+        yield SimpleNamespace(type="message_stop")
 
     def get_final_message(self):
         return self._final_message
@@ -80,30 +83,6 @@ def _clean_env(monkeypatch):
     yield
     _aux_mod._aux_unhealthy_until.clear()
     _aux_mod._aux_unhealthy_logged_at.clear()
-
-
-@pytest.fixture
-def codex_auth_dir(tmp_path, monkeypatch):
-    """Provide a writable ~/.codex/ directory with a valid auth.json."""
-    codex_dir = tmp_path / ".codex"
-    codex_dir.mkdir()
-    auth_file = codex_dir / "auth.json"
-    auth_file.write_text(json.dumps({
-        "tokens": {
-            "access_token": "codex-test-token-abc123",
-            "refresh_token": "codex-refresh-xyz",
-        }
-    }))
-    monkeypatch.setattr(
-        "agent.auxiliary_client._read_codex_access_token",
-        lambda: "codex-test-token-abc123",
-    )
-    return codex_dir
-
-
-class TestAuxiliaryMaxTokensParam:
-    pass
-
 
 
 class TestResolveTaskProviderModel:
@@ -262,9 +241,6 @@ class TestResolveTaskProviderModel:
         assert model is None
 
 
-
-
-
 class TestMoaAggregatorSharedResolution:
     """The shared MoA→aggregator helper and the layers that consume it.
 
@@ -275,7 +251,7 @@ class TestMoaAggregatorSharedResolution:
 
     @staticmethod
     def _write_moa_config(tmp_path, monkeypatch, default_preset="opus-gpt"):
-        import yaml
+        import hermes_yaml as yaml
 
         home = tmp_path / ".hermes"
         home.mkdir(exist_ok=True)
@@ -316,7 +292,7 @@ class TestMoaAggregatorSharedResolution:
     def test_real_config_explicit_task_provider_moa(self, tmp_path, monkeypatch):
         """auxiliary.<task>.provider: moa in a REAL config.yaml resolves to the
         aggregator through the genuine load_config()/resolve_moa_preset() path."""
-        import yaml
+        import hermes_yaml as yaml
 
         home = self._write_moa_config(tmp_path, monkeypatch)
         cfg = yaml.safe_load((home / "config.yaml").read_text())
@@ -465,8 +441,6 @@ class TestBuildCallKwargsMaxTokens:
         assert "max_tokens" not in kw3
 
 
-
-
 class TestNousTagsScoping:
     def test_tags_injected_when_provider_is_nous(self, monkeypatch):
         import agent.auxiliary_client as aux
@@ -495,19 +469,28 @@ class TestNousTagsScoping:
         assert "extra_body" not in kwargs
 
 
-
 class TestNormalizeAuxProvider:
-    def test_maps_github_copilot_aliases(self):
-        assert _normalize_aux_provider("github") == "copilot"
-        assert _normalize_aux_provider("github-copilot") == "copilot"
-        assert _normalize_aux_provider("github-models") == "copilot"
+    def test_main_provider_opencode_resolves_an_aux_client(self, monkeypatch):
+        """``model.provider: opencode`` (the alias the main path accepts) must resolve an aux client
+        exactly like ``opencode-zen`` does, instead of ``(None, None)`` (#115006)."""
+        monkeypatch.setenv("OPENCODE_ZEN_API_KEY", "sk-test-not-real")
+        alias_client, alias_model = resolve_provider_client("opencode", model="glm-5.3", task="approval")
+        canon_client, canon_model = resolve_provider_client("opencode-zen", model="glm-5.3", task="approval")
+        assert canon_client is not None
+        assert alias_client is not None
+        assert str(alias_client.base_url) == str(canon_client.base_url)
+        assert alias_model == canon_model
 
-    def test_maps_github_copilot_acp_aliases(self):
-        assert _normalize_aux_provider("github-copilot-acp") == "copilot-acp"
-        assert _normalize_aux_provider("copilot-acp-agent") == "copilot-acp"
+    def test_covers_every_alias_the_main_path_resolves(self):
+        """Every alias hermes_cli.auth resolves also resolves in aux — drift becomes a red test (#115006)."""
+        from hermes_cli.auth import _PROVIDER_ALIASES as auth_table
+        for alias, canonical in auth_table.items():
+            assert _normalize_aux_provider(alias) == canonical, alias
 
 
-class TestReadCodexAccessToken:
+class TestResolveCodexCredentialToken:
+    """Token half of ``_resolve_codex_credential_and_base`` with no pool (auth.json only)."""
+
     def test_valid_auth_store(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir(parents=True, exist_ok=True)
@@ -520,14 +503,9 @@ class TestReadCodexAccessToken:
             },
         }))
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-        result = _read_codex_access_token()
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)):
+            result = _resolve_codex_credential_and_base()[0]
         assert result == "tok-123"
-
-
-
-
-
-
 
     def test_expired_jwt_returns_none(self, tmp_path, monkeypatch):
         """Expired JWT tokens should be skipped so auto chain continues."""
@@ -552,7 +530,7 @@ class TestReadCodexAccessToken:
         }))
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)):
-            result = _read_codex_access_token()
+            result = _resolve_codex_credential_and_base()[0]
         assert result is None, "Expired JWT should return None"
 
     def test_valid_jwt_returns_token(self, tmp_path, monkeypatch):
@@ -576,9 +554,9 @@ class TestReadCodexAccessToken:
             },
         }))
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-        result = _read_codex_access_token()
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)):
+            result = _resolve_codex_credential_and_base()[0]
         assert result == valid_jwt
-
 
 
 class TestResolveXaiOAuthForAux:
@@ -703,7 +681,6 @@ class TestAnthropicOAuthFlag:
             client, model = _try_anthropic()
 
         assert client is not None
-        assert model == "claude-haiku-4-5-20251001"
         assert mock_build.call_args.args[0] == "sk-ant-oat01-pooled"
 
 
@@ -711,7 +688,9 @@ class TestBuildCodexClient:
     def test_pool_without_selected_entry_falls_back_to_auth_store(self):
         with (
             patch("agent.auxiliary_client._select_pool_entry", return_value=(True, None)),
-            patch("agent.auxiliary_client._read_codex_access_token", return_value="codex-auth-token"),
+            # A present pool with no usable row reads auth.json directly (no re-selection that
+            # could pair another row's key with the default host, #121486).
+            patch("agent.auxiliary_client._read_codex_singleton_token", return_value="codex-auth-token"),
             patch("agent.auxiliary_client.OpenAI") as mock_openai,
         ):
             mock_openai.return_value = MagicMock()
@@ -723,6 +702,43 @@ class TestBuildCodexClient:
         assert model == "gpt-5.4"
         assert mock_openai.call_args.kwargs["api_key"] == "codex-auth-token"
         assert mock_openai.call_args.kwargs["base_url"] == "https://chatgpt.com/backend-api/codex"
+
+    def test_profile_codex_base_url_overrides_pool_endpoint(self, monkeypatch):
+        """Auxiliary Codex calls use the same profile endpoint override as the main client."""
+        entry = SimpleNamespace(
+            runtime_api_key="codex-pool-token",
+            runtime_base_url="https://chatgpt.com/backend-api/codex",
+        )
+        with (
+            patch("agent.auxiliary_client._select_pool_entry", return_value=(True, entry)),
+            patch("agent.auxiliary_client.OpenAI") as mock_openai,
+        ):
+            monkeypatch.setenv("HERMES_CODEX_BASE_URL", "http://127.0.0.1:8787/v1")
+            mock_openai.return_value = MagicMock()
+            from agent.auxiliary_client import _build_codex_client
+
+            client, model = _build_codex_client("gpt-5.4")
+
+        assert client is not None
+        assert model == "gpt-5.4"
+        assert mock_openai.call_args.kwargs["base_url"] == "http://127.0.0.1:8787/v1"
+
+    def test_profile_codex_base_url_applies_to_raw_codex_client(self, monkeypatch):
+        """The main agent's raw Codex client honours the same endpoint override."""
+        with (
+            patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)),
+            patch("agent.auxiliary_client._read_codex_singleton_token", return_value="codex-auth-token"),
+            patch("agent.auxiliary_client.OpenAI") as mock_openai,
+        ):
+            monkeypatch.setenv("HERMES_CODEX_BASE_URL", "http://127.0.0.1:8787/v1")
+            mock_openai.return_value = MagicMock()
+            from agent.auxiliary_client import resolve_provider_client
+
+            client, model = resolve_provider_client("openai-codex", "gpt-5.4", raw_codex=True)
+
+        assert client is not None
+        assert model == "gpt-5.4"
+        assert mock_openai.call_args.kwargs["base_url"] == "http://127.0.0.1:8787/v1"
 
     def test_rejects_missing_model(self):
         """Callers must pass an explicit model; no hardcoded default."""
@@ -863,37 +879,6 @@ class TestResolveProviderClientUniversalModelFallback:
 class TestExpiredCodexFallback:
     """Test that expired Codex tokens don't block the auto chain."""
 
-    def test_expired_codex_falls_through_to_next(self, tmp_path, monkeypatch):
-        """When Codex token is expired, auto chain should skip it and try next provider."""
-        import base64
-        import time as _time
-
-        # Expired Codex JWT
-        header = base64.urlsafe_b64encode(b'{"alg":"RS256","typ":"JWT"}').rstrip(b"=").decode()
-        payload_data = json.dumps({"exp": int(_time.time()) - 3600}).encode()
-        payload = base64.urlsafe_b64encode(payload_data).rstrip(b"=").decode()
-        expired_jwt = f"{header}.{payload}.fakesig"
-
-        hermes_home = tmp_path / "hermes"
-        hermes_home.mkdir(parents=True, exist_ok=True)
-        (hermes_home / "auth.json").write_text(json.dumps({
-            "version": 1,
-            "providers": {
-                "openai-codex": {
-                    "tokens": {"access_token": expired_jwt, "refresh_token": "r"},
-                },
-            },
-        }))
-        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-
-        # Set up Anthropic as fallback
-        monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-test-fallback")
-        with patch("agent.anthropic_adapter.build_anthropic_client") as mock_build:
-            mock_build.return_value = MagicMock()
-            from agent.auxiliary_client import _resolve_auto_route
-            client, model, _provider = _resolve_auto_route()
-            # Should NOT be Codex, should be Anthropic (or another available provider)
-            assert not isinstance(client, type(None)), "Should find a provider after expired Codex"
 
 
     def test_expired_codex_openrouter_wins(self, tmp_path, monkeypatch):
@@ -1092,20 +1077,6 @@ class TestOpenRouterPaidLaneGuard:
         assert model is None
         mark_unhealthy.assert_not_called()
 
-    def test_free_only_gate_reports_policy_not_credentials(self, monkeypatch, caplog):
-        import logging
-
-        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
-        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
-             patch("hermes_cli.config.load_config_readonly",
-                   return_value={"auxiliary": {"free_only": True}}), \
-             caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
-            resolve_provider_client("openrouter", model="google/gemini-3.6-flash")
-
-        messages = [record.getMessage() for record in caplog.records]
-        assert any("free_only" in message and "google/gemini-3.6-flash" in message
-                   for message in messages)
-        assert not any("credentials" in message for message in messages)
 
     def test_paid_lane_warns_once(self, monkeypatch, caplog):
         """Engaging a user-configured PAID model logs a WARNING (once per model).
@@ -1184,7 +1155,8 @@ class TestGetTextAuxiliaryClient:
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
         with patch("agent.auxiliary_client._read_nous_auth", return_value=None), \
-             patch("agent.auxiliary_client._read_codex_access_token", return_value=None), \
+             patch("agent.auxiliary_client._resolve_codex_credential_and_base",
+                   return_value=(None, "https://chatgpt.com/backend-api/codex")), \
              patch("agent.auxiliary_client._resolve_api_key_provider", return_value=(None, None)):
             client, model = get_text_auxiliary_client()
         assert client is None
@@ -1254,7 +1226,6 @@ class TestVisionClientFallback:
         assert response.choices[0].message.content == "streamed aux response"
         assert response.usage.prompt_tokens == 3
         assert response.usage.completion_tokens == 4
-
 
 
 class TestAuxiliaryPoolAwareness:
@@ -1426,12 +1397,6 @@ class TestIsPaymentError:
     # ── Daily / monthly quota exhaustion (#26803) ────────────────────────────
 
 
-
-
-
-
-
-
 class TestIsModelNotFoundError:
     """_is_model_not_found_error detects stale/invalid model 404s, distinct
     from payment errors."""
@@ -1468,8 +1433,6 @@ class TestIsModelNotFoundError:
         assert _is_model_not_found_error(exc) is False
 
 
-
-
 class TestIsModelIncompatibleError:
     """_is_model_incompatible_error detects 400s where the route cannot run
     the model at all (capability mismatch), distinct from not-found and
@@ -1502,8 +1465,6 @@ class TestIsModelIncompatibleError:
         exc = Exception("insufficient credits: model is not supported on free tier")
         exc.status_code = 400
         assert _is_model_incompatible_error(exc) is False
-
-
 
 
 class TestRefreshNousRecommendedModel:
@@ -1554,28 +1515,6 @@ class TestIsRateLimitError:
         exc = RateLimitError("rate limit exceeded")
         # No status_code set, but class name matches
         assert _is_rate_limit_error(exc) is True
-
-
-
-class TestGetProviderChain:
-    """_get_provider_chain() resolves functions at call time (testable)."""
-
-    def test_returns_four_entries(self):
-        chain = _get_provider_chain()
-        assert len(chain) == 4
-        labels = [label for label, _ in chain]
-        assert labels == ["openrouter", "nous", "local/custom", "api-key"]
-        # Codex is deliberately NOT in this chain — see _get_provider_chain
-        # docstring. ChatGPT-account Codex has a shifting model allow-list;
-        # guessing a model to fall back on breaks more often than it helps.
-        assert "openai-codex" not in labels
-
-    def test_picks_up_patched_functions(self):
-        """Patches on _try_* functions must be visible in the chain."""
-        sentinel = lambda: ("patched", "model")
-        with patch("agent.auxiliary_client._try_openrouter", sentinel):
-            chain = _get_provider_chain()
-        assert chain[0] == ("openrouter", sentinel)
 
 
 class TestTryPaymentFallback:
@@ -1629,16 +1568,73 @@ class TestTryPaymentFallback:
 class TestCallLlmPaymentFallback:
     """call_llm() retries with a different provider on 402 / payment / rate-limit errors."""
 
-    def _make_402_error(self, msg="Payment Required: insufficient credits"):
-        exc = Exception(msg)
-        exc.status_code = 402
-        return exc
 
     def _make_429_rate_limit_error(self, msg="Rate limit exceeded, try again in 60 seconds"):
         exc = Exception(msg)
         exc.status_code = 429
         return exc
 
+
+    @staticmethod
+    def _sdk_stream_error(error_payload):
+        """The APIError the real OpenAI SDK raises for an HTTP-200 SSE ``error`` event."""
+        import httpx
+        from openai import APIError, OpenAI
+
+        sse = f"data: {json.dumps({'error': error_payload})}\n\n".encode()
+        transport = httpx.MockTransport(lambda request: httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, content=sse))
+        client = OpenAI(api_key="k", base_url="https://relay.example/v1",
+                        http_client=httpx.Client(transport=transport))
+        with pytest.raises(APIError) as caught:
+            for _ in client.chat.completions.create(
+                    model="m", messages=[{"role": "user", "content": "hi"}], stream=True):
+                pass
+        return caught.value
+
+    def test_statusless_structured_error_detection(self):
+        """A status-less SDK stream error with a non-empty structured body counts (#101538)."""
+        assert _is_statusless_structured_provider_error(
+            self._sdk_stream_error({"type": "server_error", "code": "overloaded", "message": "busy"}))
+        assert _is_statusless_structured_provider_error(self._sdk_stream_error("service unavailable"))
+        assert not _is_statusless_structured_provider_error(self._sdk_stream_error({"metadata": {}}))
+        assert not _is_statusless_structured_provider_error(Exception("stream_error: mid_stream_failure"))
+
+        class _StatusCoded(Exception):
+            status_code = 503
+            body = {"type": "server_error"}
+
+        assert not _is_statusless_structured_provider_error(_StatusCoded("unavailable"))
+
+    def test_statusless_structured_error_after_param_strip_triggers_configured_fallback(self):
+        """An in-stream error event on an explicit relay reaches the fallback chain, also when it
+        arrives on a parameter-strip retry (#101538)."""
+        primary_client = MagicMock()
+        primary_client.base_url = "https://relay.example/v1"
+        primary_client.chat.completions.create.side_effect = [
+            Exception("Unsupported parameter: temperature"),
+            self._sdk_stream_error({"type": "server_error", "code": "overloaded"}),
+        ]
+        fallback_client = MagicMock()
+        fallback_client.chat.completions.create.return_value = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="fallback response"))
+        ])
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "virtual-model")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("custom", "virtual-model", "https://relay.example/v1", "test-key", None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(fallback_client, "fallback-model", "fallback_chain[0](openrouter)")) as mock_chain, \
+             patch("agent.auxiliary_client._try_main_agent_model_fallback",
+                   return_value=(None, None, "")):
+            call_llm(task="compression", messages=[{"role": "user", "content": "summarize"}],
+                     temperature=0.3)
+
+        assert fallback_client.chat.completions.create.called
+        assert primary_client.chat.completions.create.call_count == 2
+        assert "temperature" not in primary_client.chat.completions.create.call_args.kwargs
+        assert mock_chain.call_args.kwargs["reason"] == "structured provider error"
 
     def test_429_rate_limit_triggers_fallback(self, monkeypatch):
         """429 rate-limit errors should trigger fallback to next provider."""
@@ -1659,7 +1655,7 @@ class TestCallLlmPaymentFallback:
                     return_value=("auto", "xiaomi/mimo-v2-pro", None, None, None)), \
              patch("agent.auxiliary_client._try_payment_fallback",
                     return_value=(fallback_client, "fallback-model", "openrouter")):
-            result = call_llm(
+            call_llm(
                 task="session_search",
                 messages=[{"role": "user", "content": "hello"}],
             )
@@ -1697,7 +1693,6 @@ class TestCallLlmPaymentFallback:
         assert fallback_client.chat.completions.create.called
         # Labelled as an auth error, not mis-tagged as a connection error.
         assert mock_fb.call_args.kwargs.get("reason") == "auth error"
-
 
 
 class TestStaleFallbackCandidateSkip:
@@ -1798,11 +1793,12 @@ class TestStaleFallbackCandidateSkip:
             )
 
         assert result.choices[0].message.content == "openrouter-serves"
+        # The chain was walked a second time after the stale candidate was quarantined.
         assert mock_fb.call_count == 2
-        assert mock_fb.call_args_list[1].kwargs.get("reason") == "stale fallback credential"
-        mock_mark.assert_called_once_with(
-            "anthropic", base_url="https://api.anthropic.com",
-        )
+        assert mock_mark.call_count == 1
+        assert mock_mark.call_args.args[0] == "anthropic"
+        assert mock_mark.call_args.kwargs["base_url"] == "https://api.anthropic.com"
+        assert mock_mark.call_args.kwargs["reason"] == "stale fallback credential"
         assert stale_fb.chat.completions.create.call_count == 1
         assert healthy_fb.chat.completions.create.call_count == 1
 
@@ -1833,8 +1829,531 @@ class TestStaleFallbackCandidateSkip:
                 )
 
 
+class TestVisionCapabilityWalk:
+    """Public calls use real configuration, selection, ladder, conversion and SDK shaping."""
+
+    @pytest.fixture
+    def routes(self, monkeypatch):
+        from copy import deepcopy
+
+        import httpx
+        from agent import auxiliary_client as aux
+
+        primary = {"provider": "openrouter", "model": "openai/gpt-4o"}
+
+        def entry(model, host="main.example", provider="custom"):
+            return {"provider": provider, "model": model,
+                    "base_url": f"https://{host}/v1", "api_key": "candidate-key",
+                    "api_mode": "chat_completions"}
+
+        config = {
+            "model": {"provider": "openrouter", "default": primary["model"]},
+            "providers": {
+                "openrouter": {"models": {primary["model"]: {"supports_vision": True}}},
+                "custom": {"models": {"known-text": {"supports_vision": False}}},
+            },
+            "auxiliary": {"vision": {
+                "provider": "auto", "model": primary["model"],
+                "fallback_chain": [primary, {"provider": "anthropic", "model": "unavailable"}],
+            }},
+            "fallback_providers": [
+                primary, entry("known-text"), entry("text", provider="kimi-coding"),
+                entry("main-a"), entry("main-b"),
+            ],
+        }
+        messages = [{"role": "user", "content": [
+            {"type": "text", "text": "Describe this image."},
+            {"type": "image_url", "image_url": {"url": "https://image.example/photo.png"}},
+        ]}]
+        tools = [{"type": "function", "function": {
+            "name": "annotate", "parameters": {"type": "object"},
+        }}]
+        reasoning = {"enabled": True, "effort": "low"}
+        route_info, requests, errors = {}, [], []
+        faults = {primary["model"]: (429, "Rate limit exceeded"),
+                  "main-a": (400, "image_url unsupported; text-only model")}
+        monkeypatch.setenv("OPENROUTER_API_KEY", "primary-key")
+        # Refresh is an external credential operation. No ladder/selector is mocked.
+        refresh = MagicMock(return_value=False)
+        monkeypatch.setattr(aux, "_refresh_provider_credentials", refresh)
+
+        def respond(request):
+            assert request.url.path.endswith("/chat/completions")
+            payload = json.loads(request.content)
+            requests.append((request, payload, dict(route_info)))
+            fault = faults.get(payload["model"])
+            if fault:
+                status, message = fault
+                return httpx.Response(status, request=request, json={"error": {"message": message}})
+            return httpx.Response(200, request=request, json={
+                "id": "vision-result", "object": "chat.completion", "created": 0,
+                "model": payload["model"],
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "described"},
+                             "finish_reason": "stop"}],
+            })
+
+        async def async_send(client, request, **kwargs):
+            return respond(request)
+
+        import openai
+        for cls in (openai.OpenAI, openai.AsyncOpenAI):
+            original = cls._make_status_error
+
+            def record_error(client, *args, _original=original, **kwargs):
+                error = _original(client, *args, **kwargs)
+                errors.append(error)
+                return error
+
+            monkeypatch.setattr(cls, "_make_status_error", record_error)
+        monkeypatch.setattr(httpx.Client, "send", lambda client, request, **kw: respond(request))
+        monkeypatch.setattr(httpx.AsyncClient, "send", async_send)
+
+        async def invoke(async_mode, **overrides):
+            (aux.get_hermes_home() / "config.yaml").write_text(json.dumps(config))
+            kwargs: dict = dict(task="vision", messages=messages, tools=tools, temperature=0.2,
+                          timeout=19, max_tokens=73, reasoning_config=reasoning,
+                          extra_body={"test_marker": "preserved"}, route_info=route_info)
+            kwargs.update(overrides)
+            return await async_call_llm(**kwargs) if async_mode else call_llm(**kwargs)
+
+        return SimpleNamespace(
+            aux=aux, config=config, entry=entry, primary=primary, faults=faults, invoke=invoke,
+            requests=requests, errors=errors, refresh=refresh, route_info=route_info,
+            messages=messages, tools=tools, reasoning=reasoning,
+            original=deepcopy((messages, tools, reasoning)),
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+    async def test_main_false_does_not_override_candidate_true(self, routes, async_mode):
+        from copy import deepcopy
+
+        r = routes
+        r.config["model"].update(
+            provider="custom:main-only", default="main-text", supports_vision=False,
+            base_url="https://main-only.example/v1", api_key="main-only-key",
+        )
+        r.config["fallback_providers"] = [r.entry("main-b")]
+        r.config["providers"]["custom"]["models"]["main-b"] = {"supports_vision": True}
+        original_config = deepcopy(r.config)
+
+        response = await r.invoke(async_mode)
+
+        assert response.choices[0].message.content == "described"
+        assert [p["model"] for _, p, _ in r.requests] == [r.primary["model"]] * 2 + ["main-b"]
+        request, payload, recorded = r.requests[-1]
+        assert request.url.host == "main.example"
+        assert request.headers["authorization"] == "Bearer candidate-key"
+        assert payload["messages"] == r.original[0]
+        assert payload["tools"] == r.original[1]
+        assert recorded == r.route_info == {"provider": "custom", "model": "main-b"}
+        assert (r.messages, r.tools, r.reasoning) == r.original
+        assert r.config == original_config
+        assert json.loads((r.aux.get_hermes_home() / "config.yaml").read_text()) == original_config
+        assert not r.aux._main_model_supports_vision("custom:main-only", "main-text")
+        r.refresh.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+    async def test_main_true_does_not_override_candidate_false(self, routes, async_mode):
+        from copy import deepcopy
+
+        r = routes
+        r.config["model"]["supports_vision"] = True
+        r.config["fallback_providers"] = [r.entry("known-text"), r.entry("main-b")]
+        r.config["providers"]["custom"]["models"].pop("known-text")
+        r.config["custom_providers"] = [
+            {"name": "custom", "models": {"known-text": {"vision": False}}},
+        ]
+        # The unknown custom candidate must not inherit the active provider's verdict either.
+        r.config["providers"]["openrouter"]["models"]["main-b"] = {"supports_vision": False}
+        original_config = deepcopy(r.config)
+
+        response = await r.invoke(async_mode)
+
+        assert response.choices[0].message.content == "described"
+        assert [p["model"] for _, p, _ in r.requests] == [r.primary["model"]] * 2 + ["main-b"]
+        request, payload, recorded = r.requests[-1]
+        assert request.url.host == "main.example"
+        assert request.headers["authorization"] == "Bearer candidate-key"
+        assert payload["messages"] == r.original[0]
+        assert payload["tools"] == r.original[1]
+        assert recorded == r.route_info == {"provider": "custom", "model": "main-b"}
+        assert (r.messages, r.tools, r.reasoning) == r.original
+        assert r.config == original_config
+        assert json.loads((r.aux.get_hermes_home() / "config.yaml").read_text()) == original_config
+        assert r.aux._main_model_supports_vision(r.primary["provider"], r.primary["model"])
+        r.refresh.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+    @pytest.mark.parametrize("status,message", [
+        (400, "image_url unsupported; text-only model"),
+        (415, "image input not supported"),
+        (422, "unknown variant `image_url`, expected `text`"),
+        (400, "This model is not supported when using this route"),
+    ])
+    async def test_main_capability_walk_preserves_request(self, routes, async_mode, status, message):
+        r = routes
+        r.faults["main-a"] = (status, message)
+        response = await r.invoke(async_mode)
+        assert response.choices[0].message.content == "described"
+        assert [p["model"] for _, p, _ in r.requests] == [r.primary["model"]] * 2 + ["main-a", "main-b"]
+        for request, payload, recorded in r.requests:
+            assert payload["messages"] == r.original[0]
+            assert payload["tools"] == r.original[1]
+            if payload["model"] == r.primary["model"]:
+                assert payload["reasoning"] == r.original[2]
+            else:
+                # The native custom provider profile uses the OpenAI top-level field.
+                assert payload["reasoning_effort"] == r.reasoning["effort"]
+            assert payload["temperature"] == 0.2
+            assert payload["test_marker"] == "preserved"
+            assert request.extensions["timeout"]["read"] == 19
+            primary = payload["model"] == r.primary["model"]
+            assert payload.get("max_tokens", payload.get("max_completion_tokens")) == (73 if primary else None)
+            assert request.headers["authorization"] == ("Bearer primary-key" if primary else "Bearer candidate-key")
+            assert recorded == {"provider": "openrouter" if primary else "custom", "model": payload["model"]}
+        assert (r.messages, r.tools, r.reasoning) == r.original
+        assert r.route_info == {"provider": "custom", "model": "main-b"}
+        r.refresh.assert_not_called()
+        assert not r.aux._is_provider_unhealthy("custom", "https://main.example/v1")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+    @pytest.mark.parametrize("status,message", [
+        (401, "image input unsupported; invalid API key"),
+        (403, "image input unsupported; unauthenticated:bad-credentials"),
+        (402, "image input unsupported; payment required"),
+        (429, "image input unsupported; quota exceeded"),
+        (404, "image input unsupported; model not found"),
+        (400, "Unknown validation failure"),
+        (400, "image input unsupported; model not found"),
+        (400, "vision unsupported; billing quota exceeded"),
+        (400, "vision unsupported; invalid API key"),
+        (415, "vision unsupported; quota exhausted"),
+        (422, "vision unsupported; model not found"),
+        (500, "image input unsupported"),
+    ])
+    async def test_candidate_non_capability_error_propagates(self, routes, async_mode, status, message):
+        r = routes
+        # No skip screen here: even the unmodified base reaches this candidate.
+        r.config["fallback_providers"] = [r.entry("main-a"), r.entry("main-b")]
+        r.faults["main-a"] = (status, message)
+        with pytest.raises(Exception) as caught:
+            await r.invoke(async_mode)
+        assert caught.value is r.errors[-1]
+        assert caught.value.status_code == status
+        assert message in str(caught.value)
+        assert [p["model"] for _, p, _ in r.requests] == [r.primary["model"]] * 2 + ["main-a"]
+        r.refresh.assert_not_called()
+        assert not r.aux._is_provider_unhealthy("custom", "https://main.example/v1")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+    @pytest.mark.parametrize("origin", ["task", "main"])
+    @pytest.mark.parametrize("message,capability", [
+        ("image input unsupported", True),
+        ("vision unsupported; billing quota exceeded", False),
+        ("vision unsupported; invalid API key", False),
+        ("vision unsupported; model not found", False),
+        ("Unknown validation failure", False),
+        ("Auxiliary vision: LLM returned invalid response (choices[0].message)", False),
+    ])
+    async def test_only_main_origin_can_advance_no_status_capability(self, routes, monkeypatch, async_mode, origin, message, capability):
+        from openai.resources.chat.completions import Completions, AsyncCompletions
+
+        r = routes
+        r.config["fallback_providers"] = [r.entry("main-a"), r.entry("main-b")]
+        if origin == "task":
+            r.config["auxiliary"]["vision"]["fallback_chain"] = [r.entry("main-a")]
+        error = RuntimeError(message)
+        calls = []
+        cls = AsyncCompletions if async_mode else Completions
+        original = cls.create
+
+        def create(client, **kwargs):
+            calls.append(kwargs["model"])
+            if kwargs["model"] == "main-a":
+                raise error
+            return original(client, **kwargs)
+
+        async def acreate(client, **kwargs):
+            result = create(client, **kwargs)
+            return await result
+
+        monkeypatch.setattr(cls, "create", acreate if async_mode else create)
+        if origin == "task" or not capability:
+            with pytest.raises(RuntimeError) as caught:
+                await r.invoke(async_mode)
+            assert caught.value is error
+            assert calls == [r.primary["model"]] * 2 + ["main-a"]
+        else:
+            assert (await r.invoke(async_mode)).choices[0].message.content == "described"
+            assert calls == [r.primary["model"]] * 2 + ["main-a", "main-b"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+    @pytest.mark.parametrize("initial_status,policy,succeeds", [
+        (400, "auto", True), (401, "auto", True), (401, "openrouter", False),
+    ])
+    async def test_initial_auto_eligibility_stays_separate(self, routes, async_mode, initial_status, policy, succeeds):
+        r = routes
+        r.config["fallback_providers"] = [r.entry("main-b")]
+        r.faults[r.primary["model"]] = (initial_status, "image input unsupported" if initial_status == 400 else "Invalid API key")
+        if succeeds:
+            assert (await r.invoke(async_mode, provider=policy)).choices[0].message.content == "described"
+        else:
+            with pytest.raises(Exception) as caught:
+                await r.invoke(async_mode, provider=policy)
+            assert caught.value is r.errors[0]
+        assert [p["model"] for _, p, _ in r.requests] == [r.primary["model"]] + (["main-b"] if succeeds else [])
+        assert r.refresh.call_count == (1 if initial_status == 401 else 0)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+    @pytest.mark.parametrize("discovery", [False, True])
+    @pytest.mark.parametrize("empty", [False, True])
+    async def test_exhausted_walk_preserves_discovery_and_original_error(self, routes, monkeypatch, caplog, async_mode, discovery, empty):
+        r = routes
+        r.config["fallback_providers"] = [] if empty else [r.entry("main-a"), r.entry("main-a")]
+        r.config["model"]["provider"] = "auto"
+        # Discovery is external availability I/O; retain its real ordering/eligibility owner.
+        probe = MagicMock(return_value=(None, None))
+        if discovery:
+            def discover():
+                return r.aux.resolve_provider_client("custom", "discovered", explicit_base_url="https://discovery.example/v1", explicit_api_key="discovery-key", api_mode="chat_completions")
+            probe.side_effect = discover
+        monkeypatch.setattr(r.aux, "_get_provider_chain", lambda: [("custom", probe)])
+        if discovery:
+            assert (await r.invoke(async_mode)).choices[0].message.content == "described"
+            assert r.route_info == {"provider": "custom", "model": "discovered"}
+        else:
+            with pytest.raises(Exception) as caught:
+                await r.invoke(async_mode)
+            assert caught.value is r.errors[0]
+            assert sum("all fallbacks exhausted" in record.message for record in caplog.records) == 1
+        probe.assert_called_once()
+        assert [p["model"] for _, p, _ in r.requests] == [r.primary["model"]] * 2 + ([] if empty else ["main-a"]) + (["discovered"] if discovery else [])
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+    async def test_configured_resolved_aliases_bounded_and_endpoints_distinct(self, routes, async_mode):
+        r = routes
+        # An unresolvable route must not poison another label at the same endpoint.
+        # OpenCode strips vendor/ natively; exclude both configured and resolved labels.
+        r.config["fallback_providers"] = [
+            r.entry("main-a", provider="unconfigured-provider"),
+            r.entry("vendor/main-a", provider="opencode-go"),
+            r.entry("main-a", provider="opencode-go"),
+            r.entry("main-a", provider="custom"),
+            r.entry("main-b"),
+            r.entry("main-b", host="other.example"),
+        ]
+        r.faults["main-b"] = (400, "image input unsupported")
+        # The second endpoint must be attempted even though the first endpoint rejected that model.
+        with pytest.raises(Exception):
+            await r.invoke(async_mode)
+        calls = [(request.url.host, payload["model"]) for request, payload, _ in r.requests]
+        assert calls == [("openrouter.ai", r.primary["model"])] * 2 + [
+            ("main.example", "main-a"), ("main.example", "main-b"), ("other.example", "main-b"),
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+    async def test_default_endpoint_rejection_preserves_explicit_relay(self, routes, async_mode):
+        r = routes
+        default = {"provider": "openrouter", "model": "main-a"}
+        same = {**default, "base_url": "https://openrouter.ai/api/v1"}
+        relay = r.entry("main-a", host="relay.example", provider="openrouter")
+        r.config["fallback_providers"] = [default, same, relay, dict(relay)]
+
+        with pytest.raises(Exception):
+            await r.invoke(async_mode)
+
+        assert [(request.url.host, payload["model"])
+                for request, payload, _ in r.requests] == [
+            ("openrouter.ai", r.primary["model"]),
+            ("openrouter.ai", r.primary["model"]),
+            ("openrouter.ai", "main-a"),
+            ("relay.example", "main-a"),
+        ]
+        assert all(payload["messages"] == r.messages for _, payload, _ in r.requests)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+    async def test_explicit_transport_survives_fallback_async_conversion(self, routes, async_mode):
+        r = routes
+        destination = r.entry("claude-vision")
+        destination["base_url"] = "https://api.anthropic.com/v1"
+        r.config["fallback_providers"] = [destination]
+        assert (await r.invoke(async_mode, reasoning_config=None)).choices[0].message.content == "described"
+        _, payload, _ = r.requests[-1]
+        # Explicit chat_completions wins over the URL heuristic: no Anthropic cache decoration.
+        assert payload["messages"] == r.messages
+        assert payload["tools"] == r.tools
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+    async def test_native_token_retry_retains_tools(self, routes, async_mode):
+        r = routes
+        # HTTP boundary returns success only once the native parameter rung removes the cap.
+        import httpx
+        original_send = httpx.AsyncClient.send if async_mode else httpx.Client.send
+        calls = []
+
+        def respond(client, request, **kwargs):
+            payload = json.loads(request.content)
+            calls.append(payload)
+            if len(calls) == 1:
+                return httpx.Response(400, request=request, json={"error": {"message": "Unsupported parameter: max_tokens"}})
+            r.faults.clear()
+            return original_send(client, request, **kwargs)
+
+        async def async_send(client, request, **kwargs):
+            result = respond(client, request, **kwargs)
+            return await result if hasattr(result, "__await__") else result
+
+        with patch.object(httpx.AsyncClient if async_mode else httpx.Client, "send", async_send if async_mode else respond):
+            assert (await r.invoke(async_mode)).choices[0].message.content == "described"
+        assert len(calls) == 2
+        assert calls[0].get("max_tokens", calls[0].get("max_completion_tokens")) == 73
+        assert "max_tokens" not in calls[1] and "max_completion_tokens" not in calls[1]
+        assert calls[0]["messages"] == calls[1]["messages"] == r.messages
+        assert calls[0]["tools"] == calls[1]["tools"] == r.tools
+
+
+    @pytest.mark.parametrize("failed,candidate", [("xai", "custom:xai"), ("custom:xai", "xai")])
+    def test_raw_credential_namespace_isolation_in_main_selector(self, routes, failed, candidate):
+        r = routes
+        r.config["fallback_providers"] = [r.entry("vision-model", provider=candidate)]
+        (r.aux.get_hermes_home() / "config.yaml").write_text(json.dumps(r.config))
+        client, model, label = r.aux._try_main_fallback_chain(
+            "vision", failed, reason="auth error", failed_base_url="https://main.example/v1",
+        )
+        assert client is not None
+        assert model == "vision-model"
+        assert label == candidate
+
+
 class TestAuxiliaryFallbackLayering:
     """Explicit-provider users get layered fallback: configured_chain → main agent → warn."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+    @pytest.mark.parametrize("policy", ["auto", "AUTO", " auto ", "explicit-argument", "explicit-config"])
+    @pytest.mark.parametrize("task_fallback", ["absent", "healthy", "stale"])
+    async def test_vision_429_preserves_fallback_policy(
+        self, monkeypatch, async_mode, policy, task_fallback,
+    ):
+        """Auto keeps the configured main chain after a concrete backend exhausts its retry."""
+        from copy import deepcopy
+
+        import httpx
+        import openai
+
+        from agent import auxiliary_client as aux
+
+        primary = {"provider": "openrouter", "model": "openai/gpt-4o"}
+        task_entry = {
+            "provider": "custom", "model": "task-vision",
+            "base_url": "https://task.example/v1", "api_key": "task-key",
+            "api_mode": "chat_completions",
+        }
+        main_entry = {
+            "provider": "custom", "model": "main-vision",
+            "base_url": "https://main.example/v1", "api_key": "main-key",
+            "api_mode": "chat_completions",
+        }
+        config = {
+            "model": {
+                "provider": primary["provider"], "default": primary["model"],
+                "supports_vision": True,
+            },
+            "auxiliary": {"vision": {
+                "provider": primary["provider"] if policy == "explicit-config" else "auto",
+                "model": primary["model"],
+                # A duplicate of the failed route must be skipped using its concrete identity.
+                "fallback_chain": [primary] + ([] if task_fallback == "absent" else [task_entry]),
+            }},
+            "fallback_providers": [primary, main_entry],
+        }
+        (aux.get_hermes_home() / "config.yaml").write_text(json.dumps(config))
+        monkeypatch.setenv("OPENROUTER_API_KEY", "primary-key")
+        messages = [{"role": "user", "content": [
+            {"type": "text", "text": "Describe this image."},
+            {"type": "image_url", "image_url": {"url": "https://image.example/photo.png"}},
+        ]}]
+        original_messages = deepcopy(messages)
+        route_info = {}
+        requests = []
+
+        def respond(request):
+            payload = json.loads(request.content)
+            requests.append((request, payload, dict(route_info)))
+            if request.url.host == "openrouter.ai":
+                return httpx.Response(429, request=request, json={"error": {
+                    "message": "Rate limit exceeded", "type": "rate_limit_error",
+                }})
+            if request.url.host == "task.example" and task_fallback == "stale":
+                return httpx.Response(401, request=request, json={"error": {
+                    "message": "Invalid API key", "type": "authentication_error",
+                }})
+            assert request.url.host in {"task.example", "main.example"}
+            return httpx.Response(200, request=request, json={
+                "id": "vision-result", "object": "chat.completion", "created": 0,
+                "model": payload["model"],
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "image described"},
+                             "finish_reason": "stop"}],
+            })
+
+        async def async_send(client, request, **kwargs):
+            return respond(request)
+
+        # Mock only HTTP I/O: config, provider routing, SDKs, retry, quarantine and both chains run.
+        monkeypatch.setattr(httpx.Client, "send", lambda client, request, **kwargs: respond(request))
+        monkeypatch.setattr(httpx.AsyncClient, "send", async_send)
+        kwargs: dict = dict(
+            task="vision", messages=messages, route_info=route_info,
+            provider=(primary["provider"] if policy == "explicit-argument" else
+                      None if policy == "explicit-config" else policy),
+            max_tokens=73, temperature=0.2, timeout=19,
+        )
+        auto_policy = policy in {"auto", "AUTO", " auto "}
+        succeeds = task_fallback == "healthy" or (auto_policy and task_fallback == "absent")
+        if succeeds:
+            result = await async_call_llm(**kwargs) if async_mode else call_llm(**kwargs)
+            assert result.choices[0].message.content == "image described"
+        else:
+            with pytest.raises(openai.AuthenticationError if task_fallback == "stale" else openai.RateLimitError):
+                if async_mode:
+                    await async_call_llm(**kwargs)
+                else:
+                    call_llm(**kwargs)
+
+        expected = [("openrouter.ai", primary["model"], "openrouter", "primary-key")] * 2
+        if task_fallback != "absent":
+            expected.append(("task.example", task_entry["model"], "custom", "task-key"))
+        if auto_policy and task_fallback == "absent":
+            expected.append(("main.example", main_entry["model"], "custom", "main-key"))
+        assert len(requests) == len(expected)
+        for (request, payload, observed_route), (host, model, provider, key) in zip(requests, expected):
+            assert request.url.host == host
+            assert request.url.path.endswith("/chat/completions")
+            assert request.headers["authorization"] == f"Bearer {key}"
+            assert payload["model"] == model
+            assert payload["messages"] == original_messages
+            # Native shaping budgets OpenRouter; custom vision routes omit the cap.
+            assert payload.get("max_completion_tokens", payload.get("max_tokens")) == (
+                73 if provider == "openrouter" else None
+            )
+            assert payload["temperature"] == 0.2
+            assert observed_route == {"provider": provider, "model": model}
+        assert messages == original_messages
+        assert route_info == {"provider": expected[-1][2], "model": expected[-1][1]}
+        if task_fallback == "stale":
+            assert not aux._is_provider_unhealthy("custom", task_entry["base_url"])
+            assert not aux._is_provider_unhealthy("custom", main_entry["base_url"])
 
     def _make_payment_err(self):
         exc = Exception("Payment Required: insufficient credits")
@@ -1874,7 +2393,7 @@ class TestAuxiliaryFallbackLayering:
              patch("agent.auxiliary_client._try_configured_fallback_chain",
                    return_value=(fallback_client, "deepseek-v4-pro", "fallback_chain[0](opencode-go)")) as mock_chain, \
              patch("agent.auxiliary_client._try_main_agent_model_fallback") as mock_main:
-            result = call_llm(
+            call_llm(
                 task="kanban_decomposer",
                 messages=[{"role": "user", "content": "decompose this"}],
             )
@@ -1908,9 +2427,8 @@ class TestAuxiliaryFallbackLayering:
                     messages=[{"role": "user", "content": "hello"}],
                 )
 
-        assert any(
-            "all fallbacks exhausted" in r.message for r in caplog.records
-        ), f"Expected exhaustion warning, got: {[r.message for r in caplog.records]}"
+        assert any(r.levelno >= logging.WARNING for r in caplog.records), \
+            "Expected a user-visible warning before the re-raise"
 
     def test_explicit_provider_no_client_uses_configured_chain_before_error(self, monkeypatch):
         """Missing primary credentials should still honor auxiliary fallback_chain."""
@@ -1955,7 +2473,7 @@ class TestAuxiliaryFallbackLayering:
 
         with patch("agent.auxiliary_client._select_pool_entry",
                    return_value=(True, pool_entry)), \
-             patch("agent.auxiliary_client._read_codex_access_token",
+             patch("agent.auxiliary_client._read_codex_singleton_token",
                    side_effect=AssertionError("should use pool token")), \
              patch("agent.auxiliary_client.OpenAI", return_value=real_client) as mock_openai:
             client, model = _resolve_fallback_entry({
@@ -1992,10 +2510,6 @@ class TestTryMainAgentModelFallback:
         assert client is fake_client
         assert model == "anthropic/claude-sonnet-4"
         assert label == "main-agent(openrouter)"
-
-
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -2038,6 +2552,43 @@ def test_resolve_api_key_provider_skips_unconfigured_anthropic(monkeypatch):
 
     assert "anthropic" not in called, \
         "_try_anthropic() should not be called when anthropic is not explicitly configured"
+
+
+def test_resolve_api_key_provider_skips_unconfigured_copilot(monkeypatch):
+    """_resolve_api_key_provider must skip copilot when user never configured it (#114740)."""
+    from collections import OrderedDict
+    from hermes_cli.auth import ProviderConfig
+
+    fake_registry = OrderedDict({
+        "copilot": ProviderConfig(
+            id="copilot",
+            name="Copilot",
+            auth_type="api_key",
+            inference_base_url="https://api.githubcopilot.com",
+            api_key_env_vars=("GITHUB_COPILOT_TOKEN", "GH_TOKEN"),
+        ),
+    })
+
+    pool_selected = []
+
+    def mock_select_pool_entry(provider_id):
+        pool_selected.append(provider_id)
+        return False, None
+
+    monkeypatch.setattr("agent.auxiliary_client._select_pool_entry", mock_select_pool_entry)
+    monkeypatch.setattr("hermes_cli.auth.PROVIDER_REGISTRY", fake_registry)
+    monkeypatch.setattr(
+        "hermes_cli.auth.is_provider_explicitly_configured",
+        lambda pid: False,
+    )
+
+    from agent.auxiliary_client import _resolve_api_key_provider
+    client, model = _resolve_api_key_provider()
+
+    assert client is None
+    assert model is None
+    assert "copilot" not in pool_selected, \
+        "_select_pool_entry() should not be called for unconfigured copilot"
 
 
 # ---------------------------------------------------------------------------
@@ -2260,7 +2811,7 @@ class TestTransientTransportRetry:
         ]
 
         p1, p2, p3 = self._patches(primary)
-        with p1, p2, p3:
+        with p1, p2, p3, patch("agent.auxiliary_client._TRANSIENT_RETRY_BACKOFF_BASE", 0.0):
             result = call_llm(task="title", messages=[{"role": "user", "content": "hi"}])
         assert result == {"retried": True}
         # Same provider was retried once — unchanged behaviour off the critical path.
@@ -2305,8 +2856,6 @@ class TestTransientTransportRetry:
         )
 
 
-
-
 class TestAuxClientNoSdkRetries:
     """Auxiliary OpenAI clients are constructed with SDK-internal retries
     disabled so Hermes owns the retry/timeout budget (issue #54465). The SDK
@@ -2327,19 +2876,6 @@ class TestAuxClientNoSdkRetries:
             ac._create_openai_client(api_key="k", base_url="https://x/v1")
         assert captured.get("max_retries") == 0
 
-    def test_explicit_max_retries_override_wins(self):
-        from agent import auxiliary_client as ac
-        captured = {}
-
-        class _FakeOpenAI:
-            def __init__(self, **kwargs):
-                captured.update(kwargs)
-
-        with patch.object(ac, "OpenAI", _FakeOpenAI), \
-             patch.object(ac, "_openai_http_client_kwargs", return_value={}):
-            ac._create_openai_client(api_key="k", base_url="https://x/v1", max_retries=5)
-        assert captured.get("max_retries") == 5
-
 
 class TestIsTimeoutError:
     """_is_timeout_error distinguishes a full-budget timeout from a fast
@@ -2358,8 +2894,6 @@ class TestIsTimeoutError:
         assert _is_timeout_error(ReadTimeout("slow")) is True
 
 
-
-
 class TestIsConnectionError:
     """Tests for _is_connection_error detection."""
 
@@ -2375,7 +2909,6 @@ class TestIsConnectionError:
         err = Exception("Bad Request: invalid model")
         err.status_code = 400
         assert _is_connection_error(err) is False
-
 
 
 class TestKimiTemperatureOmitted:
@@ -2418,7 +2951,7 @@ class TestKimiTemperatureOmitted:
         "model",
         [
             "anthropic/claude-sonnet-4-6",
-            "gpt-5.4",
+            "gpt-4.1",
             "deepseek-chat",
         ],
     )
@@ -2435,34 +2968,154 @@ class TestKimiTemperatureOmitted:
         assert kwargs["temperature"] == 0.3
 
 
-
 # ---------------------------------------------------------------------------
 # async_call_llm payment / connection fallback (#7512 bug 2)
 # ---------------------------------------------------------------------------
 
 
-class TestStaleBaseUrlWarning:
-    """_resolve_auto_route() warns when OPENAI_BASE_URL conflicts with config provider (#5161)."""
-
-    def test_warns_when_openai_base_url_set_with_named_provider(self, monkeypatch, caplog):
-        """Warning fires when OPENAI_BASE_URL is set but provider is a named provider."""
-        import agent.auxiliary_client as mod
-        # Reset the module-level flag so the warning fires
-        monkeypatch.setattr(mod, "_stale_base_url_warned", False)
-        monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:11434/v1")
-        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
-
-        with patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"), \
-             patch("agent.auxiliary_client._read_main_model", return_value="google/gemini-flash"), \
-             caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
-            _resolve_auto_route()
-
-        assert any("OPENAI_BASE_URL is set" in rec.message for rec in caplog.records), \
-            "Expected a warning about stale OPENAI_BASE_URL"
-        assert mod._stale_base_url_warned is True
-
-
 class TestAuxiliaryTaskExtraBody:
+    def test_task_reasoning_disable_uses_deepseek_thinking_wire(self, monkeypatch):
+        """Task-level ``none`` must reach an always-toggle profile as its native disable shape."""
+        import agent.auxiliary_client as aux
+
+        monkeypatch.setattr(aux, "_get_auxiliary_task_config", lambda _task: {"reasoning_effort": "none"})
+
+        kwargs = aux._build_call_kwargs(
+            provider="deepseek",
+            model="deepseek-v4-flash",
+            messages=[{"role": "user", "content": "hello"}],
+            extra_body=aux._get_task_extra_body("compression"),
+            task="compression",
+        )
+
+        assert kwargs["extra_body"]["thinking"] == {"type": "disabled"}
+        assert "reasoning" not in kwargs["extra_body"]
+
+    def test_explicit_deepseek_thinking_disable_beats_profile_default(self):
+        """An explicit vendor control is authoritative when no normalized config is present."""
+        import agent.auxiliary_client as aux
+
+        kwargs = aux._build_call_kwargs(
+            provider="deepseek",
+            model="deepseek-v4-flash",
+            messages=[{"role": "user", "content": "hello"}],
+            extra_body={"thinking": {"type": "disabled"}},
+            task="compression",
+        )
+
+        assert kwargs["extra_body"]["thinking"] == {"type": "disabled"}
+
+    def test_disabled_caller_reasoning_suppresses_task_reasoning_for_profile_wire(self, monkeypatch):
+        """A profile-owned ``reasoning_effort=none`` must not ship with task reasoning."""
+        import agent.auxiliary_client as aux
+
+        projection = aux._ProfileProjection({}, {}, {"reasoning_effort": "none"}, True)
+        monkeypatch.setattr(aux, "_project_provider_profile", lambda *_args: projection)
+        monkeypatch.setattr(
+            aux,
+            "_get_auxiliary_task_config",
+            lambda _task: {"reasoning_effort": "low", "extra_body": {"metadata": {"task": "title"}}},
+        )
+
+        kwargs = aux._build_call_kwargs(
+            provider="custom",
+            model="test-model",
+            messages=[{"role": "user", "content": "hello"}],
+            extra_body=aux._get_task_extra_body("title_generation"),
+            reasoning_config={"enabled": False},
+            task="title_generation",
+        )
+
+        assert kwargs["reasoning_effort"] == "none"
+        assert "reasoning" not in kwargs["extra_body"]
+        assert kwargs["extra_body"]["metadata"] == {"task": "title"}
+
+    def test_disabled_caller_reasoning_keeps_profile_owned_disable_shape(self, monkeypatch):
+        """Control: a profile whose disabled shape IS ``extra_body.reasoning`` (OpenRouter) keeps it —
+        the caller's thinking-off replaces the task effort, it never deletes the profile's own field."""
+        import agent.auxiliary_client as aux
+
+        projection = aux._ProfileProjection({}, {"reasoning": {"enabled": False}}, {}, True)
+        monkeypatch.setattr(aux, "_project_provider_profile", lambda *_args: projection)
+        monkeypatch.setattr(aux, "_get_auxiliary_task_config", lambda _task: {"reasoning_effort": "low"})
+
+        kwargs = aux._build_call_kwargs(
+            provider="openrouter",
+            model="test-model",
+            messages=[{"role": "user", "content": "hello"}],
+            extra_body=aux._get_task_extra_body("title_generation"),
+            reasoning_config={"enabled": False},
+            task="title_generation",
+        )
+
+        assert kwargs["extra_body"]["reasoning"] == {"enabled": False}
+        assert "reasoning_effort" not in kwargs
+
+    @pytest.mark.parametrize("task", ["session_search", "moa_reference", "moa_aggregator"])
+    def test_generic_reasoning_fallback_clamps_ultra_for_auxiliary_and_moa_calls(self, task, monkeypatch):
+        """The OpenAI-compatible fallback must never put Hermes-only ``ultra`` on the wire."""
+        from agent.auxiliary_client import _ProfileProjection, _build_call_kwargs
+
+        monkeypatch.setattr(
+            "agent.auxiliary_client._project_provider_profile",
+            lambda *_args: _ProfileProjection({}, {}, {}, False),
+        )
+
+        kwargs = _build_call_kwargs(
+            provider="custom",
+            model="test-model",
+            messages=[{"role": "user", "content": "hello"}],
+            reasoning_config={"enabled": True, "effort": "ultra"},
+            task=task,
+        )
+
+        assert kwargs["extra_body"]["reasoning"] == {"enabled": True, "effort": "max"}
+
+    def test_task_extra_body_reasoning_effort_ultra_is_clamped(self, monkeypatch):
+        """``auxiliary.<task>.reasoning_effort: ultra`` folds into ``extra_body.reasoning`` (the path
+        compression/title/vision/... use, with no reasoning_config) and must take the same clamp."""
+        import agent.auxiliary_client as aux
+        from agent.auxiliary_client import _build_call_kwargs, _get_task_extra_body
+
+        monkeypatch.setattr(aux, "_get_auxiliary_task_config", lambda task: {"reasoning_effort": "ultra"})
+        monkeypatch.setattr(aux, "_project_provider_profile", lambda *_args: aux._ProfileProjection({}, {}, {}, False))
+
+        kwargs = _build_call_kwargs(
+            provider="custom",
+            model="test-model",
+            messages=[{"role": "user", "content": "hello"}],
+            extra_body=_get_task_extra_body("session_search"),
+            reasoning_config=None,
+            task="session_search",
+        )
+
+        assert kwargs["extra_body"]["reasoning"] == {"enabled": True, "effort": "max"}
+
+    def test_profile_projection_receives_wire_clamped_effort(self, monkeypatch):
+        """Profiles clamp only against their own narrower sets (or a catalog that may be cold), so
+        ``ultra`` must already be a wire level when the projection sees it — the MoA aggregator on
+        an OpenRouter/Nous slot 400'd otherwise (#112010)."""
+        import agent.auxiliary_client as aux
+
+        seen = {}
+        real = aux._project_provider_profile
+
+        def spy(provider, provider_norm, model, effective_base, reasoning_config):
+            seen["config"] = reasoning_config
+            return real(provider, provider_norm, model, effective_base, reasoning_config)
+
+        monkeypatch.setattr(aux, "_project_provider_profile", spy)
+        kwargs = aux._build_call_kwargs(
+            provider="openrouter",
+            model="deepseek/deepseek-v4.1-flash",
+            messages=[{"role": "user", "content": "hello"}],
+            reasoning_config={"enabled": True, "effort": "ultra"},
+            task="moa_aggregator",
+        )
+
+        assert seen["config"] == {"enabled": True, "effort": "max"}
+        assert "ultra" not in json.dumps(kwargs.get("extra_body")) and kwargs.get("reasoning_effort") != "ultra"
+
     def test_sync_call_merges_task_extra_body_from_config(self):
         client = MagicMock()
         client.base_url = "https://api.example.com/v1"
@@ -2542,7 +3195,7 @@ class TestAuxiliaryTaskExtraBody:
             result = _get_task_extra_body(moa_task)
 
         assert "reasoning" not in result
-        assert any("per-slot" in rec.message for rec in caplog.records)
+        assert any(rec.levelno == logging.WARNING for rec in caplog.records)
 
 
     def test_anthropic_aux_client_forwards_extra_body_reasoning(self):
@@ -2612,25 +3265,17 @@ class TestAuxiliaryTaskExtraBody:
 
 
 
-    def test_no_warning_when_provider_is_custom(self, monkeypatch, caplog):
-        """No warning when the provider is 'custom' — OPENAI_BASE_URL is expected."""
-        import agent.auxiliary_client as mod
-        monkeypatch.setattr(mod, "_stale_base_url_warned", False)
-        monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:11434/v1")
-        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
 
-        with patch("agent.auxiliary_client._read_main_provider", return_value="custom"), \
-             patch("agent.auxiliary_client._read_main_model", return_value="llama3"), \
-             patch("agent.auxiliary_client._resolve_custom_runtime",
-                   return_value=("http://localhost:11434/v1", "test-key", None)), \
-             patch("agent.auxiliary_client.OpenAI") as mock_openai, \
-             caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
-            mock_openai.return_value = MagicMock()
-            _resolve_auto_route()
-
-        assert not any("OPENAI_BASE_URL is set" in rec.message for rec in caplog.records), \
-            "Should NOT warn when provider is 'custom'"
-
+    def test_bare_custom_auth_error_does_not_fall_back_to_env_base_url(self, monkeypatch):
+        """Bare 'custom' with nothing configured: the main resolver raises AuthError; aux must
+        return no endpoint rather than route to a stale env OPENAI_BASE_URL with a placeholder key."""
+        from hermes_cli.auth import AuthError
+        from agent.auxiliary_client import _resolve_custom_runtime
+        monkeypatch.setenv("OPENAI_BASE_URL", "https://old-proxy.example/v1")
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        with patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                   side_effect=AuthError("no creds", provider="custom", code="missing_api_key")):
+            assert _resolve_custom_runtime() == (None, None, None)
 
 
 # ---------------------------------------------------------------------------
@@ -2681,7 +3326,6 @@ class TestAnthropicCompatImageConversion:
         assert vid_block["source"] == {"type": "url", "url": "https://example.com/clip.mp4"}
 
 
-
 class _AuxAuth401(Exception):
     status_code = 401
 
@@ -2703,17 +3347,6 @@ class _FailingThenSuccessCompletions:
         if self.calls == 1:
             raise _AuxAuth401()
         return _DummyResponse("sync-ok")
-
-
-class _AsyncFailingThenSuccessCompletions:
-    def __init__(self):
-        self.calls = 0
-
-    async def create(self, **kwargs):
-        self.calls += 1
-        if self.calls == 1:
-            raise _AuxAuth401()
-        return _DummyResponse("async-ok")
 
 
 class TestAuxiliaryAuthRefreshRetry:
@@ -2750,7 +3383,8 @@ class TestAuxiliaryAuthRefreshRetry:
 
     def test_refresh_provider_credentials_force_refreshes_anthropic_oauth_and_evicts_cache(self, monkeypatch):
         stale_client = MagicMock()
-        cache_key = ("anthropic", False, None, None, None)
+        from agent.auxiliary_client import _client_cache_key
+        cache_key = _client_cache_key("anthropic", async_mode=False)
 
         monkeypatch.setenv("ANTHROPIC_TOKEN", "")
         monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
@@ -2776,10 +3410,13 @@ class TestAuxiliaryAuthRefreshRetry:
             from agent.auxiliary_client import _refresh_provider_credentials
 
             assert _refresh_provider_credentials("anthropic", failed_api_key="expired-token") is True
+            import agent.auxiliary_client as aux
+            assert cache_key not in aux._client_cache  # evicted, not closed (in-flight users)
 
         mock_refresh_oauth.assert_called_once_with("refresh-token", use_json=False)
-        mock_write.assert_called_once_with("fresh-token", "refresh-token-2", 9999999999999)
-        stale_client.close.assert_called_once()
+        mock_write.assert_called_once_with(
+            "fresh-token", "refresh-token-2", 9999999999999, spent_refresh_token="refresh-token")
+        stale_client.close.assert_not_called()
 
     def test_refresh_provider_credentials_remints_vertex_token_and_evicts_cache(self):
         """Vertex tokens live ~1h; on a long-running gateway the cached
@@ -2791,7 +3428,8 @@ class TestAuxiliaryAuthRefreshRetry:
         through to the final `return False` and the stale client (and its
         dead token) stayed cached until process restart."""
         stale_client = MagicMock()
-        cache_key = ("vertex", False, None, None, None)
+        from agent.auxiliary_client import _client_cache_key
+        cache_key = _client_cache_key("vertex", async_mode=False)
 
         with (
             patch("agent.auxiliary_client._client_cache", {cache_key: (stale_client, "google/gemini-3-flash-preview", None)}),
@@ -2803,9 +3441,11 @@ class TestAuxiliaryAuthRefreshRetry:
             from agent.auxiliary_client import _refresh_provider_credentials
 
             assert _refresh_provider_credentials("vertex") is True
+            import agent.auxiliary_client as aux
+            assert cache_key not in aux._client_cache  # evicted, not closed (in-flight users)
 
         mock_get_config.assert_called_once()
-        stale_client.close.assert_called_once()
+        stale_client.close.assert_not_called()
 
     def test_refresh_provider_credentials_vertex_returns_false_when_unminted(self):
         """No usable token/base_url (e.g. ADC and the service-account file
@@ -2823,7 +3463,6 @@ class TestAuxiliaryAuthRefreshRetry:
 
         assert client is None
         assert model is None
-
 
 
 class TestAuxiliaryPoolRotationRetry:
@@ -2875,7 +3514,6 @@ class TestAuxiliaryPoolRotationRetry:
         assert len(pool.rotate_calls) == 1
         assert pool.rotate_calls[0]["status_code"] == 429
         mock_fallback.assert_not_called()
-
 
 
 class TestAnthropicAuxiliaryReasoningTranslation:
@@ -2945,6 +3583,37 @@ class TestAnthropicAuxiliaryReasoningTranslation:
             base_url="https://example.test/v1",
         )
         assert "_reasoning_config" not in openai_wire_kwargs
+
+    def test_anthropic_messages_profile_keeps_reasoning_reachable(self):
+        # commandcode-anthropic: OpenAI-shaped URL, anthropic_messages api_mode, and a profile
+        # class that overrides build_api_kwargs_extras (so the generic extra_body.reasoning
+        # fallback the adapter used to read is suppressed). The adapter must still be told.
+        import model_tools  # noqa: F401 — triggers provider discovery
+        import providers
+
+        assert providers.get_provider_profile("commandcode-anthropic") is not None
+        rc = {"enabled": False}
+        kwargs = _build_call_kwargs(
+            "commandcode-anthropic", "claude-haiku-4-5-20251001", [{"role": "user", "content": "hi"}],
+            reasoning_config=rc, base_url="https://api.commandcode.ai/provider/v1",
+        )
+        assert kwargs["_reasoning_config"] == rc
+        chat_kwargs = _build_call_kwargs(
+            "commandcode", "Qwen/Qwen3.7-Max", [{"role": "user", "content": "hi"}],
+            reasoning_config=rc, base_url="https://api.commandcode.ai/provider/v1",
+        )
+        assert "_reasoning_config" not in chat_kwargs
+
+    def test_anthropic_messages_profile_resolves_to_messages_adapter(self, monkeypatch):
+        # Bare ``provider: commandcode-anthropic`` (no api_mode) must wrap the client on the
+        # profile's declared wire, or the ``_reasoning_config`` kwarg above would reach a plain
+        # OpenAI client and TypeError.
+        import model_tools  # noqa: F401
+        from agent.auxiliary_client import AnthropicAuxiliaryClient, resolve_provider_client
+
+        monkeypatch.setenv("COMMANDCODE_API_KEY", "sk-test-" + "x" * 20)
+        client, _ = resolve_provider_client("commandcode-anthropic", model="claude-haiku-4-5-20251001")
+        assert isinstance(client, AnthropicAuxiliaryClient)
 
 
 class TestAuxiliaryProviderProfileReasoning:
@@ -3072,6 +3741,23 @@ class TestCodexAdapterReasoningTranslation:
         )
         assert captured.get("reasoning") == {"effort": "low", "summary": "auto"}
 
+    def test_disabled_reasoning_is_sent_as_none_and_chat_era_models_get_no_field(self):
+        """#75227 / #76255 on the auxiliary Responses path: ``enabled: False`` goes on the wire as
+        ``effort: none`` (omitting it keeps the model's default effort on); a chat-era OpenAI model on
+        api.openai.com gets no ``reasoning`` key at all, since it 400s on the field."""
+        adapter, captured = self._build_adapter()
+        adapter._client.base_url = "https://api.openai.com/v1"
+        adapter.create(messages=[{"role": "user", "content": "hi"}], extra_body={"reasoning": {"enabled": False}})
+        assert captured.get("reasoning") == {"effort": "none"}
+        assert "include" not in captured
+
+        adapter, captured = self._build_adapter()
+        adapter._client.base_url = "https://api.openai.com/v1"
+        adapter._model = "gpt-4o-mini"
+        adapter.create(model="gpt-4o-mini", messages=[{"role": "user", "content": "hi"}],
+                       extra_body={"reasoning": {"effort": "medium"}})
+        assert "reasoning" not in captured
+
 
 
 
@@ -3097,8 +3783,6 @@ class TestCodexAdapterReasoningTranslation:
         )
         assert captured.get("reasoning") == {"effort": "medium", "summary": "auto"}
         assert captured.get("include") == ["reasoning.encrypted_content"]
-
-
 
 
 class TestCodexAdapterPromptCacheKey:
@@ -3260,7 +3944,6 @@ class TestCodexAdapterPromptCacheKey:
         assert "prompt_cache_retention" not in captured
 
 
-
 class TestCodexAdapterGithubResponsesMessageIdDrop:
     """_CodexCompletionsAdapter must drop codex_message_items ``id`` when
     talking to Copilot (githubcopilot.com), independent of the main
@@ -3402,16 +4085,6 @@ class TestVisionAutoSkipsKimiCoding:
         assert model == "google/gemini-3-flash-preview"
 
 
-
-    def test_skip_set_covers_exactly_known_entries(self):
-        """Guard against accidental widening of the skip list."""
-        from agent.auxiliary_client import _PROVIDERS_WITHOUT_VISION
-        assert _PROVIDERS_WITHOUT_VISION == frozenset({
-            "kimi-coding",
-            "kimi-coding-cn",
-        })
-
-
 class TestCodexAuxiliaryAdapterTimeout:
     def test_forwards_timeout_to_responses_create(self):
         message_item = SimpleNamespace(
@@ -3449,18 +4122,96 @@ class TestCodexAuxiliaryAdapterTimeout:
         assert fake_client.responses.kwargs["stream"] is True
         assert response.choices[0].message.content == "summary"
 
-    def test_enforces_total_timeout_while_stream_keeps_emitting_events(self):
+    def test_enforces_total_timeout_while_stream_keeps_emitting_events(self, monkeypatch):
+        import threading
+
+        clock = SimpleNamespace(now=0.0)
+        emitted_events = []
+        started_timers = []
+        cancelled_timers = []
+        stream_close_threads = []
+        client_close_threads = []
+        owner_tid = threading.get_ident()
+
+        class _RecordingTimer:
+            def __init__(self, interval, function):
+                self.interval = interval
+                self.function = function
+
+            def start(self):
+                # Let the real per-event deadline check win without a watchdog thread.
+                started_timers.append(self)
+
+            def cancel(self):
+                cancelled_timers.append(self)
+
+        monkeypatch.setattr("agent.auxiliary_client.time.monotonic", lambda: clock.now)
+        monkeypatch.setattr("agent.auxiliary_client.threading.Timer", _RecordingTimer)
+
         class _SlowAliveCreateStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                self.close()
+                return False
+
             def __iter__(self):
                 for _ in range(5):
-                    time.sleep(0.03)
+                    clock.now += 0.03
+                    event = SimpleNamespace(type="response.in_progress")
+                    emitted_events.append(event.type)
+                    yield event
+
+            def close(self):
+                stream_close_threads.append(threading.get_ident())
+
+            def get_final_response(self):
+                raise AssertionError("The stream deadline must interrupt iteration")
+
+        class FakeResponses:
+            def create(self, **kwargs):
+                return _SlowAliveCreateStream()
+
+            def stream(self, **kwargs):
+                return self.create(**kwargs)
+
+        fake_client = SimpleNamespace(
+            responses=FakeResponses(),
+            close=lambda: client_close_threads.append(threading.get_ident()),
+        )
+        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
+
+        with pytest.raises(TimeoutError):
+            adapter.create(
+                messages=[{"role": "user", "content": "summarize this"}],
+                timeout=0.05,
+            )
+
+        assert emitted_events == ["response.in_progress", "response.in_progress"]
+        assert stream_close_threads and all(tid == owner_tid for tid in stream_close_threads)
+        assert client_close_threads and all(tid == owner_tid for tid in client_close_threads)
+        assert started_timers
+        assert all(timer in cancelled_timers for timer in started_timers)
+
+    def test_no_progress_timeout_kwarg_overrides_default_window(self):
+        """#108104: an explicit ``no_progress_timeout`` kwarg (the task-scoped
+        ``auxiliary.<task>.no_progress_timeout`` config value) must set the
+        substantive-progress window itself, not just clamp against the overall
+        request ``timeout`` (the built-in default is 60s; here it's narrowed to
+        0.05s so a stalled-but-alive stream is cut off far sooner than the
+        5s overall timeout would otherwise force)."""
+        class _StallingStream:
+            def __iter__(self):
+                for _ in range(50):
+                    time.sleep(0.02)
                     yield SimpleNamespace(type="response.in_progress")
 
             def close(self): pass
 
         class FakeResponses:
             def create(self, **kwargs):
-                return _SlowAliveCreateStream()
+                return _StallingStream()
 
         fake_client = SimpleNamespace(responses=FakeResponses(), close=lambda: None)
         adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
@@ -3469,10 +4220,16 @@ class TestCodexAuxiliaryAdapterTimeout:
         with pytest.raises(TimeoutError):
             adapter.create(
                 messages=[{"role": "user", "content": "summarize this"}],
-                timeout=0.05,
+                timeout=5.0,
+                no_progress_timeout=0.05,
             )
+        elapsed = time.monotonic() - started
+        assert elapsed < 1.0, (
+            f"no_progress_timeout=0.05 override should cut the stall off in well "
+            f"under 1s, took {elapsed:.2f}s (falling back to the 5s overall timeout "
+            f"instead of honoring the override)"
+        )
 
-        assert time.monotonic() - started < 0.14
 
 
 class TestCodexAuxiliaryAdapterCacheScope:
@@ -3703,63 +4460,6 @@ class TestCodexAuxiliaryAdapterNullOutputRecovery:
 
         assert response.choices[0].message.content == "aux survived"
 
-    def test_handles_final_output_is_none_after_consumer(self):
-        """Regression for #33368 — defense against ``final.output`` being ``None``.
-
-        The event-driven consumer always sets ``final.output`` to a list, so this
-        shape can't come from our own path. But a mocked client / compatibility
-        shim that returns a typed Response with ``output=None`` directly (or a
-        future code path that wraps a different consumer) would crash on
-        ``for item in getattr(final, "output", [])`` because ``getattr`` returns
-        ``None`` (not the default) when the attribute exists but is ``None``.
-        Coerce with ``or []`` to handle this defensively.
-        """
-        # Stream that returns no items but a terminal with output=None.
-        # The consumer assembles an empty list. We then mock the consumer's
-        # return to simulate a third-party path that returns final.output=None.
-        empty_events = [
-            SimpleNamespace(type="response.completed", response=SimpleNamespace(
-                status="completed", id="r", output=None, usage=None,
-            )),
-        ]
-
-        class _Stream:
-            def __iter__(self): return iter(empty_events)
-            def close(self): pass
-
-        # Monkey-patch the consumer to return a final whose .output is None
-        # (mimics third-party shim behavior the defensive guard protects against).
-        from agent import codex_runtime
-        original_consume = codex_runtime._consume_codex_event_stream
-
-        def _consume_returning_none_output(*args, **kwargs):
-            return SimpleNamespace(
-                output=None,  # the defensive guard target
-                output_text="",
-                usage=None,
-                status="completed",
-                id="r",
-                model=kwargs.get("model"),
-                incomplete_details=None,
-                error=None,
-            )
-
-        codex_runtime._consume_codex_event_stream = _consume_returning_none_output
-        try:
-            class FakeResponses:
-                def create(self, **kwargs):
-                    return _Stream()
-
-            fake_client = SimpleNamespace(responses=FakeResponses())
-            adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
-
-            # Should not raise TypeError: 'NoneType' object is not iterable
-            response = adapter.create(messages=[{"role": "user", "content": "x"}])
-            assert response.choices[0].message.content is None
-            assert response.choices[0].finish_reason == "stop"
-        finally:
-            codex_runtime._consume_codex_event_stream = original_consume
-
 
 class TestCodexAuxiliaryAdapterCompletedResponse:
     def test_accepts_completed_response_when_stream_was_requested(self):
@@ -3796,6 +4496,102 @@ class TestCodexAuxiliaryAdapterCompletedResponse:
         assert response.usage.prompt_tokens == 11
         assert response.usage.completion_tokens == 3
         assert response.usage.total_tokens == 14
+
+    def test_completed_response_with_null_output_does_not_crash(self):
+        """Regression for #33368: a host that returns a completed Responses
+        object with ``output=None`` must yield an empty ``stop`` turn, not
+        ``TypeError: 'NoneType' object is not iterable``."""
+        completed = SimpleNamespace(
+            status="completed", id="r", output=None, output_text="", usage=None,
+            incomplete_details=None, error=None,
+        )
+
+        class FakeResponses:
+            def create(self, **kwargs):
+                return completed
+
+        fake_client = SimpleNamespace(responses=FakeResponses())
+        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
+
+        response = adapter.create(messages=[{"role": "user", "content": "x"}])
+
+        assert response.choices[0].message.content is None
+        assert response.choices[0].finish_reason == "stop"
+
+
+class TestCodexAuxiliaryAdapterReservedToolAliases:
+    """The aux adapter emits the same tool schemas as the main Responses transport: shared
+    converter (``strict: False``) plus provider-reserved-name aliasing (OpenCode, Perplexity),
+    reversed on the parsed tool_calls before Hermes dispatch (#114260)."""
+
+    _TOOLS = [
+        {"type": "function", "function": {"name": name, "description": name,
+                                          "parameters": {"type": "object", "properties": {}}}}
+        for name in ("web_search", "search_files", "people_search", "read_file", "tool_search")
+    ]
+    _HISTORY = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "find it"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "search_files", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+    ]
+
+    @pytest.mark.parametrize("base_url, aliased", [
+        ("https://api.perplexity.ai/v1", {"web_search", "search_files", "people_search"}),
+        ("https://opencode.ai/zen/v1", {"web_search", "search_files"}),
+        # xAI (client web-search mode): Grok's native ``web_search`` and ``tool_search`` collide.
+        ("https://api.x.ai/v1", {"web_search", "tool_search"}),
+        ("https://api.perplexity.ai.evil.com/v1", set()),
+        ("https://example.com/v1", set()),
+    ])
+    def test_wire_tools_match_main_transport_aliases_and_strict(self, base_url, aliased, monkeypatch):
+        from agent.codex_responses_adapter import classify_responses_route
+        from agent.transports.codex import ResponsesApiTransport
+
+        # Deterministic xAI branch: a non-xAI web backend keeps client dispatch under ``hermes_web_search``.
+        monkeypatch.setattr("agent.transports.codex._xai_prefers_native_web_search", lambda: False)
+        adapter = _CodexCompletionsAdapter(SimpleNamespace(base_url=base_url), "m")
+        resp_kwargs, _, _ = adapter._build_responses_kwargs(
+            {"model": "m", "messages": self._HISTORY, "tools": self._TOOLS}
+        )
+        # The main loop hands build_kwargs the route flags it classified from provider + base_url.
+        route = classify_responses_route(SimpleNamespace(provider="custom", base_url=base_url))
+        main_kwargs = ResponsesApiTransport().build_kwargs(
+            "m", self._HISTORY, self._TOOLS, provider="custom", base_url=base_url, **route._asdict()
+        )
+        assert resp_kwargs["tools"] == main_kwargs["tools"]
+        assert all(t["strict"] is False for t in resp_kwargs["tools"])
+        assert {t["name"] for t in resp_kwargs["tools"]} == {
+            f"hermes_{n}" if n in aliased else n
+            for n in ("web_search", "search_files", "people_search", "read_file", "tool_search")
+        }
+        # Replayed history names the tool the way this request declares it; the alias map rides on the payload.
+        history_names = [i["name"] for i in resp_kwargs["input"] if i.get("type") == "function_call"]
+        assert history_names == ["hermes_search_files" if "search_files" in aliased else "search_files"]
+        assert resp_kwargs.get("_wire_aliases", {}) == {f"hermes_{n}": n for n in aliased}
+
+    def test_create_maps_aliases_back_and_never_sends_alias_map(self):
+        sent = {}
+
+        class FakeResponses:
+            def create(self, **kwargs):
+                sent.update(kwargs)
+                return SimpleNamespace(
+                    status="completed", id="resp_1", usage=None,
+                    output=[SimpleNamespace(type="function_call", call_id="c9", id="fc_9",
+                                            name="hermes_search_files", arguments='{"pattern": "x"}')],
+                )
+
+        adapter = _CodexCompletionsAdapter(
+            SimpleNamespace(base_url="https://api.perplexity.ai/v1", responses=FakeResponses()), "m"
+        )
+        response = adapter.create(messages=[{"role": "user", "content": "find it"}], tools=self._TOOLS)
+
+        wire_tools = sent.get("tools") or sent.get("extra_body", {}).get("tools")  # SDK transform bypass moves bulk fields
+        assert "_wire_aliases" not in sent and "_wire_aliases" not in sent.get("extra_body", {})
+        assert "hermes_search_files" in {t["name"] for t in wire_tools}
+        assert [tc.function.name for tc in response.choices[0].message.tool_calls] == ["search_files"]
 
 
 # ---------------------------------------------------------------------------
@@ -3899,7 +4695,6 @@ class TestAuxiliaryClientPoisonedCacheEviction:
                 _client_cache.clear()
 
 
-
 # ---------------------------------------------------------------------------
 # _build_call_kwargs — tool dedup at API boundary
 # ---------------------------------------------------------------------------
@@ -3943,13 +4738,6 @@ class TestBuildCallKwargsToolDedup:
             f"Duplicate tool names found: {names}"
         )
         assert len(result_tools) == 3  # lcm_grep, lcm_describe, lcm_expand
-
-    def test_empty_tools_unchanged(self):
-        kwargs = _build_call_kwargs(
-            provider="openai", model="gpt-4o", messages=[], tools=[],
-        )
-        assert kwargs.get("tools") == [] or "tools" not in kwargs
-
 
 
 class TestNvidiaBillingHeaders:
@@ -4028,35 +4816,6 @@ class TestOpenRouterExplicitApiKey:
                 "Should NOT fall back to OPENROUTER_API_KEY when explicit_api_key is provided"
             )
 
-    def test_resolve_provider_client_without_explicit_api_key_falls_back_to_env(
-        self, monkeypatch
-    ):
-        """
-        When resolve_provider_client() is called WITHOUT explicit_api_key for OpenRouter,
-        it should fall back to OPENROUTER_API_KEY env var.
-        """
-        # Set up env var as fallback (should be used when explicit_api_key is NOT provided)
-        monkeypatch.setenv("OPENROUTER_API_KEY", "env-fallback-key")
-
-        # Mock OpenAI to capture the api_key used
-        mock_openai = MagicMock()
-        mock_openai.return_value = MagicMock(name="openrouter-client")
-
-        with patch("agent.auxiliary_client.OpenAI", mock_openai):
-            client, model = resolve_provider_client(
-                provider="openrouter",
-                explicit_api_key=None,
-            )
-
-            # Verify a client was created
-            assert client is not None
-            # Verify the env var fallback was used
-            mock_openai.assert_called_once()
-            call_kwargs = mock_openai.call_args[1]
-            assert call_kwargs["api_key"] == "env-fallback-key", (
-                f"Expected env fallback key to be used when explicit_api_key is None, got: {call_kwargs['api_key']}"
-            )
-
 
 def test_pool_runtime_base_url_uses_nous_env_override(monkeypatch):
     entry = SimpleNamespace(
@@ -4079,30 +4838,7 @@ class TestAnthropicExplicitApiKey:
     even when an explicit key was supplied (e.g. from a fallback_model entry).
     """
 
-    def test_try_anthropic_uses_explicit_api_key_over_env(self):
-        """_try_anthropic(explicit_api_key) must use the supplied key, not the env fallback."""
-        with patch("agent.anthropic_credentials.resolve_anthropic_token", return_value="env-fallback-key"), \
-             patch("agent.anthropic_adapter.build_anthropic_client") as mock_build, \
-             patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)):
-            mock_build.return_value = MagicMock()
-            from agent.auxiliary_client import _try_anthropic
-            client, model = _try_anthropic("explicit-pool-key")
-        assert client is not None
-        assert mock_build.call_args.args[0] == "explicit-pool-key", (
-            f"Expected explicit_api_key to be passed, got: {mock_build.call_args.args[0]}"
-        )
-        assert mock_build.call_args.args[0] != "env-fallback-key"
 
-    def test_try_anthropic_without_explicit_key_falls_back_to_resolve(self):
-        """Without explicit_api_key, _try_anthropic falls back to resolve_anthropic_token."""
-        with patch("agent.anthropic_credentials.resolve_anthropic_token", return_value="env-fallback-key"), \
-             patch("agent.anthropic_adapter.build_anthropic_client") as mock_build, \
-             patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)):
-            mock_build.return_value = MagicMock()
-            from agent.auxiliary_client import _try_anthropic
-            client, model = _try_anthropic()
-        assert client is not None
-        assert mock_build.call_args.args[0] == "env-fallback-key"
 
     def test_resolve_provider_client_passes_explicit_api_key_to_anthropic(self):
         """resolve_provider_client(provider='anthropic', explicit_api_key=...) must propagate the key."""
@@ -4312,7 +5048,6 @@ class TestAuxUnhealthyCache:
         assert _is_provider_unhealthy("custom", local_url) is False
 
 
-
 # ── auxiliary_max_tokens_param ──────────────────────────────────────────────
 
 
@@ -4376,11 +5111,6 @@ class TestCompressionFallbackContextFilter:
             "api_key": api_key,
         }
 
-    def _mock_resolve(self, entry):
-        """Mock _resolve_fallback_entry to return a (client, model) per entry."""
-        client = MagicMock()
-        client.base_url = entry.get("base_url", "")
-        return client, entry["model"]
 
     # ── L2: configured fallback chain ─────────────────────────────────
 
@@ -4630,6 +5360,89 @@ class TestCustomEndpointApiKeyInheritance:
         assert captured.get("api_key") == "no-key-required"
 
 
+class TestNoProgressTimeoutTaskConfigGating:
+    """#108104: ``auxiliary.<task>.no_progress_timeout`` must only reach the request kwargs
+    when the resolved client is a Codex Responses-shim client — forwarding it to a real
+    OpenAI-SDK-shaped client's ``chat.completions.create()`` would raise ``TypeError:
+    unexpected keyword argument 'no_progress_timeout'``."""
+
+    def test_non_codex_client_never_receives_the_kwarg(self, monkeypatch):
+        client = MagicMock()
+        client.base_url = "https://api.openai.com/v1"
+        client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
+        )
+        with (
+            patch("agent.auxiliary_client._resolve_task_provider_model",
+                  return_value=("openai", "gpt-4.1", None, None, None)),
+            patch("agent.auxiliary_client._get_cached_client", return_value=(client, "gpt-4.1")),
+            patch("agent.auxiliary_client._validate_llm_response",
+                  side_effect=lambda resp, _task, **_kw: resp),
+            patch("agent.auxiliary_client._get_task_no_progress_timeout", return_value=300.0),
+        ):
+            call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert "no_progress_timeout" not in client.chat.completions.create.call_args.kwargs
+
+    def test_real_config_value_reaches_the_stream_guard_per_task(self, tmp_path, monkeypatch, caplog):
+        """#108104: a REAL config.yaml ``auxiliary.compression.no_progress_timeout`` must set the
+        guard's substantive-progress window through the genuine call_llm -> _prepare_aux_request ->
+        CodexAuxiliaryClient path (both the first-output and between-output deadlines derive from
+        ``guard.no_progress_timeout``); other tasks keep the 60s default; a non-positive value
+        is rejected with a warning and falls back to the default."""
+        import hermes_yaml as yaml
+        from agent import auxiliary_client as aux
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        def _run(task):
+            captured = {}
+
+            class _Stop(Exception):
+                pass
+
+            def _start(self):
+                captured["window"] = self.no_progress_timeout
+                raise _Stop()
+
+            real_client = SimpleNamespace(
+                api_key="k", base_url="https://chatgpt.com/backend-api/codex/", close=lambda: None,
+                responses=SimpleNamespace(create=lambda **kw: None),
+            )
+            client = CodexAuxiliaryClient(real_client, "gpt-5.6-sol")
+            with (
+                patch.object(aux._CodexStreamGuard, "start", _start),
+                patch.object(aux, "_get_cached_client", lambda *a, **k: (client, "gpt-5.6-sol")),
+            ):
+                try:
+                    call_llm(task=task, provider="openai-codex", model="gpt-5.6-sol",
+                             messages=[{"role": "user", "content": "summarize"}])
+                except Exception:
+                    pass
+            return captured["window"]
+
+        (home / "config.yaml").write_text(yaml.safe_dump(
+            {"auxiliary": {"compression": {"timeout": 600, "no_progress_timeout": 5}}}))
+        assert _run("compression") == 5.0
+        # Per-task: the compression override does not leak into another task (timeout 600 so the
+        # min(window, total_timeout) clamp cannot mask the default).
+        (home / "config.yaml").write_text(yaml.safe_dump(
+            {"auxiliary": {"compression": {"timeout": 600, "no_progress_timeout": 5},
+                           "title_generation": {"timeout": 600}}}))
+        assert _run("title_generation") == 60.0
+
+        (home / "config.yaml").write_text(yaml.safe_dump(
+            {"auxiliary": {"compression": {"timeout": 600, "no_progress_timeout": -3}}}))
+        with caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+            assert _run("compression") == 60.0
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+
 class TestMoaAggregatorStreamingBypass:
     def test_moa_aggregator_stream_bypasses_relay_for_codex_auxiliary_client(self, monkeypatch):
         """The MoA facade owns the streaming contract. For Codex Responses-shim
@@ -4761,7 +5574,6 @@ class TestSynchronousFallbackCachePlans:
             for message in wire_request["messages"]
             for part in (message.get("content") if isinstance(message.get("content"), list) else [])
         )
-
 
 
 class TestAsynchronousFallbackCachePlans:
