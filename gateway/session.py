@@ -9,17 +9,20 @@ import json
 import threading
 from pathlib import Path
 from datetime import datetime, timedelta
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from typing import Dict, List, Optional, Any
 
 from .config import Platform, GatewayConfig, HomeChannel
 from .whatsapp_identity import canonical_whatsapp_identifier
+from gateway.session_identity import transport_profile_of
 from gateway.session_persistence import SessionPersistenceMixin, _DB_UNPINNED
 from gateway.session_recovery import SessionRecoveryMixin
 from gateway.session_lifecycle import SessionLifecycleMixin, _iso, _new_session_id, _now, _parse_iso
 from gateway.session_transcript import SessionTranscriptMixin
 
 logger = logging.getLogger(__name__)
+
+COMPRESSION_EXHAUSTED_METADATA_KEY = "compression_exhausted"
 
 
 # -- PII redaction helpers --------------------------------------------------------------------
@@ -216,20 +219,27 @@ def _slack_tools_loaded() -> bool:
     except Exception:
         pass
 
-    # Profile secret scope, not bare env: under multiplex the env may hold another profile's token.
+    # Profile secret scope, not bare env: under multiplex the env may hold another
+    # profile's token. Only the unscoped default-profile path (UnscopedSecretError)
+    # reads the env; any other scoped-read failure fails closed rather than borrowing.
     try:
-        from agent.secret_scope import get_secret
+        from agent.secret_scope import UnscopedSecretError, get_secret
 
-        token = get_secret("SLACK_BOT_TOKEN") or ""
-    except Exception:  # includes UnscopedSecretError
-        token = os.environ.get("SLACK_BOT_TOKEN") or ""
+        try:
+            token = get_secret("SLACK_BOT_TOKEN") or ""
+        except UnscopedSecretError:
+            token = os.environ.get("SLACK_BOT_TOKEN") or ""
+    except Exception:
+        return False
     if not token.strip():
         return False
     try:
-        from hermes_cli.config import load_config
+        # Read-only loader: this runs per turn via _ephemeral_change_key, and _get_platform_tools
+        # only reads the config. load_config()'s defensive deepcopy is ~half this probe's cost.
+        from hermes_cli.config import load_config_readonly
         from hermes_cli.tools_config import _get_platform_tools
         # include_default_mcp_servers defaults True so a default-enabled Slack MCP counts too.
-        return "slack" in _get_platform_tools(load_config(), "slack")
+        return "slack" in _get_platform_tools(load_config_readonly(), "slack")
     except Exception:
         return False
 
@@ -239,12 +249,14 @@ def _discord_tools_loaded() -> bool:
     toolset enabled AND `DISCORD_BOT_TOKEN` set (the tool's `check_fn` gates on it)."""
     try:
         from agent.secret_scope import get_secret
-        from hermes_cli.config import load_config
+        # Read-only loader: this runs per turn via _ephemeral_change_key, and _get_platform_tools
+        # only reads the config. load_config()'s defensive deepcopy is ~half this probe's cost.
+        from hermes_cli.config import load_config_readonly
         from hermes_cli.tools_config import _get_platform_tools
 
         if not (get_secret("DISCORD_BOT_TOKEN", "") or "").strip():
             return False
-        enabled = _get_platform_tools(load_config(), "discord", include_default_mcp_servers=False)
+        enabled = _get_platform_tools(load_config_readonly(), "discord", include_default_mcp_servers=False)
         return "discord" in enabled or "discord_admin" in enabled
     except Exception:
         return False
@@ -519,6 +531,16 @@ class SessionEntry:
     # Session-scoped /model override (model/provider/base_url ONLY — never credentials, see
     # sanitize_model_override). Persisted so a restart keeps the chosen model.
     model_override: Optional[Dict[str, str]] = None
+    # Profile owning the bot that received this lane's traffic (``RoutingIdentity.transport_profile``,
+    # "default" spelled out). The key namespace only says where the turn RUNS; after a restart this is
+    # what says which bot may deliver to it. None = unknown (row predates the field, or standalone).
+    transport_profile: Optional[str] = None
+
+    @property
+    def compression_paused(self) -> bool:
+        """Durable pause, or a process-local hold when the initial write failed."""
+        return (self.metadata.get(COMPRESSION_EXHAUSTED_METADATA_KEY) is True
+                or getattr(self, "_compression_pause_pending", False) is True)
 
     # Fields (de)serialized verbatim, in wire order (``from_dict`` reads them with
     # ``data.get(name, <dataclass default>)``), split around the three ISO-datetime/token keys.
@@ -548,6 +570,8 @@ class SessionEntry:
         if self.model_override:
             # Defence-in-depth against an unsanitized dict stored directly.
             result["model_override"] = sanitize_model_override(self.model_override)
+        if self.transport_profile:
+            result["transport_profile"] = self.transport_profile
         if self.origin:
             result["origin"] = self.origin.to_dict()
         return result
@@ -578,6 +602,7 @@ class SessionEntry:
         defaults = {f.name: f.default for f in fields(cls)}
         plain = {n: data.get(n, defaults[n]) for n in cls._PLAIN_FIELDS + cls._RESET_FIELDS}
         plain["expiry_finalized"] = data.get("expiry_finalized", data.get("memory_flushed", False))
+        transport_profile = data.get("transport_profile")
         return cls(
             session_key=session_key, session_id=session_id,
             created_at=datetime.fromisoformat(data["created_at"]),
@@ -586,7 +611,9 @@ class SessionEntry:
             chat_type=data.get("chat_type", "dm"), metadata=dict(data.get("metadata") or {}),
             last_resume_marked_at=_parse_iso(data.get("last_resume_marked_at")),
             active_turn_token=token, active_turn_started_at=started_at,
-            model_override=sanitize_model_override(data.get("model_override")), **plain,
+            model_override=sanitize_model_override(data.get("model_override")),
+            transport_profile=transport_profile if isinstance(transport_profile, str) and transport_profile else None,
+            **plain,
         )
 
 
@@ -782,7 +809,9 @@ class SessionStore(
         self._transcript_reroutes: Dict[str, str] = {}
         self._dirty_transcripts: Dict[str, List[Dict[str, Any]]] = {}
         self._transcript_append_failures: Dict[str, int] = {}
-        self._fts_rebuild_attempted = False
+        # Monotonic timestamp of the last FTS5 rebuild attempt, or None before any attempt; see
+        # SessionTranscriptMixin._rebuild_fts_once for the cooldown this gates.
+        self._fts_rebuild_last_attempt_at: Optional[float] = None
         self._has_active_processes_fn = has_active_processes_fn
         self._write_sessions_json = bool(getattr(config, "write_sessions_json", True))
 
@@ -843,6 +872,8 @@ class SessionStore(
             )
             return True
 
+
+
     def has_any_sessions(self) -> bool:
         """Whether any session has ever been created. SQLite is the source of truth (ended sessions
         count); the current session is already in the DB when this runs, hence ``> 1``."""
@@ -857,6 +888,7 @@ class SessionStore(
 
     def get_or_create_session(
         self, source: SessionSource, force_new: bool = False, touch_activity: bool = True,
+        *, recovery_session_id: Optional[str] = None,
     ) -> SessionEntry:
         """Single-flight session lookup/create per routing key: overlapping calls for one key (even
         concurrent ``force_new``) share the owner's result so only one transition and SQLite row is
@@ -883,6 +915,7 @@ class SessionStore(
         try:
             slot.result = self._get_or_create_session_impl(
                 source, force_new=force_new, touch_activity=touch_activity,
+                recovery_session_id=recovery_session_id,
             )
             return slot.result
         except BaseException as exc:
@@ -895,6 +928,7 @@ class SessionStore(
 
     def _get_or_create_session_impl(
         self, source: SessionSource, force_new: bool = False, touch_activity: bool = True,
+        *, recovery_session_id: Optional[str] = None,
     ) -> SessionEntry:
         """One routing transition for the single-flight owner. All blocking I/O (SQLite SELECTs,
         index rewrite + fsync, recovery queries) runs *outside* ``self._lock``, which protects
@@ -908,6 +942,13 @@ class SessionStore(
         with self._lock:
             self._ensure_loaded_locked()
             observed = self._entries.get(session_key)
+        if force_new and observed is not None and observed.compression_paused:
+            entry = self.reset_session(
+                session_key, require_primary=True, expected_session_id=observed.session_id,
+            )
+            if entry is None:
+                raise RuntimeError("Session route changed before reset")
+            return entry
         # Phase 1b (no lock): compression tip + stale check + explicit suspension.
         checks = None
         if not force_new and observed is not None:
@@ -921,7 +962,7 @@ class SessionStore(
 
         # Phase 3 (no lock): recovery + create + save + DB ops.
         if decision.needs_recover and decision.prev_session_id is None:
-            self._route_recover(decision, session_key, source, now)
+            self._route_recover(decision, session_key, source, now, recovery_session_id)
         create_kwargs = None
         if decision.entry is None:
             create_kwargs = self._route_create(
@@ -988,16 +1029,37 @@ class SessionStore(
         return decision
 
     def _route_recover(
-        self, decision: _RouteDecision, session_key: str, source: SessionSource, now: datetime
+        self, decision: _RouteDecision, session_key: str, source: SessionSource, now: datetime,
+        recovery_session_id: Optional[str] = None,
     ) -> None:
-        """Adopt a recoverable state.db row, or schedule its reset (no lock held on entry)."""
-        recovered = self._query_recoverable_session(session_key=session_key, source=source, now=now)
+        """Recover an absent route; a binding hint cannot replace a concurrent publication."""
+        recovered = None
+        if recovery_session_id:
+            try:
+                db = self._db_for_key(session_key)
+                canonical_id = db.get_compression_tip(recovery_session_id) or recovery_session_id
+                row = db.get_recoverable_gateway_session(
+                    canonical_id, session_key=session_key, source=source.platform.value,
+                )
+                if row and self._recovered_row_allowed_for_active_profile(
+                    requested_session_key=session_key, recovered=row,
+                ):
+                    recovered = self._create_entry_from_recovered_row(
+                        row=row, session_key=session_key, source=source, now=now,
+                    )
+            except Exception:
+                logger.debug("Topic binding recovery failed for %s", session_key, exc_info=True)
         if recovered is None:
-            return
-        self._reopen_session_row(session_key, recovered.session_id)
+            recovered = self._query_recoverable_session(session_key=session_key, source=source, now=now)
         with self._lock:
-            decision.entry = self._entries.setdefault(session_key, recovered)
-        decision.needs_save = True
+            self._ensure_loaded_locked()
+            decision.entry = self._entries.get(session_key)
+            if decision.entry is None and recovered is not None:
+                # Reopen only the winner, while replacement is excluded. A losing hint must
+                # never reopen history ended by an explicit reset or switch.
+                self._reopen_session_row(session_key, recovered.session_id)
+                self._entries[session_key] = decision.entry = recovered
+                decision.needs_save = True
 
     def _route_create(
         self, decision: _RouteDecision, session_key: str, source: SessionSource, now: datetime,
@@ -1011,7 +1073,7 @@ class SessionStore(
             origin=source, display_name=source.chat_name, platform=source.platform,
             chat_type=source.chat_type, was_auto_reset=decision.reset_reason is not None,
             auto_reset_reason=decision.reset_reason, reset_had_activity=decision.reset_had_activity,
-            prev_session_id=decision.prev_session_id,
+            prev_session_id=decision.prev_session_id, transport_profile=transport_profile_of(source),
         )
         with self._lock:
             current = self._entries.get(session_key)
@@ -1042,9 +1104,11 @@ class SessionStore(
                 entry.last_prompt_tokens = last_prompt_tokens
             # Snapshot peer fields under _lock so a concurrent reset/heal cannot tear the row.
             peer_sid, peer_origin, peer_name = entry.session_id, entry.origin, entry.display_name
+            peer_transport = entry.transport_profile
         # Metadata-only: single-row UPSERT, outside ``_lock``.
         self._save_entry(session_key)
-        self._record_gateway_session_peer(peer_sid, session_key, peer_origin, display_name=peer_name)
+        self._record_gateway_session_peer(
+            peer_sid, session_key, peer_origin, display_name=peer_name, transport_profile=peer_transport)
 
     def get_session_metadata(self, session_key: str, key: str, default: Any = None) -> Any:
         """Return a metadata value stored on a live session entry."""
@@ -1052,14 +1116,71 @@ class SessionStore(
             entry = self._entry_locked(session_key)
             return default if entry is None else entry.metadata.get(key, default)
 
-    def set_session_metadata(self, session_key: str, key: str, value: Any) -> bool:
+    def set_session_metadata(
+        self, session_key: str, key: str, value: Any, *, require_primary: bool = False,
+        expected_session_id: Optional[str] = None,
+    ) -> bool:
         """Persist a small JSON-serializable metadata value. Deliberately does NOT advance
         ``updated_at``: a background write must not make an idle session look fresh.
 
         Internal bookkeeping must not advance the user-activity clock used by housekeeping
         and restart recovery.
         """
-        return self._update_entry(session_key, lambda e: e.metadata.__setitem__(key, value))
+        if not require_primary:
+            return self._update_entry(session_key, lambda e: e.metadata.__setitem__(key, value))
+        with self._lock:
+            self._ensure_loaded_locked()
+            data, generation = self._snapshot_routing_locked()
+            entry = self._entries.get(session_key)
+            if entry is None or (expected_session_id is not None and entry.session_id != expected_session_id):
+                return False
+            if key == COMPRESSION_EXHAUSTED_METADATA_KEY and value is True:
+                # Set before I/O; a failed first mark must not admit another paid turn.
+                entry._compression_pause_pending = True
+            metadata = {**entry.metadata, key: value}
+            data[session_key] = replace(entry, metadata=metadata).to_dict()
+            self._persist_routing_data(data, generation, require_primary=True)
+            entry.metadata = metadata
+            if key == COMPRESSION_EXHAUSTED_METADATA_KEY:
+                entry._compression_pause_pending = False
+            return True
+
+    def delete_session_metadata(self, session_key: str, key: str, *, expected_session_id: str) -> bool:
+        """Strict primary deletion; publish only after commit, preserving the activity clock."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            data, generation = self._snapshot_routing_locked()
+            entry = self._entries.get(session_key)
+            if entry is None or entry.session_id != expected_session_id:
+                return False
+            if key not in entry.metadata:
+                return True
+            metadata = {k: v for k, v in entry.metadata.items() if k != key}
+            data[session_key] = replace(entry, metadata=metadata).to_dict()
+            self._persist_routing_data(data, generation, require_primary=True)
+            entry.metadata = metadata
+            return True
+
+    def commit_manual_compression(
+        self, session_key: str, expected_session_id: str, new_session_id: str,
+    ) -> bool:
+        """Publish already-committed compression and release its pause in one routing write."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            data, generation = self._snapshot_routing_locked()
+            entry = self._entries.get(session_key)
+            if entry is None or entry.session_id != expected_session_id:
+                return False
+            metadata = {**entry.metadata, COMPRESSION_EXHAUSTED_METADATA_KEY: False}
+            data[session_key] = replace(
+                entry, session_id=new_session_id, last_prompt_tokens=0, metadata=metadata,
+            ).to_dict()
+            self._persist_routing_data(data, generation, require_primary=True)
+            entry.session_id = new_session_id
+            entry.last_prompt_tokens = 0
+            entry.metadata = metadata
+            entry._compression_pause_pending = False
+            return True
 
     def set_model_override(self, session_key: str, override: Optional[Dict[str, Any]]) -> None:
         """Persist (or clear, with ``None``) the /model override; non-secret keys only."""
@@ -1085,18 +1206,21 @@ class SessionStore(
             entry = self._entry_locked(session_key)
             return dict(entry.model_override) if entry and entry.model_override else None
 
-    def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
+    def reset_session(
+        self, session_key: str, display_name: Optional[str] = None, *,
+        require_primary: bool = False, expected_session_id: Optional[str] = None,
+    ) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""
         with self._lock:
             old_entry = self._entry_locked(session_key)
-            if old_entry is None:
+            if old_entry is None or (expected_session_id is not None and old_entry.session_id != expected_session_id):
                 return None
             now = _now()
             session_id = _new_session_id(now)
             new_entry = self._replace_route_locked(
                 session_key, old_entry, session_id, now,
                 display_name=display_name if display_name is not None else old_entry.display_name,
-                is_fresh_reset=True,
+                is_fresh_reset=True, require_primary=require_primary,
             )
             db_create_kwargs = self._session_create_kwargs(
                 session_id=session_id, session_key=session_key, origin=old_entry.origin,
@@ -1110,15 +1234,28 @@ class SessionStore(
         )
         return new_entry
 
-    def _replace_route_locked(self, session_key, old_entry, session_id, now, **fields) -> SessionEntry:
-        """Publish a fresh entry (inheriting origin/platform/chat_type) and save. Lock held."""
+    def _replace_route_locked(
+        self, session_key, old_entry, session_id, now, *, require_primary=False,
+        telegram_topic_binding=None, **fields,
+    ) -> SessionEntry:
+        """Replace a route; paused transitions commit primary storage before publication."""
         new_entry = SessionEntry(
             session_key=session_key, session_id=session_id, created_at=now, updated_at=now,
             origin=old_entry.origin, platform=old_entry.platform, chat_type=old_entry.chat_type,
-            **fields,
+            transport_profile=old_entry.transport_profile, **fields,
         )
-        self._entries[session_key] = new_entry
-        self._save()
+        if require_primary or old_entry.compression_paused or "manual_fallback_index" in old_entry.metadata:
+            data, generation = self._snapshot_routing_locked()
+            if self._entries.get(session_key) is not old_entry:
+                raise RuntimeError("Session route changed before replacement")
+            data[session_key] = new_entry.to_dict()
+            self._persist_routing_data(
+                data, generation, require_primary=True, telegram_topic_binding=telegram_topic_binding,
+            )
+            self._entries[session_key] = new_entry
+        else:
+            self._entries[session_key] = new_entry
+            self._save()
         return new_entry
 
     def rekey_profile_routing(self, old_name: str, new_name: str) -> int:
@@ -1148,21 +1285,79 @@ class SessionStore(
                 self._save()
         return len(moving)
 
+    def purge_profile_routing(self, profile: str) -> int:
+        """Drop a deleted profile's live routing entries and persist the drop (#111926, delete side).
+
+        The mirror of :meth:`rekey_profile_routing`, and it has to happen here for the same reason:
+        this index is written back by the owning process, so a durable DB delete made elsewhere is
+        undone by the next save of this in-memory copy — which is how a deleted profile kept
+        resolving. Idempotent; returns the number of entries dropped.
+        """
+        name = (profile or "").strip()
+        if not name:
+            return 0
+        ns = f"agent:{name}:"
+        with self._lock:
+            dropped = [key for key in self._entries if key.startswith(ns)]
+            for key in dropped:
+                self._entries.pop(key, None)
+            if dropped:
+                self._save()
+        return len(dropped)
+
     # Compression repoint is store bookkeeping, not user activity — leave ``updated_at`` alone so a
     # background compression on an idle session cannot make it look fresh to the
     # restart-resume freshness gate (#85709).
-    def switch_session(self, session_key: str, target_session_id: str) -> Optional[SessionEntry]:
+    def switch_session(
+        self, session_key: str, target_session_id: str, *, require_primary: bool = False,
+        expected_session_id: Optional[str] = None,
+        telegram_topic_binding: Optional[Dict[str, str]] = None,
+        clear_model_override: bool = False,
+    ) -> Optional[SessionEntry]:
         """Point a session key at an existing session ID (``/resume``): ends the current row and
-        reopens the target so resume matches the CLI."""
+        reopens the target so resume matches the CLI. Explicit topic restores also commit
+        their binding atomically with primary routing before publishing the transition.
+
+        ``expected_session_id`` makes the repoint a compare-and-swap: ``None`` is returned when
+        the key no longer points at that session, so a caller that resolved against a snapshot
+        across an await (async-delegation re-pin) cannot overwrite a concurrent /new or /resume.
+        ``clear_model_override`` drops the /model pin in the same route write when switching
+        to a different session at a conversation boundary; other repins retain it by default.
+        """
+        if telegram_topic_binding is not None:
+            self._telegram_topic_restore_db(telegram_topic_binding["_db_path"])
+            require_primary = True
         with self._lock:
             old_entry = self._entry_locked(session_key)
             if old_entry is None:
                 return None
+            if expected_session_id is not None and old_entry.session_id != expected_session_id:
+                logger.info(
+                    "Session switch for %s refused: route moved from %s to %s after the caller's snapshot",
+                    session_key, expected_session_id, old_entry.session_id,
+                )
+                return None
+            if telegram_topic_binding is not None:
+                telegram_topic_binding = {
+                    **telegram_topic_binding, "session_key": session_key,
+                    "expected_session_id": old_entry.session_id,
+                }
             if old_entry.session_id == target_session_id:
+                if require_primary:
+                    data, generation = self._snapshot_routing_locked()
+                    # Reconciliation can replace fallback entries, even for the same ID.
+                    if (self._entries.get(session_key) is not old_entry
+                            or old_entry.session_id != target_session_id):
+                        raise RuntimeError("Session route changed before replacement")
+                    self._persist_routing_data(
+                        data, generation, require_primary=True, telegram_topic_binding=telegram_topic_binding,
+                    )
                 return old_entry
             new_entry = self._replace_route_locked(
                 session_key, old_entry, target_session_id, _now(),
                 display_name=old_entry.display_name,
+                model_override=None if clear_model_override else old_entry.model_override,
+                require_primary=require_primary, telegram_topic_binding=telegram_topic_binding,
             )
 
         if self._db_for_key(session_key) and old_entry.session_id:
@@ -1177,6 +1372,7 @@ class SessionStore(
             self._record_gateway_session_peer(
                 target_session_id, session_key, new_entry.origin,
                 display_name=new_entry.display_name, include_compression_ancestors=True,
+                transport_profile=new_entry.transport_profile,
             )
         return new_entry
 

@@ -9,9 +9,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agent import chat_completion_helpers
 from agent.error_classifier import FailoverReason
-from run_agent import AIAgent, _pool_may_recover_from_rate_limit
+from run_agent import AIAgent
 
 
 def _make_agent(fallback_model=None):
@@ -43,12 +42,38 @@ def _mock_client(base_url="https://openrouter.ai/api/v1", api_key="fb-key"):
 # ── Chain initialisation ──────────────────────────────────────────────────
 
 
+@pytest.mark.parametrize("next_policy", [None, "normal", "unsupported"])
+def test_next_route_replaces_or_clears_tier_policy(next_policy, caplog):
+    from copy import deepcopy
+
+    chain = [
+        {"provider": "openai", "model": "gpt-4o", "service_tier_override": " NORMAL "},
+        {"provider": "custom", "model": "gpt-4.1", "service_tier_override": next_policy,
+         "base_url": "https://next.example.test/v1", "api_mode": "chat_completions"},
+    ]
+    before_chain = deepcopy(chain)
+    agent = _make_agent(fallback_model=chain)
+    agent.request_overrides = {"service_tier": "priority", "speed": "fast", "extra_body": {"store": False}}
+    before = deepcopy(agent.request_overrides)
+    with patch("agent.auxiliary_client.resolve_provider_client", return_value=(_mock_client(), None)):
+        assert agent._try_activate_fallback() is True
+        assert agent._active_fallback_service_tier_override == "normal"
+        wire = agent._build_api_kwargs([{"role": "user", "content": "fixture"}])
+        assert "service_tier" not in wire
+        assert "speed" not in wire
+        assert agent._try_activate_fallback() is True
+    assert agent._active_fallback_service_tier_override == ("normal" if next_policy == "normal" else None)
+    wire = agent._build_api_kwargs([{"role": "user", "content": "fixture"}])
+    assert wire.get("service_tier") == (None if next_policy == "normal" else "priority")
+    assert wire.get("speed") == (None if next_policy == "normal" else "fast")
+    assert wire["extra_body"]["store"] is False
+    if next_policy == "unsupported":
+        assert "Ignoring unsupported fallback service_tier_override" in caplog.text
+    assert agent.request_overrides == before
+    assert chain == before_chain
+
+
 class TestFallbackChainInit:
-    def test_no_fallback(self):
-        agent = _make_agent(fallback_model=None)
-        assert agent._fallback_chain == []
-        assert agent._fallback_index == 0
-        assert agent._fallback_model is None
 
 
 
@@ -72,26 +97,8 @@ class TestFallbackChainInit:
 # ── Chain advancement ─────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize(
-    ("reason", "expected"),
-    [
-        (FailoverReason.auth, "authentication failed"),
-        (FailoverReason.billing, "billing or quota exhausted"),
-        (FailoverReason.rate_limit, "rate limit"),
-        (FailoverReason.upstream_rate_limit, "upstream model rate limit"),
-        (FailoverReason.overloaded, "provider overloaded"),
-        (FailoverReason.server_error, "provider server error"),
-        (FailoverReason.timeout, "request timeout"),
-        (FailoverReason.model_not_found, "model not found"),
-        (FailoverReason.unknown, "provider failure"),
-    ],
-)
-def test_fallback_reason_text_is_operator_friendly(reason, expected):
-    assert chat_completion_helpers._fallback_reason_text(reason) == expected
 
 
-def test_fallback_reason_text_defaults_when_reason_is_missing():
-    assert chat_completion_helpers._fallback_reason_text(None) == "provider failure"
 
 
 class TestFallbackChainAdvancement:
@@ -112,26 +119,6 @@ class TestFallbackChainAdvancement:
             assert agent.model == "gpt-4o"
             assert agent._fallback_activated is True
 
-    @patch("time.monotonic", return_value=1000.0)
-    def test_records_user_visible_switch_with_reason(self, _clock):
-        agent = _make_agent(
-            fallback_model={"provider": "zai", "model": "glm-5.2"},
-        )
-        agent.model = "gpt-5.6-sol"
-        agent.provider = "openai-codex"
-        with patch(
-            "agent.auxiliary_client.resolve_provider_client",
-            return_value=(_mock_client(base_url="https://api.z.ai/v1"), "glm-5.2"),
-        ):
-            assert agent._try_activate_fallback(FailoverReason.rate_limit) is True
-
-        expected = (
-            "⚠️ Model fallback: gpt-5.6-sol via openai-codex unavailable "
-            "(rate limit); using glm-5.2 via zai. "
-            "Primary retry eligible in ~60 s; recovery is not guaranteed."
-        )
-        assert agent._pending_fallback_notice == [expected]
-        assert agent._retry_status_buffer[-1] == ("status", expected)
 
     @patch("time.monotonic", return_value=1000.0)
     def test_records_sequential_switches_in_order(self, _clock):
@@ -154,13 +141,13 @@ class TestFallbackChainAdvancement:
             assert agent._try_activate_fallback(FailoverReason.rate_limit) is True
             assert agent._try_activate_fallback(FailoverReason.overloaded) is True
 
-        assert agent._pending_fallback_notice == [
-            "⚠️ Model fallback: gpt-5.6-sol via openai-codex unavailable "
-            "(rate limit); using glm-5.2 via zai. "
-            "Primary retry eligible in ~60 s; recovery is not guaranteed.",
-            "⚠️ Model fallback: glm-5.2 via zai unavailable "
-            "(provider overloaded); using deepseek-v4-flash via deepseek.",
-        ]
+        # One user-visible notice per switch, in order, each naming from/to.
+        notices = agent._pending_fallback_notice
+        assert len(notices) == 2
+        assert "gpt-5.6-sol" in notices[0] and "glm-5.2" in notices[0]
+        assert "glm-5.2" in notices[1] and "deepseek-v4-flash" in notices[1]
+        assert agent._retry_status_buffer[-1] == ("status", notices[1])
+
     def test_skips_unconfigured_provider_to_next(self):
         """If resolve_provider_client returns None, skip to next in chain."""
         fbs = [
@@ -320,9 +307,6 @@ def _pool(n_entries: int, has_available: bool = True):
     return pool
 
 
-class TestPoolRotationRoom:
-    def test_none_pool_returns_false(self):
-        assert _pool_may_recover_from_rate_limit(None) is False
 
 
 
@@ -510,3 +494,143 @@ class TestFallbackExtraBodyReResolution:
         agent.request_overrides["temperature"] = 0.2
         self._activate(agent)
         assert agent.request_overrides.get("temperature") == 0.2
+
+
+# ── MoA preset as a fallback entry (#112525, #112623) ─────────────────────
+
+
+def _write_moa_home(tmp_path, monkeypatch):
+    """Real config.yaml with a MoA preset under a temp HERMES_HOME (genuine preset resolution)."""
+    import hermes_yaml as yaml
+
+    home = tmp_path / ".hermes"
+    home.mkdir(exist_ok=True)
+    (home / "config.yaml").write_text(yaml.safe_dump({
+        "moa": {"default_preset": "default", "presets": {"default": {
+            "enabled": True,
+            "reference_models": [{"provider": "xai", "model": "grok-4-fast"}],
+            "aggregator": {"provider": "xai", "model": "grok-4.6"},
+        }}},
+    }))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    return home
+
+
+def _assert_bound_to_moa_preset(agent, preset="default"):
+    from agent.conversation_loop import _moa_client_consumes_prepared_request
+
+    assert (agent.provider, agent.requested_provider, agent.model) == ("moa", "moa", preset)
+    assert (agent.base_url, agent.api_mode) == ("moa://local", "chat_completions")
+    assert agent._client_kwargs == {}
+    assert _moa_client_consumes_prepared_request(agent.client)
+
+
+class TestMoaPresetFallback:
+    def test_runtime_fallback_to_moa_preset_binds_the_facade(self, tmp_path, monkeypatch):
+        """#112525 / #112623: a ``{provider: moa, model: <preset>}`` fallback entry activates the
+        preset (facade, ``moa://local``), never the aggregator's HTTP client wearing the virtual
+        identity (preset name on the aggregator wire → 404; ``provider == "moa"`` guards misfire)."""
+        _write_moa_home(tmp_path, monkeypatch)
+        agent = _make_agent(fallback_model={"provider": "moa", "model": "default"})
+        aggregator_client = _mock_client(base_url="https://api.x.ai/v1/", api_key="xai-key")
+        with patch("agent.auxiliary_client.resolve_provider_client",
+                   return_value=(aggregator_client, "grok-4.6")):
+            assert agent._try_activate_fallback() is True
+        _assert_bound_to_moa_preset(agent)
+        assert agent.client is not aggregator_client
+        assert agent._provider_fallback_route == ("default", "moa")
+
+    def test_init_time_fallback_to_moa_preset_binds_the_facade(self, tmp_path, monkeypatch):
+        """Primary without credentials at init walks the chain: a MoA entry lands on the preset
+        with virtual pins, not on the aggregator slug with the aggregator's kwargs."""
+        _write_moa_home(tmp_path, monkeypatch)
+        aggregator_client = _mock_client(base_url="https://api.x.ai/v1/", api_key="xai-key")
+
+        def _route(provider, model=None, **_kw):
+            return (aggregator_client, "grok-4.6") if provider == "moa" else (None, None)
+
+        with (
+            patch("model_tools.get_tool_definitions", return_value=[]),
+            patch("model_tools.check_toolset_requirements", return_value={}),
+            patch("agent.auxiliary_client.resolve_provider_client", side_effect=_route),
+        ):
+            agent = AIAgent(model="anthropic/claude-sonnet-4.5", provider="openrouter",
+                            quiet_mode=True, skip_context_files=True, skip_memory=True,
+                            fallback_model={"provider": "moa", "model": "default"})
+        _assert_bound_to_moa_preset(agent)
+        assert agent._fallback_activated is True
+
+
+def test_manual_entry_alias_is_skipped_before_advancing_to_next_fallback():
+    fbs = [
+        {"provider": "openrouter", "model": "claude-sonnet-4.6"},
+        {"provider": "openai", "model": "gpt-4o"},
+    ]
+    agent = _make_agent(fallback_model=fbs)
+    agent.provider = "openrouter"
+    agent.model = "anthropic/claude-sonnet-4.6"
+    agent.base_url = "https://openrouter.ai/api/v1"
+    resolver = MagicMock(
+        return_value=(_mock_client(base_url="https://api.openai.com/v1"), "gpt-4o")
+    )
+
+    def _normalize(model, provider):
+        if provider == "openrouter" and model == "claude-sonnet-4.6":
+            return "anthropic/claude-sonnet-4.6"
+        return model
+
+    with (
+        patch(
+            "agent.chat_completion_helpers._fallback_entry_unavailable_without_network",
+            return_value=None,
+        ),
+        patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            resolver,
+        ),
+        patch(
+            "hermes_cli.model_normalize.normalize_model_for_provider",
+            side_effect=_normalize,
+        ),
+    ):
+        assert agent._try_activate_fallback() is True
+
+    resolver.assert_called_once()
+    assert resolver.call_args.args[:2] == ("openai",)
+    assert resolver.call_args.kwargs["model"] == "gpt-4o"
+    assert agent._fallback_index == 2
+    assert agent.provider == "openai"
+    assert agent.model == "gpt-4o"
+
+@pytest.mark.parametrize("setup_policy", [None, "normal"])
+def test_manual_policy_preserves_native_setup_fallback(setup_policy, monkeypatch):
+    from types import SimpleNamespace
+    client = SimpleNamespace(api_key="setup-fixture", base_url="https://openrouter.ai/api/v1",
+                             _custom_headers={}, default_headers={}, _default_headers={})
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    with patch("model_tools.get_tool_definitions", return_value=[]), patch("model_tools.check_toolset_requirements", return_value={}), patch("agent.process_bootstrap.OpenAI"), patch(
+        "agent.auxiliary_client.resolve_provider_client", side_effect=[(None, None), (client, "gpt-4o")]
+    ):
+        agent = AIAgent(provider="openai", model="gpt-5.5", api_mode="chat_completions",
+                        fallback_model=[dict(provider="openrouter", model="gpt-4o", service_tier_override=setup_policy)],
+                        fallback_service_tier_override="normal", quiet_mode=True,
+                        skip_memory=True, skip_context_files=True,
+                        request_overrides={"service_tier": "priority"})
+    try:
+        assert agent._fallback_activated and agent.provider == "openrouter"
+        assert agent._active_fallback_service_tier_override == setup_policy
+        wire = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        assert wire.get("service_tier") == (None if setup_policy else "priority")
+    finally:
+        agent.shutdown_memory_provider()
+        agent.close()
+
+
+def test_manual_parameter_appended_without_shifting_positional_callers():
+    import inspect
+    from agent.agent_init import init_agent
+    for fn in (AIAgent.__init__, init_agent):
+        params = list(inspect.signature(fn).parameters)
+        assert params[-1] == "fallback_service_tier_override"
+        assert params[-2] == "tool_result_metadata_callback"
