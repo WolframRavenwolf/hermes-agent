@@ -23,8 +23,7 @@ def prompt_dangerous_approval(command: str, description: str, timeout_seconds: i
                               title: str | None = None) -> str:
     """Prompt the user to approve a dangerous command (CLI only).
 
-    allow_permanent=False hides [a]lways (tirith warnings present: broad permanent
-    allowlisting is wrong for content-level findings). allow_session=False hides
+    allow_permanent=False hides [a]lways. allow_session=False hides
     [s]ession too — the caller grants one operation and re-asks next time (the
     protected agent-instruction gate in ``tools/file_tools.py``); offering a scope
     the caller discards makes every later write re-prompt and reads as broken.
@@ -35,20 +34,36 @@ def prompt_dangerous_approval(command: str, description: str, timeout_seconds: i
     allow_permanent=True, allow_session=True, smart_denied=False) -> str``; legacy
     signatures keep working while both keywords hold their defaults.
 
-    Returns 'once', 'session', 'always', 'deny', or 'timeout'. 'timeout' means no
-    user response — still blocked (fail-closed), but callers report "no response"
-    rather than an explicit denial.
+    Returns 'once', 'session', 'always', 'deny', 'timeout', or 'cancelled'. 'timeout'
+    means no user response — still blocked (fail-closed), but callers report "no
+    response" rather than an explicit denial. 'cancelled' is an :class:`Unanswered`
+    sentinel: the prompt never reached a human (callback raised, no callback under
+    prompt_toolkit, interrupted read) and ``.cause`` says why (#22992).
 
     See #81887.
     """
     if timeout_seconds is None:
         timeout_seconds = _ctx._get_approval_timeout()
+    from tools.human_input_hooks import human_input_request
     # Everything below is a human prompt (callback panel or input() fallback, both bounded by the approval deadline):
     # record it as human-wait time so the concurrent batch deadline excludes it.
     # See #79719.
-    with human_wait_window():
-        return _ask_human(command, description, timeout_seconds, allow_permanent,
-                          approval_callback, allow_session, smart_denied, title=title)
+    with human_input_request("approval", prompt=command) as human, human_wait_window():
+        human.outcome = choice = _ask_human(command, description, timeout_seconds, allow_permanent,
+                                            approval_callback, allow_session, smart_denied, title=title)
+        return choice
+
+
+class Unanswered(str):
+    """Choice ``"cancelled"`` carrying the reason nobody answered. Compares equal to the gateway's
+    withdrawn-prompt choice so every consumer already handling ``cancelled`` fails closed without
+    attributing a denial to the user."""
+    __slots__ = ("cause",)
+
+    def __new__(cls, cause: str):
+        self = super().__new__(cls, "cancelled")
+        self.cause = cause
+        return self
 
 
 _CLI_CHOICE_ALIASES = {
@@ -112,14 +127,14 @@ def _ask_human(command: str, description: str, timeout_seconds: int, allow_perma
             return approval_callback(display_command, display_description, **callback_kwargs)
         except Exception as e:
             logger.error("Approval callback failed: %s", e, exc_info=True)
-            return "deny"
+            return Unanswered(f"the approval callback failed: {type(e).__name__}")
 
     # Fail-closed guard: when prompt_toolkit owns the terminal and no callback is registered on this thread, the
     # input() fallback would spawn a daemon thread whose read never sees Enter (keystrokes go to prompt_toolkit) — an
-    # invisible deadlock. Deny loudly instead; threads needing interactive approval must install a callback via
+    # invisible deadlock. Fail closed loudly instead; threads needing interactive approval must install a callback via
     # tools.terminal_tool.set_approval_callback() first.
     try:
-        # Deny fast and log loudly instead so the caller can surface a real error to the agent. Any thread
+        # Fail fast and log loudly so the caller can surface a real error to the agent. Any thread
         # that needs interactive approval must install a callback via
         # tools.terminal_tool.set_approval_callback() before reaching this point (see delegate_tool.py,
         # run_agent.py _execute_tool_calls_concurrent / _spawn_background_review for the established
@@ -127,9 +142,10 @@ def _ask_human(command: str, description: str, timeout_seconds: int, allow_perma
         from prompt_toolkit.application.current import get_app_or_none
         if get_app_or_none() is not None:
             logger.warning("Dangerous-command approval requested on a thread with no "
-                           "approval callback while prompt_toolkit is active; denying "
+                           "approval callback while prompt_toolkit is active; failing closed "
                            "to avoid stdin deadlock. command=%r description=%r", command, description)
-            return "deny"
+            return Unanswered("no approval callback is registered on this thread while prompt_toolkit owns "
+                              "the terminal, so the prompt could not be shown")
     except Exception:
         pass  # prompt_toolkit absent or detection failed: legacy input() path is safe
 
@@ -159,7 +175,7 @@ def _ask_human(command: str, description: str, timeout_seconds: int, allow_perma
         return decision
     except (EOFError, KeyboardInterrupt):
         print("\n" + t("approval.cancelled"))
-        return "deny"
+        return Unanswered("the prompt was interrupted before an answer was given")
     finally:
         os.environ.pop("HERMES_SPINNER_PAUSE", None)
         print()
@@ -224,14 +240,16 @@ def _present_with_selected_transport(*, command: str, description: str, pattern_
         request_id=request.request_id, request_digest=request.digest,
     )
     _ctx._fire_approval_hook("pre_approval_request", **hook_kwargs)
-    with human_wait_window(session_key):
+    from tools.human_input_hooks import human_input_request
+    with human_input_request("approval", prompt=request.command, session_key=session_key) as human, \
+            human_wait_window(session_key):
         result = invoke_approval_transport(
             registered.present, request, timeout_seconds=timeout_seconds,
             on_poll=activity_heartbeat("waiting for plugin approval transport"),
             is_interrupted=is_interrupted,
         )
-    hook_choice = result.choice if result.failure is None else f"transport_{result.failure}"
-    _ctx._fire_approval_hook("post_approval_response", **hook_kwargs, choice=hook_choice)
+        human.outcome = result.choice if result.failure is None else f"transport_{result.failure}"
+    _ctx._fire_approval_hook("post_approval_response", **hook_kwargs, choice=human.outcome)
     return _attempt(name, result.choice, result.failure, fallback)
 
 
@@ -263,7 +281,7 @@ def _consent(choice, unresolved: str) -> str:
     """Map an approval choice to an elicitation verdict; *unresolved* is the no-answer outcome."""
     if choice in ("once", "session", "always"):
         return "accept"
-    return unresolved if choice == "timeout" else "decline"
+    return unresolved if choice in ("timeout", "cancelled") else "decline"
 
 
 def request_elicitation_consent(message: str, description: str, *,
@@ -281,8 +299,21 @@ def request_elicitation_consent(message: str, description: str, *,
     except Exception as exc:  # pragma: no cover -- defensive
         logger.warning("Elicitation consent: session lookup failed: %s", exc)
         return "decline"
+    # A finite gateway turn (``chat -q`` / ``-z`` over the daemon) has no one to answer: parking the prompt
+    # would detach the viewer mid-turn instead of failing closed like the in-process ``-q`` input() path.
+    if _ctx._is_single_query_approval_context():
+        return "decline"
 
-    if _ctx._is_gateway_approval_context():
+    # api_server is an unattended *platform* for the dangerous-command gate, but a live ``/v1/runs`` run
+    # registers an approval notify callback and answers via ``POST /v1/runs/{id}/approval``
+    # (gateway/platforms/api_server_runs.py), so its per-call MCP consent takes the gateway path too.
+    # A run without a callback still fails closed below; cron and ``-q`` workers stay excluded.
+    api_run_context = (
+        _ctx._get_session_platform() == "api_server"
+        and not _ctx._is_cron_approval_context()
+        and not _ctx._is_single_query_approval_context()
+    )
+    if _ctx._is_gateway_approval_context() or api_run_context:
         notify_cb = _a._gateway_notify_cb(session_key)
         if notify_cb is None:
             logger.warning("Elicitation requested in gateway session %s but no "
@@ -298,15 +329,33 @@ def request_elicitation_consent(message: str, description: str, *,
             return "decline"
         if decision.get("notify_failed"):
             return "decline"
-        if not decision.get("resolved"):
-            return "cancel"
+        if not decision.get("resolved") or decision.get("cancelled"):
+            return "cancel"  # nobody answered (timeout / prompt withdrawn) — not a user refusal
         return _consent(decision.get("choice"), "decline")
 
-    # allow_permanent=False: elicitation is a per-call confirmation — no pattern to remember.
+    # Nobody can answer a -q, cron or unattended-platform worker. A `hermes chat -q` turn still has the CLI's
+    # panel callback registered, which would wait the full approval timeout before failing closed.
+    if _ctx._no_user_can_answer():
+        logger.info("Elicitation consent (%s) declined: no user can answer in this session", surface)
+        return "decline"
+
+    # Same observer payload as the gateway branch (#131876); post fires in a finally so the
+    # wait settles for observers on the early fail-closed return too.
+    hook_kwargs = dict(command=message, description=description, pattern_key="mcp_elicitation",
+                       pattern_keys=["mcp_elicitation"], session_key=session_key, surface=surface)
+    _ctx._fire_approval_hook("pre_approval_request", **hook_kwargs)
+    hook_choice = "cancelled"
     try:
+        from tools.terminal_tool import _get_approval_callback
+        # allow_permanent=False: elicitation is a per-call confirmation — no pattern to remember.
+        # Pass the agent thread's panel callback: without it prompt_toolkit fails the prompt closed unseen.
         choice = prompt_dangerous_approval(message, description, timeout_seconds=timeout_seconds,
-                                           allow_permanent=False, title=title)
+                                           allow_permanent=False, title=title,
+                                           approval_callback=_get_approval_callback())
+        hook_choice = choice
     except Exception as exc:
         logger.error("Elicitation CLI prompt failed: %s", exc, exc_info=True)
         return "decline"
+    finally:
+        _ctx._fire_approval_hook("post_approval_response", **hook_kwargs, choice=hook_choice)
     return _consent(choice, "cancel")  # timeout mirrors the gateway's unresolved outcome
