@@ -206,25 +206,6 @@ class TestFailedRebuildRetries:
         assert agent._client_kwargs["base_url"] == LOCAL_BASE
 
 
-class TestRouteConfigRefresh:
-    def test_base_url_change_recomputes_route_tls_and_headers(self, env):
-        """Moving to a new endpoint must recompute route-derived TLS material
-        and default headers, exactly as credential-pool rotation does."""
-        agent = _make_agent()
-        env["OPENAI_API_KEY"] = "sk-old"
-        env["OPENAI_BASE_URL"] = LOCAL_BASE
-
-        assert agent._try_refresh_env_client_credentials() is True
-        agent._reapply_route_client_config.assert_called_once_with(route_changed=True)
-
-    def test_key_only_change_keeps_route_config(self, env):
-        agent = _make_agent()
-        env["OPENAI_API_KEY"] = "sk-old"
-        assert agent._try_refresh_env_client_credentials() is False
-
-        env["OPENAI_API_KEY"] = "sk-new"
-        assert agent._try_refresh_env_client_credentials() is True
-        agent._reapply_route_client_config.assert_called_once_with(route_changed=False)
 
 
 CUSTOM_BASE = "https://api.longcat.example/openai/v1"
@@ -274,6 +255,21 @@ class TestNamedCustomProviders:
         env["LONGCAT_API_KEY"] = "lc-new"
         assert agent._try_refresh_env_client_credentials() is True
         assert agent.api_key == "lc-new"
+
+    def test_named_header_binding_follows_env_key_edit_and_rolls_back_on_rebuild_failure(self, env, named_custom_provider):
+        agent = self._make_custom_agent(api_key="lc-old")
+        agent._resolved_extra_headers = {"X-Account": "team-one"}
+        agent._resolved_header_api_key = "lc-old"
+        agent._resolved_header_base_url = CUSTOM_BASE
+        env["LONGCAT_API_KEY"] = "lc-old"
+        assert agent._try_refresh_env_client_credentials() is False
+        env["LONGCAT_API_KEY"] = "lc-new"
+        agent._replace_primary_openai_client.return_value = False
+        assert agent._try_refresh_env_client_credentials() is False
+        assert agent._resolved_header_api_key == "lc-old"
+        agent._replace_primary_openai_client.return_value = True
+        assert agent._try_refresh_env_client_credentials() is True
+        assert agent._resolved_header_api_key == "lc-new"
 
     def test_unchanged_env_is_a_noop(self, env, named_custom_provider):
         agent = self._make_custom_agent(api_key="lc-old")

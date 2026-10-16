@@ -40,6 +40,16 @@ def _is_live_system_guard(exc: BaseException) -> bool:
 class SessionPersistenceMixin:
     """SessionStore storage plumbing: SessionDB handle resolution and routing-index load/save."""
 
+    def retire_runtime_sessions(self, session_ids):
+        """Publish committed retirement; durable fences reject delayed saves."""
+        with self._lock:
+            targets = set(session_ids)
+            for key, entry in list(self._entries.items()):
+                if entry.session_id in targets:
+                    del self._entries[key]
+            for sid in targets:
+                self._session_owner_hints.pop(sid, None)
+
     def _open_session_db_for_active_scope(self, db_path: Optional[Path] = None):
         """SessionDB for the active profile scope. ``db_path`` pins the store; otherwise
         ``_default_db_path()`` follows the context-local HERMES_HOME (resolved per call so
@@ -104,6 +114,22 @@ class SessionPersistenceMixin:
             return self._open_session_db_for_active_scope(db_path=home / "state.db")
         except Exception:
             return None
+
+    def _telegram_topic_restore_db(self, topic_db_path):
+        """Require the handler's actual topic DB and routing DB to be the same file.
+
+        The path is an internal identity descriptor only; it never opens a database.
+        Separate handles and filesystem aliases of the same SQLite file are supported.
+        """
+        db = self._routing_db
+        if db is None or topic_db_path is None:
+            raise RuntimeError("Primary routing storage is unavailable")
+        if not Path(db.db_path).samefile(topic_db_path):
+            raise ValueError(
+                "Session restoration is not supported when topic/session storage and "
+                "routing storage use separate databases."
+            )
+        return db
 
     def _named_profile_for_key(self, session_key: Optional[str]) -> Optional[str]:
         """The non-default profile that owns *session_key*, or None (ambient store is authoritative:
@@ -290,7 +316,7 @@ class SessionPersistenceMixin:
         if not sessions_file.exists():
             return
         try:
-            with open(sessions_file, "r", encoding="utf-8") as f:
+            with open(sessions_file, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
             imported = 0
             for key, entry_data in data.items():
@@ -303,6 +329,10 @@ class SessionPersistenceMixin:
                         type(entry_data).__name__)
                     continue
                 try:
+                    from hermes_state_mutation_retirement import retired_session
+                    db = self._routing_db
+                    if db is not None and retired_session(db, entry_data['session_id']):
+                        continue
                     self._entries[key] = SessionEntry.from_dict(entry_data)
                     imported += 1
                 except (ValueError, KeyError, TypeError) as e:
@@ -364,10 +394,37 @@ class SessionPersistenceMixin:
         # Compression-ended parent with a newer live child for the same peer: repoint instead of
         # dropping, or queued/resume-pending work vanishes until the next message.
         if recovered_entry is not None and recovered_entry.session_id != entry.session_id:
+            if ((entry.compression_paused or "manual_fallback_index" in entry.metadata)
+                    and row.get("end_reason") == "compression"):
+                try:
+                    db = self._db_for_key(key)
+                    tip = db.get_compression_tip(entry.session_id)
+                    if tip == recovered_entry.session_id:
+                        child = db.get_session(tip)
+                        peer_fields = ("source", "user_id", "chat_id", "chat_type", "thread_id")
+                        if (child is not None and row.get("session_key") == key == child.get("session_key")
+                                and all(row.get(field) == child.get(field) for field in peer_fields)):
+                            # Recovery cannot substitute for the explicit pause-release commit.
+                            if entry.compression_paused:
+                                recovered_entry.metadata["compression_exhausted"] = True
+                            # Keep invalid selections verbatim so runtime validation still fails closed.
+                            if "manual_fallback_index" in entry.metadata:
+                                recovered_entry.metadata["manual_fallback_index"] = entry.metadata["manual_fallback_index"]
+                except Exception:
+                    # An indeterminate lineage must not publish a markerless substitute route.
+                    logger.debug("gateway.session: compression lineage lookup failed for %r", key,
+                                 exc_info=True)
+                    return None
             logger.warning(
                 "gateway.session: repointing stale sessions.json entry %r from ended %s "
                 "(end_reason=%r) to recovered %s", key, entry.session_id, row["end_reason"],
                 recovered_entry.session_id)
+            if entry.prompt_pin and (
+                self._compression_tip_for_session_id(entry.session_id) == recovered_entry.session_id
+            ):
+                # The compression child continues this conversation: its internal turns keep the
+                # pinned system bytes (the rebuilt entry is minimal and would drop them).
+                recovered_entry.prompt_pin = entry.prompt_pin
             return recovered_entry
         # Same-id recovery == successful resume: keep the ORIGINAL entry object (the recovered one
         # is rebuilt minimal and would drop counters, model_override, resume markers, metadata).
@@ -384,7 +441,7 @@ class SessionPersistenceMixin:
             "a crashed gateway", key, entry.session_id, row["end_reason"])
         return "prune"
 
-    def _entries_as_dicts(self) -> Dict[str, Any]:
+    def _entries_as_dicts(self) -> dict[str, Any]:
         """Serializable snapshot of ``_entries``. Lock held."""
         return {key: entry.to_dict() for key, entry in self._entries.items()}
 
@@ -424,19 +481,29 @@ class SessionPersistenceMixin:
             elif key not in current:
                 continue  # loaded from fallback and deliberately removed
             elif current[key] == baseline[key]:
+                previous = self._entries[key]
+                if (getattr(previous, "_compression_pause_pending", False) is True
+                        and previous.session_id == durable_entry.session_id):
+                    # Recovered primary data cannot forget a failed process-local pause write.
+                    durable_entry._compression_pause_pending = True
                 self._entries[key] = durable_entry  # unchanged fallback data yields to the DB copy
         self._routing_db_loaded = True
         self._routing_fallback_baseline = None
 
-    def _snapshot_routing_locked(self) -> tuple[Dict[str, Any], int]:
+    def _snapshot_routing_locked(self) -> tuple[dict[str, Any], int]:
         """Capture immutable routing data and a monotonic generation."""
         self._reconcile_recovered_routing_locked()
         return self._entries_as_dicts(), self._next_routing_generation_locked()
 
-    def _persist_routing_data(self, data: Dict[str, Any], generation: int) -> None:
+    def _persist_routing_data(
+        self, data: dict[str, Any], generation: int, *, require_primary: bool = False,
+        telegram_topic_binding: Optional[dict[str, str]] = None,
+    ) -> None:
         """Serialize all whole-index writers through one durable write lock."""
         with self._lazy("_save_lock", threading.Lock):
             if generation <= getattr(self, "_persisted_routing_generation", 0):
+                if require_primary:
+                    raise RuntimeError("Stale routing generation cannot commit session policy")
                 return
             # Fold in fast upserts numbered above this snapshot: they were serialized after us and
             # a delayed full rewrite must not regress them.
@@ -447,12 +514,38 @@ class SessionPersistenceMixin:
                         data[key] = json.loads(entry_json)
             db_saved = False
             replacer = self._routing_db_method("replace_gateway_routing_entries")
-            if replacer is not None:
+            if telegram_topic_binding is not None:
+                binding = dict(telegram_topic_binding)
+                db = self._telegram_topic_restore_db(binding.pop("_db_path"))
+                expected_id = binding.pop("expected_session_id")
+                key = binding["session_key"]
+                scope = self._routing_scope()
+                primary_json = db.load_gateway_routing_entries(scope=scope).get(key)
+                primary_id = None
+                if primary_json is not None:
+                    primary = self._routing_entry_from_json(key, primary_json)
+                    if primary is None:
+                        raise RuntimeError("Invalid primary session route")
+                    primary_id = primary.session_id
+                    if primary_id != expected_id:
+                        raise RuntimeError("Session route changed before topic restoration")
+                if not db.commit_telegram_topic_restore(
+                    routing_entries={k: json.dumps(v) for k, v in data.items()}, scope=scope,
+                    expected_route_session_id=primary_id, session_id=data[key]["session_id"],
+                    **binding,
+                ):
+                    raise RuntimeError("Session route changed before topic restoration")
+                db_saved = True
+            elif require_primary and replacer is None:
+                raise RuntimeError("Primary routing storage is unavailable")
+            elif replacer is not None:
                 try:
                     replacer({k: json.dumps(v) for k, v in data.items()}, scope=self._routing_scope())
                     db_saved = True
                 except Exception as exc:
                     logger.warning("gateway.session: state.db routing save failed: %s", exc)
+                    if require_primary:
+                        raise
             if getattr(self, "_write_sessions_json", True) or not db_saved:
                 try:
                     self._save_sessions_json(data)
@@ -471,7 +564,7 @@ class SessionPersistenceMixin:
                 for key in [k for k, (rev, _) in fast_persisted.items() if rev <= generation]:
                     del fast_persisted[key]
 
-    def _save_sessions_json(self, data: Dict[str, Any]) -> None:
+    def _save_sessions_json(self, data: dict[str, Any]) -> None:
         """Write the legacy sessions.json mirror of the routing index (atomic + fsync)."""
         atomic_json_write(self.sessions_dir / "sessions.json", {"_README": _SESSIONS_JSON_README, **data}, mode=0o600)
 
@@ -482,7 +575,7 @@ class SessionPersistenceMixin:
         self._persist_routing_data(data, generation)
 
     def _save_entry(
-        self, session_key: str, *, entry_data: Optional[Dict[str, Any]] = None,
+        self, session_key: str, *, entry_data: Optional[dict[str, Any]] = None,
         lock_held: bool = False) -> None:
         """Persist ONE routing entry via UPSERT — the per-turn fast path (a full rewrite fsyncs a
         multi-MB sessions.json). The key -> session_id mapping never changes here: structural
