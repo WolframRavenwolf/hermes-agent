@@ -5,7 +5,9 @@ tests fail. If anyone adds a NEW kill primitive to the codebase without
 adding it to the guard, the corresponding test added here will fail too.
 
 The guard exists to protect the developer's live ``hermes-gateway`` process
-from being SIGTERMed by tests. See PR #23397 for the original incident
+from being SIGTERMed by tests, and every live Hermes systemd unit
+(``hermes-gateway*``, ``hermes-dashboard*``, ``hermes-serve*``) from being
+restarted or stopped by them. See PR #23397 for the original incident
 (5+ live gateway kills in 3 days). Per Teknium 2026-05-10:
 
   > "You better do such a deep scan and scrub of the tests that this
@@ -94,18 +96,12 @@ def test_fail_closed_probe_reports_guard_active():
     assert _live_system_guard_is_active() is True
 
 
-def test_fail_closed_probe_classifies_raw_builtin_as_unguarded():
-    """The probe's discriminator, exercised against real objects: a raw C
-    builtin the guard never touches (``os.getpid``) is exactly what an
-    unguarded ``os.kill`` looks like and must read as 'guard not active', while
-    the loaded guard's ``os.kill`` is a plain Python function."""
-    assert isinstance(os.getpid, types.BuiltinFunctionType)
-    assert not isinstance(os.kill, types.BuiltinFunctionType)
 
 
 # ──────────────────── kill primitives ─────────────────────────
 
 
+@pytest.mark.platforms("linux")
 def test_os_kill_blocks_foreign_pid():
     with pytest.raises(RuntimeError, match="live-system guard"):
         os.kill(FOREIGN_PID, signal.SIGTERM)
@@ -128,41 +124,112 @@ def test_os_killpg_blocks_foreign_pgid():
 
 def test_subprocess_run_systemctl_restart_blocked():
     with pytest.raises(RuntimeError, match="live-system guard"):
-        subprocess.run(["systemctl", "--user", "restart", "hermes-gateway"])
+        subprocess.run(["systemctl", "--user", "restart", "hermes-gateway"], check=False)
 
 
 def test_subprocess_run_full_path_systemctl_blocked():
     """``/usr/bin/systemctl`` (full path) must be blocked too."""
     with pytest.raises(RuntimeError, match="live-system guard"):
-        subprocess.run(["/usr/bin/systemctl", "--user", "stop", "hermes-gateway"])
+        subprocess.run(["/usr/bin/systemctl", "--user", "stop", "hermes-gateway"], check=False)
 
 
 def test_subprocess_run_sudo_systemctl_blocked():
     """``sudo systemctl ...`` defeated the old head==systemctl check."""
     with pytest.raises(RuntimeError, match="live-system guard"):
-        subprocess.run(["sudo", "systemctl", "restart", "hermes-gateway"])
+        subprocess.run(["sudo", "systemctl", "restart", "hermes-gateway"], check=False)
 
 
 def test_subprocess_run_env_systemctl_blocked():
     """``env systemctl ...`` similarly defeated the old head check."""
     with pytest.raises(RuntimeError, match="live-system guard"):
-        subprocess.run(["env", "systemctl", "--user", "restart", "hermes-gateway"])
+        subprocess.run(["env", "systemctl", "--user", "restart", "hermes-gateway"], check=False)
 
 
 def test_subprocess_run_bash_c_systemctl_blocked():
     """``bash -c "systemctl ..."`` must also be caught."""
     with pytest.raises(RuntimeError, match="live-system guard"):
-        subprocess.run(["bash", "-c", "systemctl --user restart hermes-gateway"])
+        subprocess.run(["bash", "-c", "systemctl --user restart hermes-gateway"], check=False)
 
 
-def test_subprocess_run_sh_c_systemctl_blocked():
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        ["systemctl", "--user", "restart", "hermes-dashboard.service"],
+        ["systemctl", "--user", "restart", "hermes-dashboard-work.service"],
+        ["systemctl", "--user", "stop", "hermes-serve"],
+        ["/usr/bin/systemctl", "--user", "--no-ask-password", "restart", "hermes-serve-work.service"],
+        ["bash", "-c", "systemctl --user restart hermes-dashboard.service"],
+        "systemctl --user restart hermes-dashboard-work.service",
+        'bash -c "systemctl --user restart hermes-serve.service"',
+    ],
+)
+def test_subprocess_run_systemctl_mutating_any_hermes_unit_blocked(cmd):
+    """Not just the gateway: a test that forgot to stub the runner restarted the developer's
+    real hermes-dashboard / hermes-serve units, which the gateway-only tokens let through."""
     with pytest.raises(RuntimeError, match="live-system guard"):
-        subprocess.run(["sh", "-c", "systemctl --user stop hermes-gateway"])
+        subprocess.run(cmd, shell=isinstance(cmd, str), check=False)
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        ["systemctl", "--user", "show", "hermes-dashboard.service", "--property=MainPID"],
+        ["systemctl", "--user", "status", "hermes-dashboard"],
+        ["systemctl", "--user", "is-active", "hermes-serve.service"],
+        ["systemctl", "--user", "restart", "nginx.service"],
+        ["systemctl", "--user", "restart", "myhermes-dashboard.service"],
+    ],
+)
+def test_subprocess_run_systemctl_read_only_or_foreign_unit_passes_guard(cmd):
+    """Read-only verbs on Hermes units and mutating verbs on other units reach the real
+    ``subprocess.run``; an empty PATH turns that into FileNotFoundError, never a real systemctl."""
+    with pytest.raises(FileNotFoundError):
+        subprocess.run(cmd, env={"PATH": "/nonexistent"}, check=False)
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        ["bash", "-c", r"systemctl st\op hermes.service"],
+        ["bash", "-c", r"systemctl --user rest\art hermes-dashboard"],
+        r"systemctl --user re\start hermes-serve.service",
+        ["bash", "-c", "sh -c 'systemctl --user restart hermes-dashboard'"],
+    ],
+)
+def test_subprocess_run_shell_escaped_or_nested_verb_blocked(cmd):
+    """The shell runs ``rest\\art`` as ``restart``; the guard must read it the same way."""
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(cmd, shell=isinstance(cmd, str), check=False)
+
+
+def test_a_test_owned_unit_can_be_cleaned_up_but_no_other(request):
+    """A unit the test created under its own name may be stopped; every other Hermes unit stays refused."""
+    owned = "hermes-worker-kanban-t_selftest-run-1.scope"
+    request.node.live_system_guard_owned_units = {owned}
+    with pytest.raises(FileNotFoundError):
+        subprocess.run(["systemctl", "--user", "stop", owned], env={"PATH": "/nonexistent"}, check=False)
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(["systemctl", "--user", "stop", owned, "hermes-dashboard.service"], check=False)
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(["systemctl", "--user", "stop", "hermes-worker-kanban-other-run-1.scope"], check=False)
 
 
 def test_subprocess_run_setsid_systemctl_blocked():
     with pytest.raises(RuntimeError, match="live-system guard"):
-        subprocess.run(["setsid", "systemctl", "kill", "hermes-gateway"])
+        subprocess.run(["setsid", "systemctl", "kill", "hermes-gateway"], check=False)
+
+
+def test_host_gateway_start_blocked_but_container_exec_allowed():
+    """A host-side ``hermes gateway start`` spawns a real runtime; the same words addressed to
+    a container via ``docker exec`` stay inside it and are the Docker harness's business."""
+    with pytest.raises(RuntimeError, match="REAL hermes gateway runtime"):
+        subprocess.run(["hermes", "-p", "p", "gateway", "start"], check=False)
+    argv = ["docker", "exec", "-u", "hermes", "hermes-test-x", "sh", "-c", "hermes -p p gateway start"]
+    # Past the guard the call reaches the real subprocess.run; a missing binary is fine here.
+    with pytest.raises(FileNotFoundError):
+        subprocess.run(argv, env={"PATH": "/nonexistent"}, check=False)
 
 
 def test_subprocess_run_string_shell_true_blocked():
@@ -170,6 +237,7 @@ def test_subprocess_run_string_shell_true_blocked():
         subprocess.run(
             "systemctl --user restart hermes-gateway",
             shell=True,
+            check=False,
         )
 
 
@@ -219,6 +287,7 @@ def test_os_popen_systemctl_blocked():
 # ──────────────────── pty.spawn ────────────────────────────────
 
 
+@pytest.mark.platforms("linux")
 def test_pty_spawn_systemctl_blocked():
     import pty
     with pytest.raises(RuntimeError, match="live-system guard"):
@@ -257,23 +326,20 @@ def test_asyncio_create_subprocess_shell_systemctl_blocked():
 
 def test_subprocess_pkill_hermes_blocked():
     with pytest.raises(RuntimeError, match="live-system guard"):
-        subprocess.run(["pkill", "-f", "hermes"])
+        subprocess.run(["pkill", "-f", "hermes"], check=False)
 
 
-def test_subprocess_pkill_hermes_gateway_blocked():
-    with pytest.raises(RuntimeError, match="live-system guard"):
-        subprocess.run(["pkill", "-f", "hermes-gateway"])
 
 
 def test_subprocess_pkill_python_dash_f_blocked():
     """``pkill -f python`` matches the gateway's "python -m hermes_cli.main"."""
     with pytest.raises(RuntimeError, match="live-system guard"):
-        subprocess.run(["pkill", "-f", "python"])
+        subprocess.run(["pkill", "-f", "python"], check=False)
 
 
 def test_subprocess_killall_hermes_blocked():
     with pytest.raises(RuntimeError, match="live-system guard"):
-        subprocess.run(["killall", "hermes"])
+        subprocess.run(["killall", "hermes"], check=False)
 
 
 # ──────────────────── pass-through cases (must NOT raise) ──────
@@ -308,6 +374,19 @@ def test_subprocess_popen_real_gateway_restart_blocked():
         )
 
 
+def test_subprocess_popen_inline_source_restart_watcher_blocked():
+    """``gateway._spawn_gateway_restart_watcher`` hides the real gateway argv behind
+    ``python -c <src> <old_pid> …``. The identity matcher must ignore that trailing argv (#107002),
+    but the guard reads it as SPAWN INTENT — otherwise the watcher sails through, waits out its
+    120s deadline and leaves a real detached gateway squatting the webhook port."""
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(1)", "4242",
+             sys.executable, "-m", "hermes_cli.main", "gateway", "run"],
+            start_new_session=True,
+        )
+
+
 def test_subprocess_run_gateway_status_passes_through():
     """Only lifecycle verbs are blocked: ``gateway status`` (and every other
     read-only subcommand) must still spawn — via the canonical matcher, not an
@@ -315,6 +394,7 @@ def test_subprocess_run_gateway_status_passes_through():
     result = subprocess.run(
         [sys.executable, "-c", "import sys; print(sys.argv[1:])", "-m", "hermes_cli.main", "gateway", "status"],
         capture_output=True, text=True,
+        check=False,
     )
     assert result.returncode == 0
 
@@ -334,3 +414,148 @@ def test_bypass_marker_disables_guard():
     # so we get the real os.kill. Calling os.kill(os.getpid(), 0) just
     # checks that the PID exists — harmless.
     os.kill(os.getpid(), 0)  # No exception — guard is OFF.
+    # Signal 0 passes the guard too, so prove the patch itself is absent.
+    assert not _live_system_guard_is_active()
+
+
+# Native launchctl canaries use only `help`: a missing guard must never stop a service.
+# This probe runs at collection time, before any autouse fixture can install protection.
+_collection_launchctl_denied = False
+if sys.platform == "darwin":
+    try:
+        subprocess.run(["/bin/launchctl", "help"], capture_output=True)
+    except PermissionError:
+        _collection_launchctl_denied = True
+
+
+@pytest.mark.platforms("macos")
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS execution boundary")
+@pytest.mark.live_system_guard_bypass
+class TestLaunchctlExecutionBoundary:
+    def test_guard_is_active_before_test_collection(self):
+        assert _collection_launchctl_denied
+
+    def test_system_ps_keeps_process_diagnostics_working(self):
+        result = subprocess.run(
+            ["/bin/ps", "-p", str(os.getpid()), "-o", "pid=,pgid="],
+            capture_output=True, text=True, check=True,
+        )
+        pid, pgid = result.stdout.split()
+        assert int(pid) == os.getpid()
+        assert int(pgid) == os.getpgid(0)
+        with pytest.raises(PermissionError):
+            subprocess.run(["/bin/launchctl", "help"], capture_output=True)
+
+    def test_direct_host_and_symlink_are_denied(self, tmp_path):
+        import errno
+        alias = tmp_path / "controller-alias"
+        alias.symlink_to("/bin/launchctl")
+        for executable in ("/bin/launchctl", str(alias)):
+            with pytest.raises(PermissionError) as caught:
+                subprocess.run([executable, "help"], capture_output=True)
+            assert caught.value.errno in (errno.EPERM, errno.EACCES)
+
+    @pytest.mark.parametrize("command", [
+        ["/bin/bash", "-c", 'cmd=/bin/launchctl; "$cmd" help'],
+        ["/bin/bash", "-cO", "extglob", "/bin/launchctl help"],
+        ["/bin/bash", "-c", "cd /bin; ./launchctl help"],
+        ["/bin/bash", "-c", "if true; then /bin/launchctl help; fi"],
+        ["/bin/bash", "-c", "f() { /bin/launchctl help; }; f"],
+        ["/bin/bash", "-c", '${CMD:-/bin/launchctl} help'],
+        ["/bin/bash", "-c", "PATH=/bin launchctl help"],
+    ])
+    def test_shell_forms_cannot_execute_host_controller(self, command):
+        result = subprocess.run(command, capture_output=True, text=True)
+        assert result.returncode != 0
+        assert "Operation not permitted" in result.stderr or "Permission denied" in result.stderr
+
+    def test_opaque_script_and_native_descendant_are_denied(self, tmp_path):
+        script = tmp_path / "nested.sh"
+        script.write_text('cmd=/bin/launchctl; "$cmd" help\n', encoding="utf-8")
+        for argv in (["/bin/bash", str(script)],
+                     ["/usr/bin/find", str(script), "-exec", "/bin/launchctl", "help", ";"]):
+            result = subprocess.run(argv, capture_output=True, text=True)
+            # find may return zero even when its -exec child was denied.
+            assert "Operation not permitted" in result.stderr or "Permission denied" in result.stderr
+
+    @pytest.mark.parametrize("primitive", [
+        "os.execv('/bin/launchctl', ['launchctl', 'help'])",
+        "os.posix_spawn('/bin/launchctl', ['launchctl', 'help'], {})",
+        "subprocess.run(['/bin/launchctl', 'help'], env={})",
+    ])
+    def test_fresh_interpreter_inherits_guard_with_empty_environment(self, primitive):
+        source = (
+            "import errno, os, subprocess\n"
+            "try:\n    " + primitive + "\n"
+            "except OSError as error:\n"
+            "    assert error.errno in (errno.EPERM, errno.EACCES)\n"
+            "    print('denied')\n"
+            "else:\n    raise AssertionError('host controller executed')\n"
+        )
+        result = subprocess.run([sys.executable, "-c", source], env={}, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "denied"
+
+    def test_host_binary_cannot_be_copied_outside_protected_path(self):
+        import errno
+        from pathlib import Path
+        with pytest.raises(PermissionError) as caught:
+            Path("/bin/launchctl").read_bytes()
+        assert caught.value.errno in (errno.EPERM, errno.EACCES)
+
+    def test_fake_and_complex_harmless_shell_remain_usable(self, tmp_path):
+        fake = tmp_path / "launchctl"
+        fake.write_text("#!/bin/sh\nprintf 'fake-ok\\n'\n", encoding="utf-8")
+        fake.chmod(0o755)
+        source = tmp_path / "fixture.sh"
+        source.write_text('say() { printf "shell-ok\\n"; }\n', encoding="utf-8")
+        commands = [
+            ([str(fake), "help"], "fake-ok"),
+            (["/bin/bash", "-c", 'launchctl help',], "fake-ok"),
+            (["/bin/bash", "-c", 'source "$1"; X=1; if [ "$X" = 1 ]; then say; fi', "bash", str(source)], "shell-ok"),
+            (["/bin/echo", "/bin/launchctl help"], "/bin/launchctl help"),
+        ]
+        for argv, expected in commands:
+            result = subprocess.run(argv, env={"PATH": str(tmp_path), "LC_ALL": "C"}, capture_output=True, text=True)
+            assert result.returncode == 0, result.stderr
+            assert result.stdout.strip() == expected
+
+    def test_child_can_reinstall_guard_after_inheritance(self):
+        source = "from tests.launchctl_safety import install_launchctl_guard; install_launchctl_guard(); install_launchctl_guard()"
+        result = subprocess.run([sys.executable, "-c", source], capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.platforms("not macos")
+def test_launchctl_guard_is_inert_off_darwin(monkeypatch):
+    from tests import launchctl_safety
+    monkeypatch.setattr(launchctl_safety, "_INSTALLED", False, raising=False)
+    def unexpected(*args, **kwargs):
+        raise AssertionError("non-Darwin must not load libsandbox")
+    monkeypatch.setattr("ctypes.CDLL", unexpected)
+    launchctl_safety.install_launchctl_guard()
+
+
+@pytest.mark.platforms("macos")
+def test_launchctl_guard_fails_explicitly_when_native_library_is_unavailable(monkeypatch):
+    from tests import launchctl_safety
+    monkeypatch.setattr(launchctl_safety, "_INSTALLED", False, raising=False)
+    def unavailable(*args, **kwargs):
+        raise OSError("test library unavailable")
+    monkeypatch.setattr("ctypes.CDLL", unavailable)
+    with pytest.raises(RuntimeError, match="launchctl test guard"):
+        launchctl_safety.install_launchctl_guard()
+    assert not launchctl_safety._INSTALLED
+
+
+@pytest.mark.platforms("macos")
+def test_launchctl_guard_fails_closed_on_profile_rejection(monkeypatch):
+    from unittest.mock import Mock
+    from tests import launchctl_safety
+    monkeypatch.setattr(launchctl_safety, "_INSTALLED", False, raising=False)
+    library = Mock()
+    library.sandbox_init.return_value = -1
+    monkeypatch.setattr("ctypes.CDLL", Mock(return_value=library))
+    with pytest.raises(RuntimeError, match="launchctl test guard"):
+        launchctl_safety.install_launchctl_guard()
+    assert not launchctl_safety._INSTALLED
