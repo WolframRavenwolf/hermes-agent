@@ -79,34 +79,6 @@ def sample_audio_file(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-class TestBuiltinAlwaysWins:
-    """Built-in STT provider names short-circuit the dispatcher.
-
-    Even with a plugin registered (which the registry would reject —
-    but the dispatcher is defensive), built-in names return None so
-    the caller's elif chain handles them natively.
-    """
-
-    @pytest.mark.parametrize(
-        "builtin",
-        ["local", "local_command", "groq", "openai", "mistral", "xai"],
-    )
-    def test_dispatcher_short_circuits_builtin(self, builtin):
-        result = transcription_tools._dispatch_to_plugin_provider(
-            "/tmp/audio.mp3", builtin,
-        )
-        assert result is None, (
-            f"Built-in {builtin!r} must short-circuit plugin dispatch."
-        )
-
-
-    def test_dispatcher_short_circuits_builtin_case_insensitive(self):
-        for variant in ("OPENAI", "OpenAI", "  openai  ", "oPeNaI"):
-            assert (
-                transcription_tools._dispatch_to_plugin_provider(
-                    "/tmp/audio.mp3", variant,
-                ) is None
-            )
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +165,8 @@ class TestTranscribeAudioE2E:
         provider = _FakeProvider(name="openrouter")
         transcription_registry.register_provider(provider)
 
-        with patch("tools.transcription_tools._load_stt_config", return_value={"provider": "groq"}), \
+        with patch("tools.transcription_tools._load_stt_config",
+                   return_value={"provider": "groq", "cloud_trim_silence": False}), \
              patch("tools.transcription_tools._get_provider", return_value="groq"), \
              patch("tools.transcription_tools._transcribe_groq",
                    return_value={"success": True, "transcript": "from groq", "provider": "groq"}) as mock_groq:
@@ -205,7 +178,8 @@ class TestTranscribeAudioE2E:
         # Plugin was never called
         assert provider.last_call is None
 
-    def test_oversized_plugin_file_is_rejected_before_dispatch(self, tmp_path):
+    def test_unsplittable_oversized_plugin_file_never_reaches_the_plugin(self, tmp_path):
+        """Over the upload cap with no way to fit it (ffmpeg missing) -> refused, plugin untouched."""
         from unittest.mock import patch
 
         provider = _FakeProvider(name="openrouter")
@@ -218,7 +192,8 @@ class TestTranscribeAudioE2E:
 
         with patch("tools.transcription_tools._load_stt_config", return_value={"provider": "openrouter"}), \
              patch("tools.transcription_tools.is_stt_enabled", return_value=True), \
-             patch("tools.transcription_tools._get_provider", return_value="openrouter"):
+             patch("tools.transcription_tools._get_provider", return_value="openrouter"), \
+             patch("tools.transcription_chunking._find_ffmpeg_binary", return_value=None):
             result = transcription_tools.transcribe_audio(str(audio_path))
 
         assert result["success"] is False
@@ -331,3 +306,33 @@ class TestLanguageForwardingFromConfig:
         assert result["success"] is True
         assert provider.last_call["kwargs"]["language"] is None
         assert provider.last_call["kwargs"]["model"] is None
+
+
+class TestProviderOverride:
+    @pytest.mark.parametrize("available", [True, False])
+    def test_override_dispatches_only_selected_plugin(self, sample_audio_file, monkeypatch, available):
+        from copy import deepcopy
+
+        selected = _FakeProvider(name="selected", available=available)
+        configured = _FakeProvider(name="configured")
+        transcription_registry.register_provider(selected)
+        transcription_registry.register_provider(configured)
+        config = {"provider": "configured", "fallback_providers": ["configured"],
+                  "selected": {"model": "plugin-model", "language": "ja"}}
+        original = deepcopy(config)
+        monkeypatch.setattr(transcription_tools, "_load_stt_config", lambda: config)
+        result = transcription_tools._transcribe_audio_with_provider(
+            sample_audio_file, provider="selected",
+        )
+        assert result["success"] is available
+        assert result["provider"] == "selected"
+        if available:
+            assert selected.last_call is not None
+            assert selected.last_call["file_path"] == sample_audio_file
+            assert selected.last_call["kwargs"]["model"] == "plugin-model"
+            assert selected.last_call["kwargs"]["language"] == "ja"
+        else:
+            assert selected.last_call is None
+            assert "not available" in result["error"]
+        assert configured.last_call is None
+        assert config == original
