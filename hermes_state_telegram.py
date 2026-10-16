@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import sqlite3
 import time
 from typing import Any, Dict, List, Optional
 
-from hermes_state_common import _PREVIEW_ELIGIBLE_SQL, _PREVIEW_RAW_SELECT, _sql_session_last_active
+from hermes_state_common import _sql_preview_raw, _sql_session_last_active
+from hermes_state_errors import StateDbReplacedError
 
 # caplog tests pin the "hermes_state" logger name.
 logger = logging.getLogger("hermes_state")
@@ -68,14 +70,7 @@ _UNLINKED_SELECT_HEAD = f"""
                     SELECT s.*,
                         COALESCE(sp.prompt, s.system_prompt)
                             AS _system_prompt_resolved,
-                        COALESCE(
-                            (SELECT {_PREVIEW_RAW_SELECT}
-                             FROM messages m
-                             WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
-                               AND {_PREVIEW_ELIGIBLE_SQL}
-                             ORDER BY m.timestamp, m.id LIMIT 1),
-                            ''
-                        ) AS _preview_raw,
+                        {_sql_preview_raw()},
                         {_sql_session_last_active("s")} AS last_active
                     FROM sessions s
                     LEFT JOIN system_prompts sp
@@ -97,20 +92,36 @@ _UNLINKED_SCOPE_CLAUSES = """                      AND COALESCE(NULLIF(TRIM(s.pr
 
 class SessionTelegramTopicsMixin:
     """Telegram DM topic-mode tables, bindings and lookups. Read paths tolerate absent
-    tables (nobody ran ``/topic``) by returning their empty value; only
-    ``enable``/``bind`` run the migration."""
+    tables (nobody ran ``/topic``) by returning their empty value and never create them;
+    pre-v3 tables left by an upgrade are self-healed on read."""
+
+    def _topic_read(self, read, empty):
+        """Run ``read()``; an absent table reads as ``empty``. A pre-v3 table left by an upgrade
+        (#103363) raises ``no such column: profile_name`` — heal it and retry, otherwise the
+        write-only migration is never reached and topic mode silently reads as off forever."""
+        try:
+            return read()
+        except sqlite3.OperationalError as exc:
+            if "no such column: profile_name" not in str(exc):
+                return empty
+        try:
+            self.apply_telegram_topic_migration()
+        except (sqlite3.Error, StateDbReplacedError):
+            logger.warning("telegram topic tables are pre-v3 and the heal failed; reading as empty", exc_info=True)
+            return empty
+        return read()
 
     def _topic_read_one(self, sql: str, params):
-        """``fetchone`` that treats an unmigrated table as None."""
-        try:
-            return self._read_one(sql, params)
-        except sqlite3.OperationalError:
-            return None
+        return self._topic_read(lambda: self._read_one(sql, params), None)
+
+    def _topic_read_all(self, sql: str, params):
+        return self._topic_read(lambda: self._read_all(sql, params), [])
 
     def apply_telegram_topic_migration(self) -> None:
         """Create Telegram DM topic-mode tables on explicit /topic opt-in. Deliberately NOT
         part of startup reconciliation: operators can upgrade and keep the old bot
-        behavior until a user runs /topic. Schema versions: v1 initial; v2 session_id FK
+        behavior until a user runs /topic. Also invoked by ``_topic_read`` to heal a
+        pre-v3 table an upgrade left behind (#103363). Schema versions: v1 initial; v2 session_id FK
         ON DELETE CASCADE (pruning clears bindings); v3 ``profile_name`` on both tables so
         multiplexed gateways sharing one state.db isolate topic state per profile.
 
@@ -123,23 +134,27 @@ class SessionTelegramTopicsMixin:
                 if "profile_name" in have:
                     continue
                 # v1/v2 → v3. SQLite can't ALTER a PK or FK, so rebuild (also supplies v2's
-                # ON DELETE CASCADE). Legacy rows land in "default" only.
+                # ON DELETE CASCADE); _rebuild_table runs inside the open BEGIN IMMEDIATE so a crash
+                # rolls back instead of stranding rows (#42004). A {table}_new left by an older
+                # build's executescript crash is dropped first; its legacy table is still intact.
+                # v1 bindings had no ON DELETE CASCADE, so pruned sessions left orphan rows that
+                # the v3 FK (foreign_keys=ON on the writer) would reject — copy only live ones.
                 legacy_columns = columns.replace("profile_name, ", "", 1)
-                conn.executescript(f"""
-                    CREATE TABLE {table}_new ({ddl});
-                    INSERT INTO {table}_new ({columns})
-                        SELECT 'default', {legacy_columns} FROM {table};
-                    DROP TABLE {table};
-                    ALTER TABLE {table}_new RENAME TO {table};
-                    """)
+                live = " WHERE EXISTS (SELECT 1 FROM sessions s WHERE s.id = session_id)" if "session_id" in columns else ""
+                conn.execute(f"DROP TABLE IF EXISTS {table}_new")
+                self._rebuild_table(
+                    conn.cursor(), table, f"{table}_legacy", f"CREATE TABLE {table} ({ddl})",
+                    f"INSERT INTO {table} ({columns}) SELECT 'default', {legacy_columns} FROM {table}_legacy{live}",
+                )
             # Indexes after any rebuild: the user index needs profile_name.
-            conn.executescript("""
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_dm_topic_bindings_session
-                ON telegram_dm_topic_bindings(session_id);
-
-                CREATE INDEX IF NOT EXISTS idx_telegram_dm_topic_bindings_user
-                ON telegram_dm_topic_bindings(profile_name, user_id, chat_id);
-                """)
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_dm_topic_bindings_session "
+                "ON telegram_dm_topic_bindings(session_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_telegram_dm_topic_bindings_user "
+                "ON telegram_dm_topic_bindings(profile_name, user_id, chat_id)"
+            )
             conn.execute(
                 "INSERT INTO state_meta (key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -214,7 +229,7 @@ class SessionTelegramTopicsMixin:
 
     def get_telegram_topic_binding(
         self, *, chat_id: str, thread_id: str, profile_name: str = "default"
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Optional[dict[str, Any]]:
         """Return the session binding for a Telegram DM topic, if present."""
         profile_name = _normalize_telegram_topic_profile_name(profile_name)
         row = self._topic_read_one("""
@@ -225,19 +240,16 @@ class SessionTelegramTopicsMixin:
 
     def list_telegram_topic_bindings_for_chat(
         self, *, chat_id: str, profile_name: str = "default"
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """All bindings for one chat, newest first ([] when the table is absent)."""
         profile_name = _normalize_telegram_topic_profile_name(profile_name)
-        try:
-            rows = self._read_all(
-                "SELECT * FROM telegram_dm_topic_bindings WHERE profile_name = ? AND chat_id = ? ORDER BY updated_at DESC",
-                (profile_name, str(chat_id)),
-            )
-        except sqlite3.OperationalError:
-            return []
+        rows = self._topic_read_all(
+            "SELECT * FROM telegram_dm_topic_bindings WHERE profile_name = ? AND chat_id = ? ORDER BY updated_at DESC",
+            (profile_name, str(chat_id)),
+        )
         return [dict(row) for row in rows]
 
-    def get_telegram_topic_binding_by_session(self, *, session_id: str) -> Optional[Dict[str, Any]]:
+    def get_telegram_topic_binding_by_session(self, *, session_id: str) -> Optional[dict[str, Any]]:
         """Reverse lookup via the UNIQUE INDEX on session_id; None when unbound."""
         row = self._topic_read_one("""
                     SELECT * FROM telegram_dm_topic_bindings
@@ -298,34 +310,116 @@ class SessionTelegramTopicsMixin:
         only one topic: rebinding the same pair is idempotent; linking the session to a
         different topic raises ValueError."""
         self.apply_telegram_topic_migration()
+        self._execute_write(lambda conn: self._bind_telegram_topic_conn(
+            conn, chat_id=chat_id, thread_id=thread_id, user_id=user_id,
+            session_key=session_key, session_id=session_id, managed_mode=managed_mode,
+            profile_name=profile_name,
+        ))
+
+    def _bind_telegram_topic_conn(
+        self, conn, *, chat_id: str, thread_id: str, user_id: str, session_key: str,
+        session_id: str, managed_mode: str, profile_name: str,
+    ) -> None:
+        """Check ownership and bind using the caller's transaction only."""
         now = time.time()
         chat_id, thread_id, user_id = str(chat_id), str(thread_id), str(user_id)
         session_key, session_id = str(session_key), str(session_id)
         profile_name = _normalize_telegram_topic_profile_name(profile_name)
 
+        existing_session = conn.execute("""
+            SELECT profile_name, chat_id, thread_id
+            FROM telegram_dm_topic_bindings
+            WHERE session_id = ?
+            """, (session_id,)).fetchone()
+        if existing_session is not None:
+            linked_profile, linked_chat, linked_thread = existing_session
+            if (str(linked_profile), str(linked_chat), str(linked_thread)) != (profile_name, chat_id, thread_id):
+                raise ValueError("session is already linked to another Telegram topic")
+        conn.execute("""
+            INSERT INTO telegram_dm_topic_bindings (
+                profile_name, chat_id, thread_id, user_id, session_key, session_id,
+                managed_mode, linked_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(profile_name, chat_id, thread_id) DO UPDATE SET
+                user_id = excluded.user_id,
+                session_key = excluded.session_key,
+                session_id = excluded.session_id,
+                managed_mode = excluded.managed_mode,
+                updated_at = excluded.updated_at
+            """, (profile_name, chat_id, thread_id, user_id, session_key, session_id, managed_mode, now, now))
+
+    def commit_telegram_topic_restore(
+        self, *, routing_entries: Dict[str, str], scope: str, session_key: str,
+        expected_route_session_id: Optional[str], session_id: str,
+        chat_id: str, thread_id: str, user_id: str, profile_name: str = "default",
+        routing_db=None,
+    ) -> bool:
+        """Commit a binding and its authoritative route; None requires an absent route.
+
+        A secondary profile has a separate topic DB. Hold its write transaction while
+        committing the launch-home route, which remains authoritative on interruption.
+        If the second commit fails, inbound recovery repairs its binding from the route.
+        """
+        candidate = json.loads(routing_entries[session_key])
+        if (not isinstance(candidate, dict) or candidate.get("session_key") != session_key
+                or candidate.get("session_id") != session_id):
+            raise ValueError("Topic restoration routing snapshot does not match its target")
+        # Migration owns executescript, which must never run inside this transaction.
+        self.apply_telegram_topic_migration()
+
+        owner = routing_db or self
+        def _route(conn):
+            row = conn.execute(
+                "SELECT entry_json FROM gateway_routing WHERE scope = ? AND session_key = ?",
+                (scope, session_key),
+            ).fetchone()
+            current_id = None
+            if row is not None:
+                try:
+                    current_id = json.loads(row[0])["session_id"]
+                    if not isinstance(current_id, str) or not current_id:
+                        raise ValueError("Missing session ID")
+                except (ValueError, KeyError, TypeError) as exc:
+                    raise RuntimeError("Invalid primary session route") from exc
+            if current_id != expected_route_session_id:
+                return False
+            owner._replace_gateway_routing_entries_conn(conn, routing_entries, scope=scope)
+            return True
+
+        class RouteChanged(Exception):
+            pass
+
+        primary_committed = False
         def _do(conn):
-            existing_session = conn.execute("""
-                SELECT profile_name, chat_id, thread_id
-                FROM telegram_dm_topic_bindings
-                WHERE session_id = ?
-                """, (session_id,)).fetchone()
-            if existing_session is not None:
-                linked_profile, linked_chat, linked_thread = existing_session
-                if (str(linked_profile), str(linked_chat), str(linked_thread)) != (profile_name, chat_id, thread_id):
-                    raise ValueError("session is already linked to another Telegram topic")
-            conn.execute("""
-                INSERT INTO telegram_dm_topic_bindings (
-                    profile_name, chat_id, thread_id, user_id, session_key, session_id,
-                    managed_mode, linked_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(profile_name, chat_id, thread_id) DO UPDATE SET
-                    user_id = excluded.user_id,
-                    session_key = excluded.session_key,
-                    session_id = excluded.session_id,
-                    managed_mode = excluded.managed_mode,
-                    updated_at = excluded.updated_at
-                """, (profile_name, chat_id, thread_id, user_id, session_key, session_id, managed_mode, now, now))
-        self._execute_write(_do)
+            nonlocal primary_committed
+            self._bind_telegram_topic_conn(
+                conn, chat_id=chat_id, thread_id=thread_id, user_id=user_id,
+                session_key=session_key, session_id=session_id, managed_mode="restored",
+                profile_name=profile_name,
+            )
+            if routing_db is None:
+                if not _route(conn):
+                    raise RouteChanged()
+                return True
+            if primary_committed:
+                # A retry of the secondary commit must not CAS the already-committed route again.
+                return True
+            result = routing_db._execute_write(_route)
+            if not result:
+                raise RouteChanged()
+            primary_committed = True
+            return True
+
+        try:
+            return self._execute_write(_do)
+        except RouteChanged:
+            return False
+        except Exception:
+            if not primary_committed:
+                raise
+            logger.warning("Topic binding failed after primary route commit; inbound recovery will reconcile",
+                           exc_info=True)
+            return True
 
     def is_telegram_session_linked_to_topic(self, *, session_id: str) -> bool:
         """True if the session is bound to any Telegram DM topic (absent tables → False)."""
@@ -338,7 +432,7 @@ class SessionTelegramTopicsMixin:
 
     def list_unlinked_telegram_sessions_for_user(
         self, *, chat_id: str, user_id: str, profile_name: str = "default", limit: int = 10
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """This user's Telegram sessions not bound to a topic. Read-only: if the bindings table
         is absent, every session is unlinked and the profile-unscoped query is used.
         Scoped by ``profile_name`` so multiplexed profiles do not surface each other.
