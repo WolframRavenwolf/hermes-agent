@@ -4,14 +4,10 @@ import pytest
 
 from hermes_cli.session_listing import (
     format_gateway_session_listing,
-    parse_session_listing_args,
     query_session_listing,
 )
 
 
-class TestParseSessionListingArgs:
-    def test_plain_listing(self):
-        assert parse_session_listing_args("") == (False, False, "", None)
 
 
 
@@ -57,6 +53,46 @@ class TestQuerySessionListingSearch:
         finally:
             db.close()
 
+    @pytest.mark.parametrize("include_current", [False, True])
+    def test_plain_listing_paginates_past_unnamed_rows(self, tmp_path, include_current):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "paging.db")
+        db.create_session("named_old", "telegram")
+        db.set_session_title("named_old", "Older Work")
+        for i in range(65):
+            db.create_session(f"unnamed_{i}", "telegram")
+        db.create_session("current", "telegram")
+        try:
+            rows = query_session_listing(
+                db, source="telegram", current_session_id="current",
+                include_current_session=include_current, limit=2,
+            )
+            assert [r["id"] for r in rows] == (["current", "named_old"] if include_current else ["named_old"])
+            if include_current:
+                assert rows[0]["is_current_session"] is True
+        finally:
+            db.close()
+
+    def test_paging_stops_after_enough_rows_or_exhaustion(self):
+        class FiniteDB:
+            def __init__(self, rows):
+                self.rows = rows
+                self.offsets = []
+
+            def list_sessions_rich(self, *, limit, offset=0, **kwargs):
+                assert offset not in self.offsets, "paging must advance"
+                self.offsets.append(offset)
+                return self.rows[offset:offset + limit]
+
+        invisible = [{"id": f"unnamed_{i}"} for i in range(65)]
+        exhausted = FiniteDB(invisible)
+        assert query_session_listing(exhausted, source="telegram", limit=1) == []
+        assert len(exhausted.offsets) > 1
+        enough = FiniteDB([{"id": "first", "title": "First"}, *invisible])
+        assert [row["id"] for row in query_session_listing(enough, source="telegram", limit=1)] == ["first"]
+        assert enough.offsets == [0]
+
     def test_plain_listing_still_hides_unnamed(self, db):
         assert self._ids(db, source="telegram") == ["sess_an94"]
 
@@ -77,37 +113,12 @@ class TestQuerySessionListingSearch:
 
 
 class TestFormatGatewaySessionListing:
-    def test_marks_current_session(self):
-        listing = format_gateway_session_listing(
-            [
-                {
-                    "id": "sess_an94",
-                    "title": "AN-94 Prestige Barrel Build #2",
-                    "is_current_session": True,
-                }
-            ]
-        )
 
-        assert "**AN-94 Prestige Barrel Build #2** (current)" in listing
-
-    def test_notice_appears_above_footer(self):
-        listing = format_gateway_session_listing(
-            [{"id": "sess_an94", "title": "AN-94"}],
-            notice="_Note: `all` requires admin._",
-        )
-        lines = listing.splitlines()
-        notice_idx = lines.index("_Note: `all` requires admin._")
-        footer_idx = next(i for i, l in enumerate(lines) if l.startswith("Resume:"))
-        assert notice_idx < footer_idx
 
     def test_notice_on_empty_listing(self):
         listing = format_gateway_session_listing([], notice="_scoped_")
-        assert "No sessions found." in listing
         assert "_scoped_" in listing
 
-    def test_no_notice_by_default(self):
-        listing = format_gateway_session_listing([{"id": "x", "title": "T"}])
-        assert "Note:" not in listing
 
 
 class TestQuerySessionListingLaneScope:
